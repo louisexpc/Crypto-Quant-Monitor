@@ -1,0 +1,13 @@
+# ./requirements.txt
+python-dotenv
+pyyaml
+ccxt
+pandas
+numpy
+pymongo[srv]
+discord.py
+apscheduler
+# For AI (torch can be large, consider CPU-only version for EC2 free tier)
+torch --extra-index-url https://download.pytorch.org/whl/cpu
+pandas-ta
+pytz
