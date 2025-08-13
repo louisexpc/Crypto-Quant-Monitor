@@ -1,0 +1,202 @@
+# =========================
+# 基本實驗設定
+# =========================
+seed: 42
+device: cuda
+project_name: btc_hourly_3class
+
+# =========================
+# 數據與切分
+# =========================
+data:
+  path: data/ohlcv_labeled/indicators.csv
+
+  use_pt_cache: false
+  pt_path: data/ohlcv_labeled/btc_1h_features.pt   # 你的 .pt 路徑
+
+  index_col: datetime        # 或 timestamp
+  start: "2021-01-01"
+  end: null
+  columns:
+    time: ["datetime", "timestamp"]
+    ohlcv: ["open","high","low","close","volume"]
+
+cv:
+  type: Rolling   # [OddEven, Anchored, Rolling]
+
+  # type 1: 奇數月 train/val → 偶數月 test
+  scheme: odd_train_even_test  
+  start_month: "2021-01"       # 從這個月開始做 2-month folds
+  train_val_split: 0.7         # 奇數月內部 70/30 做 train/val
+  embargo_bars: 0              # 需要 purged/embargo 再開
+  
+  # type 2: Anchored 
+  test_freq: "M"
+  embargo_hours: 24
+  min_train_days: 30
+
+  # type 3: Rolling 
+  train_months: 12
+  embargo_hours: 24
+
+
+  num_workers: 16
+  pin_memory: true
+
+
+
+# =========================
+# 標籤與序列
+# =========================
+label:
+  horizon: 1                  # 用當下 → t+1 小時
+  flat_band_bps: 0            # 可固定值或交給 Optuna 搜一個區間（bps）
+  classes: {down: 0, flat: 1, up: 2}
+
+
+sequence:
+  seq_len: [24, 36, 48]       # 可固定 36，或給 [24, 36, 48] 讓 Optuna 選
+  step: 1                     # 每步向前 1 根
+  scaler: RobustScaler        # 標準化器（fit 只用 train，再 transform val/test）
+  shift_features_by: 1       # 訓練前一律 shift(1)
+
+features:
+  mode: precomputed
+  selection:
+    k_range: [64, 256]
+
+
+  # 危險/例外處理
+  safety:
+    ichimoku_shift_back_by_kijun: true   # 對 ISA/ISB 回移 kijun 期     
+
+    blocklist:
+      # —— 排除（避免洩漏/定義不清）——
+      - "VWAP_D"               # 若這欄是「整日完結」才算出的就丟掉
+      - "ISA_9"                # Ichimoku Senkou A（常見實作會前移到未來）
+      - "ISB_26"               # Ichimoku Senkou B（同上）
+      - "ICS_26"               # Chikou（若未確認對齊到 t−26，先排）
+      - "TOS_STDEVALL_LR"      # 全域統計（用到未來）
+      - "TOS_STDEVALL_L_1"
+      - "TOS_STDEVALL_U_1"
+      - "TOS_STDEVALL_L_2"
+      - "TOS_STDEVALL_U_2"
+      - "TOS_STDEVALL_L_3"
+      - "TOS_STDEVALL_U_3"
+      # —— 可選：避免重複（你若決定用 LOGRET_1，就先排掉 PCTRET_1）——
+      - "PCTRET_1"
+
+  postprocess:
+    na_ratio_max: 0.05
+    variance_min: 1.0e-12
+    corr_threshold: 0.98
+
+  always_on:
+    # 報酬/動能
+    - "LOGRET_1"
+    - "ROC_10"
+    - "MOM_10"
+    # 波動/風險
+    - "NATR_14"
+    # 趨勢/方向
+    - "ADX_14"
+    - "DMP_14"
+    - "DMN_14"
+    - "PPO_12_26_9"           # 若偏好 MACD 也可改成 "MACDh_12_26_9"
+    # 布林位置/帶寬
+    - "BBP_5_2.0"
+    - "BBB_5_2.0"
+    # 量價/資金流
+    - "OBV"
+    - "AOBV_LR_2"
+    - "MFI_14"
+    - "CMF_20"
+    # 震盪/超買超賣
+    - "RSI_14"                # 若想改 RSX 也可用 "RSX_14"
+    # Squeeze 狀態（擇一套：這裡用 PRO 版）
+    - "SQZPRO_ON_WIDE"
+    - "SQZPRO_ON_NORMAL"
+    - "SQZPRO_ON_NARROW"
+    - "SQZPRO_OFF"
+    - "SQZPRO_NO"
+    # Ichimoku（安全的線：無前移）
+    - "ITS_9"
+    - "IKS_26"
+    # 趨勢判斷（擇一保留）
+    - "SUPERTd_7_3.0"
+    # Vortex
+    - "VTXP_14"
+    - "VTXM_14"
+  
+
+  # =========================
+  # 特徵：pandas-ta 指標
+  # 以families分組
+  # =========================
+  families:
+    PPO:        ["^PPO_", "^PPOh_", "^PPOs_"]     # Percentage Price Oscillator（MACD 變形）
+    SQZ:        ["^SQZ_", "^SQZ_ON$", "^SQZ_OFF$", "^SQZ_NO$"]  # Squeeze momentum 指標
+    SQZPRO:     ["^SQZPRO_"]                      # Squeeze 專業版 (進階版)
+    BBANDS:     ["^BBL_", "^BBM_", "^BBU_", "^BBB_", "^BBP_", "^BBW_"]  # Bollinger Bands 各項成分
+    ICHIMOKU:   ["^ISA_", "^ISB_", "^ITS_", "^IKS_", "^ICS_"]    # Ichimoku 雲圖五條線
+    OBV_SET:    ["^OBV$", "^OBV_", "^OBVe_", "^AOBV_", "^PVT$", "^KVO_", "^PVO_"]  # 成交量相關（OBV、PVT、Klinger、PVO）
+    STOCH:      ["^STOCHk_", "^STOCHd_", "^K_9_3$", "^D_9_3$", "^J_9_3$"]  # Stochastic oscillator 隨機震盪
+    MACD_STC:   ["^MACD_", "^MACDh_", "^MACDs_", "^STC_", "^STCmacd_", "^STCstoch_"]  # 傳統 MACD + STC（自適應版）
+    RSI_RSX:    ["^RSI_", "^RSX_"]                # RSI / RSX（平滑變形）
+    MFI_CMF_EFI: ["^MFI_", "^CMF_", "^EFI_"]      # 三大資金流指標（Money/Chaikin/Elder）
+    MOM_RET:    ["^ROC_", "^MOM_", "^LOGRET_", "^PCTRET_"]  # 動能／報酬（%變化、對數回報）
+    VOL_TR:     ["^NATR_", "^ATR", "^TRUERANGE_", "^CHOP_", "^UI_", "^VHF_", "^INERTIA_", "^VAR_", "^STDEV_"]   # 波動性／真實區間／技術統計量（標準差、變異數等）
+    MAs:        ["^EMA_", "^SMA_", "^WMA_", "^ZL_EMA_", "^TEMA_", "^DEMA_", "^TRIMA_", "^HMA_", 
+                "^JMA_", "^KAMA_", "^VIDYA_", "^PWMA_", "^FWMA_", "^SWMA_", "^SINWMA_", "^HWMA_"]              # 所有型態的移動平均線（快速、平滑、低延遲）
+    DON_KEL:    ["^DCL_", "^DCM_", "^DCU_", "^KCLe_", "^KCBe_", "^KCUe_"]  # Donchian Channel / Keltner Channel
+    THERMO_DEC: ["^THERMO", "^DEC_", "^LDECAY_"]  # 熱度指標、衰減指標（例如 THERMO、指數衰減）
+    ZSCORES:    ["_Z_", "^ZS_"]                  # 標準化指標（Z-score）
+    CANDLE:     ["^CDL_"]                         # 所有蠟燭圖型態（TA-Lib output）
+    OTHER:      ["^QQE_", "^SMI_", "^PGO_", "^CTI_", "^AR_", "^BR_", "^BOP$", "^BIAS_", "^KST",
+                "^KURT_", "^SKEW_", "^UI_", "^RVG", "^RVI_"]
+                # 其他雜項指標（情緒、偏離、震盪器、統計特徵等）
+
+# =========================
+# 模型（PyTorch LSTM）
+# =========================
+model:
+  name: LSTM_SE
+  hidden_size: [64, 128, 256, 512]
+  n_layers: [1, 3]
+  dropout: [0.0, 0.5]
+  bidirectional: [false]
+  num_classes: 3
+  input_norm: layernorm_last
+
+
+# =========================
+# 訓練
+# =========================
+train:
+  lr: [1.0e-4, 3.0e-3]        # loguniform
+  weight_decay: [1.0e-6, 1.0e-2]
+  batch_size: 2048
+  epochs: [20, 100]
+  grad_clip: [0.0, 1.5]
+  early_stopping_patience: 20
+  amp: true
+
+# =========================
+# 目標與報告
+# =========================
+objective:
+  primary_metric: macro_prec
+  direction: maximize
+  penalty_on_num_features: 0.0  # 若你想鼓勵精簡，可設 1e-4 ~ 1e-3
+
+# =========================
+# Optuna 搜尋
+# =========================
+search:
+  n_trials: 1
+  timeout: 1    # 最長幾小時
+  sampler: tpe
+  pruner: median
+  pruner_warmup_folds: 2
+  epoch_pruning: false
+  seed: 42
