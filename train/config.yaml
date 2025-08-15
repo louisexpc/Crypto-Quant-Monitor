@@ -3,45 +3,109 @@
 # =========================
 seed: 42
 device: cuda
-project_name: btc_hourly_3class
+project_name: BTC_Transformer_target_loss_feature
+
+# =========================
+# 訓練設定
+# =========================
+train:
+  lr: [1.0e-5, 1.0e-3]        # loguniform
+  weight_decay: [1.0e-6, 1.0e-2]
+  batch_size: 8192
+  epochs: 200
+  grad_clip: [0.0, 1.5]
+  early_stopping_patience: 25
+  threshold: [0.2, 0.8]
+  amp: true
+  warmup_steps: 5
+
+# =========================
+# 目標與報告
+# =========================
+objective:
+  primary_metric: threshold_macro_f05
+  direction: maximize
+  penalty_on_num_features: 0.0  # 若你想鼓勵精簡，可設 1e-4 ~ 1e-3
+
+# =========================
+# Optuna 搜尋
+# =========================
+search:
+  n_trials: 1
+  timeout: 4    # 最長幾小時
+  sampler: tpe
+  pruner: median
+  pruner_warmup_folds: 2
+  epoch_pruning: false
+  seed: 42
 
 # =========================
 # 數據與切分
 # =========================
 data:
-  path: data/ohlcv_labeled/indicators.csv
+  path: data/ohlcv_labeled/BTC_1h_features.parquet
 
   use_pt_cache: false
-  pt_path: data/ohlcv_labeled/btc_1h_features.pt   # 你的 .pt 路徑
+  # pt_path: data/ohlcv_labeled/btc_1h_features.pt   # 你的 .pt 路徑
 
   index_col: datetime        # 或 timestamp
-  start: "2021-01-01"
+  start: "2023-01-01"
   end: null
   columns:
     time: ["datetime", "timestamp"]
     ohlcv: ["open","high","low","close","volume"]
 
+# corss val
 cv:
   type: Rolling   # [OddEven, Anchored, Rolling]
+  start_month: "2023-01-01"
+  train_val_split: [0.65, 0.9]     # train/val
+  test_freq: ["M", "2M"]
+  embargo_hours: [0, 168]
 
   # type 1: 奇數月 train/val → 偶數月 test
-  scheme: odd_train_even_test  
-  start_month: "2021-01"       # 從這個月開始做 2-month folds
-  train_val_split: 0.7         # 奇數月內部 70/30 做 train/val
+  scheme: odd_train_even_test    
   embargo_bars: 0              # 需要 purged/embargo 再開
   
   # type 2: Anchored 
-  test_freq: "M"
-  embargo_hours: 24
-  min_train_days: 30
+  min_train_days: 30   
 
   # type 3: Rolling 
-  train_months: 12
-  embargo_hours: 24
+  train_months: [3, 6, 9, 12, 18] # train fold 一次幾個月
 
 
+  # DataLoader 相關
   num_workers: 16
   pin_memory: true
+  prefetch_factor: 8
+  preload_gpu: true
+
+
+# =========================
+# 模型
+# =========================
+# model:
+#   name: LSTM_SE
+#   hidden_size: [64, 128, 256, 512]
+#   n_layers: [1, 3]
+#   dropout: [0.0, 0.5]
+#   bidirectional: [false]
+#   num_classes: 2
+#   input_norm: layernorm_last
+#   class_names: ["down", "up"]
+
+model:
+  name: "TemporalTransformer"
+  d_model: [64, 128, 256]    
+  n_heads: [2, 4, 8, 16]       
+  n_layers: [1, 4]
+  mlp_ratio: [2.0, 6.0]
+  dropout: [0.0, 0.3]
+  attn_dropout: [0.0, 0.1]
+  pooling: "mean"
+  num_classes: 2
+  class_names: ["down", "up"]
+
 
 
 
@@ -51,40 +115,54 @@ cv:
 label:
   horizon: 1                  # 用當下 → t+1 小時
   flat_band_bps: 0            # 可固定值或交給 Optuna 搜一個區間（bps）
-  classes: {down: 0, flat: 1, up: 2}
+  # classes: {down: 0, flat: 1, up: 2}
+  classes: {down: 0, up: 1}
 
 
 sequence:
-  seq_len: [24, 36, 48]       # 可固定 36，或給 [24, 36, 48] 讓 Optuna 選
-  step: 1                     # 每步向前 1 根
+  seq_len: 36                 # 可固定 36，或給 [24, 36, 48] 讓 Optuna 選
+  step: null                  # 每步向前 n 根
   scaler: RobustScaler        # 標準化器（fit 只用 train，再 transform val/test）
-  shift_features_by: 1       # 訓練前一律 shift(1)
+  shift_features_by: 1        # 訓練前一律 shift(1)
 
+
+# =========================
+# features
+# =========================
 features:
   mode: precomputed
   selection:
-    k_range: [64, 256]
-
+    # k_range: [64, 256]
+    k_range: null
 
   # 危險/例外處理
   safety:
-    ichimoku_shift_back_by_kijun: true   # 對 ISA/ISB 回移 kijun 期     
-
+    ichimoku_shift_back_by_kijun: true   # 對 ISA/ISB 回移 kijun 期    
     blocklist:
-      # —— 排除（避免洩漏/定義不清）——
-      - "VWAP_D"               # 若這欄是「整日完結」才算出的就丟掉
-      - "ISA_9"                # Ichimoku Senkou A（常見實作會前移到未來）
-      - "ISB_26"               # Ichimoku Senkou B（同上）
-      - "ICS_26"               # Chikou（若未確認對齊到 t−26，先排）
-      - "TOS_STDEVALL_LR"      # 全域統計（用到未來）
+      # —— 洩漏未來資訊（務必排除）——
+      - "VWAP_D"               # 當日最終值：若日內出現 → 洩漏
+      - "TOS_STDEVALL_LR"
       - "TOS_STDEVALL_L_1"
       - "TOS_STDEVALL_U_1"
       - "TOS_STDEVALL_L_2"
       - "TOS_STDEVALL_U_2"
       - "TOS_STDEVALL_L_3"
       - "TOS_STDEVALL_U_3"
-      # —— 可選：避免重複（你若決定用 LOGRET_1，就先排掉 PCTRET_1）——
-      - "PCTRET_1"
+      - "DEC_1"                # 常見未來衰減
+      - "LDECAY_5"
+      - "INC_1"                # 常見未來增量
+
+      # —— Ichimoku 雲圖：若未正確回移 → 洩漏（已處理）——
+      # - "ISA_9"
+      # - "ISB_26"
+      # - "ICS_26"
+
+      # —— 有條件保留（你需確認是否使用未來資訊）——
+      - "THERMO_20_2_0.5"
+      - "THERMOma_20_2_0.5"
+      - "THERMOl_20_2_0.5"
+      - "THERMOs_20_2_0.5"
+      - "PDIST"
 
   postprocess:
     na_ratio_max: 0.05
@@ -128,11 +206,7 @@ features:
     - "VTXP_14"
     - "VTXM_14"
   
-
-  # =========================
-  # 特徵：pandas-ta 指標
-  # 以families分組
-  # =========================
+  # 特徵：pandas-ta 指標 (以families分組)
   families:
     PPO:        ["^PPO_", "^PPOh_", "^PPOs_"]     # Percentage Price Oscillator（MACD 變形）
     SQZ:        ["^SQZ_", "^SQZ_ON$", "^SQZ_OFF$", "^SQZ_NO$"]  # Squeeze momentum 指標
@@ -155,48 +229,3 @@ features:
     OTHER:      ["^QQE_", "^SMI_", "^PGO_", "^CTI_", "^AR_", "^BR_", "^BOP$", "^BIAS_", "^KST",
                 "^KURT_", "^SKEW_", "^UI_", "^RVG", "^RVI_"]
                 # 其他雜項指標（情緒、偏離、震盪器、統計特徵等）
-
-# =========================
-# 模型（PyTorch LSTM）
-# =========================
-model:
-  name: LSTM_SE
-  hidden_size: [64, 128, 256, 512]
-  n_layers: [1, 3]
-  dropout: [0.0, 0.5]
-  bidirectional: [false]
-  num_classes: 3
-  input_norm: layernorm_last
-
-
-# =========================
-# 訓練
-# =========================
-train:
-  lr: [1.0e-4, 3.0e-3]        # loguniform
-  weight_decay: [1.0e-6, 1.0e-2]
-  batch_size: 2048
-  epochs: [20, 100]
-  grad_clip: [0.0, 1.5]
-  early_stopping_patience: 20
-  amp: true
-
-# =========================
-# 目標與報告
-# =========================
-objective:
-  primary_metric: macro_prec
-  direction: maximize
-  penalty_on_num_features: 0.0  # 若你想鼓勵精簡，可設 1e-4 ~ 1e-3
-
-# =========================
-# Optuna 搜尋
-# =========================
-search:
-  n_trials: 1
-  timeout: 1    # 最長幾小時
-  sampler: tpe
-  pruner: median
-  pruner_warmup_folds: 2
-  epoch_pruning: false
-  seed: 42

@@ -56,6 +56,10 @@ def sample_k_subset(
     """
     從 pool 中抽出 k 個特徵（保留 always_on），由 trial 控制 k 值與隨機種子。
     """
+    # 如果不限制: 全吃 (除了被block掉的)
+    if k_range == None:
+        return pool
+    
     k = trial.suggest_int("k_features", k_range[0], k_range[1])
     seed = trial.suggest_int("feat_seed", 0, 10**6 - 1)
     rng = np.random.default_rng(seed)
