@@ -1,0 +1,21 @@
+exchange:
+  id: mexc
+  default_type: swap
+
+range:
+  start: "2021-01-01"
+  end: null
+
+io:
+  outdir: "data/ohlcv"
+  fmt: "csv"
+  append: true
+
+fetch:
+  limit: 1000
+  sleep: 0.8
+  max_retries: 5
+
+monitoring:
+  - symbol: "BTC/USDT:USDT"
+    timeframes: ["5m","15m" ]

@@ -11,8 +11,10 @@ import optuna
 from pathlib import Path
 
 from objective import objective
-from utils.dataloader import load_pt_cache
+# from train.utils.dataloader_old import load_pt_cache
 from export_metrices import dump_best_yaml
+
+from utils.cuda_utils import setup_cuda_acceleration
 
 
 def set_seed(seed: int):
@@ -31,45 +33,41 @@ def load_cfg(path: str) -> dict:
 
 
 def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
-    use_pt = bool(cfg["data"].get("use_pt_cache", False))
-    if use_pt:
-        X_cpu, y_cpu, ts_cpu, cols = load_pt_cache(cfg["data"]["pt_path"])
-        assert ts_cpu is not None, "你的 .pt 檔缺少 'ts'（時間索引）"
-        assert cols is not None, "你的 .pt 檔缺少 'cols'（特徵名）"
+    path = cfg["data"]["path"]
+    index_col = cfg["data"]["index_col"]
 
-        df = pd.DataFrame(X_cpu.numpy(), index=ts_cpu, columns=cols)
-        df["label"] = y_cpu.numpy()
-        df = df.sort_index()
-        df = df.replace([np.inf, -np.inf], np.nan).dropna()
-
-        pt_bundle = {
-            "X": X_cpu,
-            "Y": y_cpu,
-            "TS": ts_cpu,
-            "FEAT_COLS": cols
-        }
-        return df, pt_bundle
-
+    # ===  根據副檔名選擇讀取方式 ===
+    if path.endswith(".csv"):
+        df = pd.read_csv(path, parse_dates=[index_col])
+    elif path.endswith(".parquet"):
+        df = pd.read_parquet(path)
+        if index_col not in df.columns and df.index.name != index_col:
+            raise ValueError(f"Parquet 檔缺少 index_col: {index_col}")
+        if df.index.name != index_col:
+            df = df.set_index(index_col)
+        df.index = pd.DatetimeIndex(df.index)
     else:
-        df = pd.read_csv(cfg["data"]["path"], parse_dates=[cfg["data"]["index_col"]]).set_index(cfg["data"]["index_col"])
-        if "label" not in df.columns:
-            h = int(cfg["label"]["horizon"])
-            band_bps = cfg["label"]["flat_band_bps"]
-            if isinstance(band_bps, list):
-                band_bps = int(np.mean(band_bps))
-            band = float(band_bps) / 10000.0
-            ret = np.log(df["close"].shift(-h) / df["close"])
-            label = pd.Series(np.where(ret >= band, 2, np.where(ret <= -band, 0, 1)), index=df.index, name="label")
-            df = pd.concat([df, label], axis=1)
+        raise ValueError("只支援 .csv 或 .parquet 檔案")
 
-        df = df.replace([np.inf, -np.inf], np.nan).dropna()
-        return df, None
+        # # === ✅ 自動加上 label（若缺） ===
+        # if "label" not in df.columns:
+        #     h = int(cfg["label"]["horizon"])
+        #     band_bps = cfg["label"]["flat_band_bps"]
+        #     if isinstance(band_bps, list):
+        #         band_bps = int(np.mean(band_bps))
+        #     band = float(band_bps) / 10000.0
+        #     ret = np.log(df["close"].shift(-h) / df["close"])
+        #     label = pd.Series(np.where(ret >= band, 2, np.where(ret <= -band, 0, 1)), index=df.index, name="label")
+        #     df = pd.concat([df, label], axis=1)
+
+        # df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    return df, None
 
 
 def run(cfg_path: str):
     cfg = load_cfg(cfg_path)
     set_seed(int(cfg.get("seed", 42)))
-    torch.set_float32_matmul_precision("high")
+    setup_cuda_acceleration()
 
     run_dir = Path("runs") / cfg.get("project_name", "exp")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -106,7 +104,7 @@ def run(cfg_path: str):
                    show_progress_bar=True)
 
     print("Best hyperparameters:", study.best_trial.params)
-    print("Best val macro-prec:", study.best_value)
+    print("Best val macro-f_05:", study.best_value)
 
     dump_best_yaml(study, cfg, run_dir)
 
