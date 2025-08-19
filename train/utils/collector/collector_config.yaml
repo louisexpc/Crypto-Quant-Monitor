@@ -3,11 +3,11 @@ exchange:
   default_type: swap
 
 range:
-  start: "2021-01-01"
+  start: "2024-01-01"
   end: null
 
 io:
-  outdir: "data/ohlcv"
+  outdir: "data/ohlcv_2024"
   fmt: "csv"
   append: true
 
@@ -18,4 +18,4 @@ fetch:
 
 monitoring:
   - symbol: "BTC/USDT:USDT"
-    timeframes: ["5m","15m" ]
+    timeframes: ["1h","15m" ]

@@ -6,3 +6,7 @@ data
 .csv
 recycle_bin
 runs
+k_group
+plots
+outputs
+cache_features

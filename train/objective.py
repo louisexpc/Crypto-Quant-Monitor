@@ -6,14 +6,11 @@ import torch
 import optuna
 from pathlib import Path
 
-from trainer import train_one_fold
+from train.recycle_bin.trainer_old import train_one_fold
 from utils.dataloader import FoldGenerator, make_loaders_for_fold
 
 from models.model_factory import build_model
-# from utils.anchored_loader import make_anchored_monthly_folds, make_rolling_monthly_folds, make_loaders_for_fold
-from hyp_utils import set_seed, build_feature_pool, sample_k_subset
-
-from utils.cuda_utils import setup_cuda_acceleration
+from utils.init_train import set_seed, build_feature_pool, sample_k_subset, setup_cuda_acceleration
 
 def suggest_float(trial, name, val, log_names=frozenset(("lr", "weight_decay"))):
     if isinstance(val, list) and len(val) == 2:
@@ -105,6 +102,7 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
     # ----- 抽超參數 -----
     cfg["train"]["lr"] = suggest_float(trial, "lr", cfg["train"]["lr"])
     cfg["train"]["weight_decay"] = suggest_float(trial, "weight_decay", cfg["train"]["weight_decay"])
+    cfg["train"]["batch_size"] = suggest_cat(trial, "batch_size", [512, 1024, 2048, 4096, 8192])
 
     grad_clip = cfg["train"]["grad_clip"]
     cfg["train"]["grad_clip"] = trial.suggest_float("grad_clip", *grad_clip)
@@ -148,7 +146,7 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
         # 2. n_heads
         n_heads = trial.suggest_categorical("n_heads", cfg["model"]["n_heads"])
 
-        # ✅ 加入合法性檢查（避免 transformer 爆炸）
+        # 加入合法性檢查（避免 transformer 爆炸）
         if d_model % n_heads != 0:
             raise optuna.TrialPruned()
 
@@ -181,8 +179,6 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
             cfg["model"]["attn_dropout"] = trial.suggest_float("attn_dropout", float(attdp[0]), float(attdp[1]))
         else:
             cfg["model"]["attn_dropout"] = float(attdp)
-
-
 
 
 
@@ -255,7 +251,7 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
 
     mean_score  = float(np.mean(fold_scores)) if fold_scores else 0.0
-    # mean_prec = float(np.mean(fold_scores)) 
+
 
 
 

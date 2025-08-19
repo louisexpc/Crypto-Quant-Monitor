@@ -35,3 +35,20 @@
 
     → [T, I, F, OHLC] → LSTM → 股價上漲/下跌預測
     I = 1 - |pos - neg| (e.g."It might go up" pos: 0.45, neg: 0.40 T = 0.45, I = 0.85, F = 0.40)
+
+
+7. RSI / MACD / %K / %D / CCI / ATR / BB / CMF / OBV / ADL：
+
+    RSI：相對強弱，衡量漲與跌的相對力度。
+
+    MACD：兩條 EMA 的差（快慢線）及其信號線，抓趨勢變化。
+
+    Stochastic（%K、%D）：收盤相對區間高低的位置（慣用超買超賣）。
+
+    CCI：價格相對「典型價的均值」的偏離度。
+
+    ATR：真實波幅的均值（衡量波動）。
+
+    BB：移動均值 ± 2σ 的通道（波動帶）。
+
+    CMF/OBV/ADL：把量價結合，近似衡量資金淨流入/流出。
