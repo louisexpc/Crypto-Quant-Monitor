@@ -1,0 +1,49 @@
+csv_path: data/ohlcv_labeled/indicators.csv
+
+leakage_blocklist:
+  - VWAP_D
+  - TOS_STDEVALL_LR
+  - TOS_STDEVALL_L_1
+  - TOS_STDEVALL_U_1
+  - TOS_STDEVALL_L_2
+  - TOS_STDEVALL_U_2
+  - TOS_STDEVALL_L_3
+  - TOS_STDEVALL_U_3
+  - DEC_1
+  - LDECAY_5
+  - INC_1
+  - THERMO_20_2_0.5
+  - THERMOma_20_2_0.5
+  - THERMOl_20_2_0.5
+  - THERMOs_20_2_0.5
+  - PDIST
+
+start_date: 2023-01-01
+end_date: 2025-01-01
+
+scalar: StandardScaler  # StandardScaler, RobustScaler, MinMaxScaler
+
+labels:
+  mode: vol    # "bps" | "vol" | "quantile" | "cost" | "triple"
+  k_vol: 0.25         # 容忍的波動倍數  (k_vol × σ)
+  vol_window: 36      # 已過去36根算
+
+
+k_min: 2
+k_max: 80
+
+# ======== for y corr ========
+# 計算出之best_k
+best_k: 10
+top_n: 5     # 每個cluster的topn
+
+
+
+# ======== for XGBoost_SFS ========
+
+# rolling cv
+train_window: 3
+embargo_hours: 24
+test_freq: M
+
+

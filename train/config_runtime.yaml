@@ -1,0 +1,163 @@
+# =========================
+# 基本實驗設定
+# =========================
+seed: 42
+device: cuda
+project_name: BTC_Trans_reg_v3
+
+# =========================
+# 訓練設定
+# =========================
+train:
+  lr: [1.0e-5, 1.0e-3]
+  weight_decay: [1.0e-6, 1.0e-2]
+  batch_size: 4096
+  epochs: 200
+  grad_clip: [0.0, 1.5]
+  early_stopping_patience: 20
+  threshold: null            # ← 只在分類時用，回歸可忽略
+  amp: true
+  warmup_epochs: 5
+  use_focal: false           # ← 回歸無效，分類才會用到
+  use_temperature: false     # ← 回歸無效，分類才會用到
+  # label_smoothing: 0.05    # ← 只在分類(CE)時有用，回歸忽略
+
+loss:
+  name: emamse_pearson       # "emamse_pearson" | "mse" | "huber"
+  alpha: 0.5
+  beta: 0.5
+  ema_decay: 0.9
+  huber_delta: 1.0
+  pearson_eps: 1e-8
+
+
+# =========================
+# 把回歸輸出轉成訊號/分類時用
+# =========================
+regression_to_class:
+  enabled: true
+  true_threshold: 0.0        # y_true 二值化門檻（>0 視為 1）
+  pred_strategy: opt_fbeta   # "zero" | "opt_fbeta"
+  fbeta: 0.5
+  grid_points: 101
+
+
+
+# =========================
+# Optuna 搜尋
+# =========================
+objective:
+  primary_metric: mixed   # or pearson / threshold_macro_f05 / macro_f1 / acc / val_loss
+  direction: minimize     # or maximize
+
+task:
+  type: regression        # or classification
+
+search:
+  n_trials: 10
+  timeout: 2    # 小時
+  sampler: tpe
+  pruner: median
+  pruner_warmup_folds: 10
+  epoch_pruning: false
+  seed: 42
+
+# =========================
+# 數據與切分（← 改用「原始 OHLCV」檔案路徑）
+# =========================
+data:
+  path: data/ohlcv_2024/mexc_swap_BTC-USDT-USDT_1h.csv   #「原始 OHLCV」CSV/Parquet（含 datetime/timestamp + OHLCV）
+  index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
+  freq: "1H"                    # 供缺口提醒（不會自動補齊）
+  columns:
+    time: ["datetime", "timestamp"]
+    ohlcv: ["open","high","low","close","volume"]
+
+# Cross-Validation
+cv:
+  type: Rolling                 # [OddEven, Anchored, Rolling]
+  start_month: "2024-01-01"
+  train_val_split: [0.65, 0.9]  # train/val
+  test_freq: ["M", "2M"]
+  embargo_hours: [24, 48]
+  min_train_days: 30
+  train_months: [1, 3, 5, 7, 9]
+
+# =========================
+# 模型（回歸時請輸出1維）
+# =========================
+model:
+  name: "TemporalTransformer"
+  d_model: [64, 128, 256, 512]
+  n_heads: [2, 4, 8]
+  n_layers: [2, 3, 4]
+  mlp_ratio: [2.0, 6.0]
+  dropout: [0.0, 0.2]
+  attn_dropout: [0.0, 0.05]
+  pooling: ["cls"]
+  use_causal: [true]
+  
+  use_alibi: [false]
+  alibi_slope: [0.01, 0.10]
+  use_conv_stem: [false]
+  use_input_norm: [false]
+  use_learned_pos: [false]
+  droppath: [0.00, 0.02]
+
+  num_classes: 1             # ★ 回歸=1，分類再改成2
+  # class_names: ["down", "up"]  # ★ 回歸不需要
+
+# model:
+#   name: LSTM_SE
+#   hidden_size: [64, 128, 192, 256]
+#   n_layers: [1, 3]
+#   dropout: [0.0, 0.3]
+#   bidirectional: [false]
+#   num_classes: 1
+#   input_norm: layernorm_last
+#   class_names: ["down", "up"]
+
+# =========================
+# 標籤與序列
+# =========================
+label:
+  horizon: 1
+  ret_kind: logret             # 或 simple（runtime 產生 0/1 標籤）
+
+sequence:
+  seq_len: 36
+  step: 1
+  scaler: StandardScaler
+  shift_features_by: 0         # ★ 重要：Indicators 已經對所有特徵 shift(1) 防洩漏
+
+# =========================
+# Runtime 特徵（由 Indicators 動態計算與快取）
+# =========================
+features:
+  cache_dir: cache_features
+  plan:
+    features:
+      - {name: RSI,   kwargs: {length: 30},  enabled: true}
+      - {name: MACD,  kwargs: {fast: 12, slow: 26, signal: 9}, enabled: true}
+      - {name: MOM,   kwargs: {length: 30},  enabled: true}
+      - {name: STOCH, kwargs: {k: 30,  d: 3, smooth_k: 3}, enabled: true}
+      - {name: STOCH, kwargs: {k: 200, d: 3, smooth_k: 3}, enabled: true}
+      - {name: RSI,   kwargs: {length: 14},  enabled: true}
+      
+      - {name: DPO,       kwargs: {length: 20}, enabled: true}
+      - {name: PVO,       kwargs: {fast: 12, slow: 26, signal: 9}, enabled: true}
+      - {name: BOP,       kwargs: {}, enabled: true}
+      - {name: BBP,       kwargs: {length: 5, std: 2.0}, enabled: true}
+      - {name: MASSI,     kwargs: {fast: 9, slow: 25}, enabled: true}
+      - {name: KDJ,       kwargs: {k: 9, d: 3, smooth_k: 3}, enabled: true}
+      - {name: WILLR,     kwargs: {length: 14}, enabled: true}
+      - {name: LOGRET,    kwargs: {length: 1}, enabled: true}
+      - {name: UO,        kwargs: {fast: 7, medium: 14, slow: 28}, enabled: true}
+      - {name: RVI,       kwargs: {length: 14}, enabled: true}
+      - {name: TRUERANGE, kwargs: {}, enabled: true}
+      - {name: AMATE_LR,  kwargs: {fast: 8, slow: 21, mamode: 2}, enabled: true}
+      - {name: SLOPE,     kwargs: {length: 1}, enabled: true}
+      - {name: EBSW,      kwargs: {length: 40, mamode: 10}, enabled: true}
+      - {name: CCI,       kwargs: {length: 14, c: 0.015}, enabled: true}
+      - {name: ZS,        kwargs: {length: 30}, enabled: true}
+      - {name: PVR,       kwargs: {}, enabled: false}
