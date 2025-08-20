@@ -1,3 +1,4 @@
+# model_factory.py
 from typing import Dict
 from .LSTM import LSTM_SE
 from .Transformer import TemporalTransformer
@@ -13,7 +14,7 @@ def build_model(cfg: Dict, n_features: int):
     
     mcfg = cfg["model"]
     name = mcfg['name']
-    num_classes = int(mcfg.get("num_classes", 2))
+    num_classes = cfg["model"]["num_classes"]
 
     
     if name == "LSTM_SE":
@@ -38,14 +39,13 @@ def build_model(cfg: Dict, n_features: int):
             dropout        = float(mcfg.get("dropout", 0.1)),
             attn_dropout   = float(mcfg.get("attn_dropout", 0.0)),
             pooling        = str(mcfg.get("pooling", "attn")),       # ← 預設 attn，比 mean 更穩
-            # use_learned_pos= bool(mcfg.get("use_learned_pos", False)),
-            causal     = bool(mcfg.get("use_causal", True)),     # ← 預設打開因果注意力
-            # use_alibi      = bool(mcfg.get("use_alibi", True)),      # ← 相對距離偏置
-            # alibi_slope    = float(mcfg.get("alibi_slope", 0.05)),
-            # use_conv_stem  = bool(mcfg.get("use_conv_stem", True)),  # ← 局部形狀
-            # droppath       = float(mcfg.get("droppath", 0.05)),      # ← Stochastic Depth
-            # use_input_norm = bool(mcfg.get("use_input_norm", True)), # ← 對輸入做 LN
         )
+    
+    if name in {"xgb", "xgboost", "xgb_reg", "xgbregressor"}:
+        from models.xgb_model import XGBRegressorModel
+        return XGBRegressorModel.from_cfg(cfg)
+    
+
     else:
         raise ValueError(f"Unknown model name: {name}")
 

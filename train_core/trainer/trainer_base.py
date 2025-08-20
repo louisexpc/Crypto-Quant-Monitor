@@ -1,11 +1,14 @@
-import copy
+# trainer_base.py
 import torch
 import torch.nn.functional as F
-from torch import nn
+
 from torch import amp
 from sklearn.metrics import roc_curve
 
-# 可選：你的 CUDA/TF32/AMP 初始化
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from utils.init_train import setup_cuda_acceleration
 setup_cuda_acceleration()
 

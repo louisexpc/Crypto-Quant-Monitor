@@ -9,8 +9,11 @@ from .trainer_base import (
     infer_class_weights, fit_temperature_ce, find_best_threshold_by_auc
 )
 
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # 匯出/視覺化/度量
-from compute_export_metrices import (
+from utils.compute_export_metrices import (
     save_fold_metrics, save_result, compute_metrics, plot_test_eval
 )
 

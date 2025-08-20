@@ -19,15 +19,15 @@ import pandas as pd
 import yaml
 
 # ---- Objective ----
-from objective_runtime import objective
+from objective.objective import objective
 
 # ---- Exports / Reporting（與 trainer.py 同源）----
-from compute_export_metrices import dump_best_yaml
+from utils.compute_export_metrices import dump_best_yaml
 
 # ---- Runtime features ----
 from utils.init_train import setup_cuda_acceleration, set_seed
-from utils.indicators_runtime import Indicators, PAPER_TOP8_PLAN
-from utils.build_features import build_features_and_label_runtime
+from build_feature_loader.indicators import Indicators
+from build_feature_loader.build_features import build_features_and_label
 
 
 # ======================================================================
@@ -44,10 +44,8 @@ def load_cfg(path: str) -> dict:
 def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
     path = cfg["data"]["path"]
     index_col = cfg["data"]["index_col"]      # "timestamp" or "datetime"
-    freq = cfg["data"].get("freq", None)
 
-    task_type = (cfg.get("task", {}) or {}).get("type", "classification").lower()
-    true_thr  = float(cfg.get("regression_to_class", {}).get("true_threshold", 0.0))
+    task_type = str(cfg["task"]["type"]).lower()
 
     # 讀原始 OHLCV
     if path.endswith(".csv"):
@@ -60,24 +58,21 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
     # Indicators（照你原有流程）
     ind = Indicators(
         df_raw,
-        cache_dir=cfg["features"].get("cache_dir", "cache_features"),
-        freq_check=freq,
+        cache_dir=cfg["features"]["cache_dir"],
+        freq_check=cfg["data"]["freq"],
         prefer_time_col=index_col,
     )
-    plan = cfg["features"].get("plan", PAPER_TOP8_PLAN)
+    plan = cfg["features"]["plan"]
     feat_df = ind.compute(plan)
     feat_path = ind.cache_path_for(plan)
 
-    # ★ 關鍵：把 task_type / cls_threshold 傳入，回歸→連續 target、分類→二值 label
-    X_df, y_s = build_features_and_label_runtime(
+    #   回歸→連續 target、分類→二值 label
+    X_df, y_s = build_features_and_label(
         df_base=ind.df,
         feat_parquet_path=feat_path,
         feat_df=feat_df,
-        horizon=int(cfg["label"].get("horizon", 1)),
-        ret_kind=cfg["label"].get("ret_kind", "logret"),
-        task_type=task_type,
-        cls_threshold=true_thr,
-    )
+        cfg=cfg)
+        
 
     # 小檢查與資訊
     if task_type == "regression":
@@ -100,10 +95,10 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
 # Section C. 建立 Study（Optuna）
 # ======================================================================
 def build_study(cfg: dict, run_dir: Path) -> optuna.Study:
-    study_name = cfg.get("project_name", "study")
-    task = (cfg.get("task", {}) or {}).get("type", "classification")
-    primary = (cfg.get("objective", {}) or {}).get("primary_metric", "macro_f1")
-    direction = (cfg.get("objective", {}) or {}).get("direction", "maximize")
+    study_name = cfg["project_name"]
+    task = str(cfg["task"]["type"]).lower()
+    primary = cfg["objective"]["primary_metric"]
+    direction = cfg["objective"]["direction"]
 
     # 模型摘要（讓 DB 名稱更具體）
     def _sig(lst):
@@ -126,12 +121,12 @@ def build_study(cfg: dict, run_dir: Path) -> optuna.Study:
         load_if_exists=True,
         direction=direction,  # "maximize" / "minimize" 與 objective_runtime 保持一致
         sampler=optuna.samplers.TPESampler(
-            seed=cfg["search"].get("seed", 2025),
-            multivariate=True,          # 通常更穩
+            seed=cfg["search"]["seed"],
+            multivariate=True,       
             group=True
-        ),
+        ),        
         pruner=optuna.pruners.MedianPruner(
-            n_warmup_steps=cfg["search"].get("pruner_warmup_folds", 2)  # 以「fold」作為 step
+            n_warmup_steps=cfg["search"]["pruner_warmup_folds"]  # 以「fold」作為 step
         ),
     )
     return study
@@ -178,5 +173,6 @@ def run(cfg_path: str):
 # Section E. 入口
 # ======================================================================
 if __name__ == "__main__":
-    # 例如：train/config_runtime.yaml
-    run("train/config_runtime.yaml")
+    import xgboost as xgb
+    print("XGB==============================",xgb.__version__)
+    run("train_core/config.yaml")
