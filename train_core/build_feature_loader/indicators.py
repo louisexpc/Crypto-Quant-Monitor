@@ -134,58 +134,6 @@ class Indicators:
         else:
             raise ValueError(f"未知時間欄位型態：{kind}")
         
-    # === 放進 Indicators 類別裡 ===
-    def _leak_check_single(self, builder_fn, name: str, kwargs: dict, n_cuts: int = 4, seed: int = 42):
-        """
-        檢查單一指標是否偷看未來（prefix invariance test）
-        步驟：對若干個隨機 cut t，分別用 df[:t] 與 df[:N] 計算，比較在 (t-1) 的值是否一致（考慮 shift(1)）
-        回傳 (ok: bool, msg: str|None)
-        """
-        rng = np.random.default_rng(seed)
-        N = len(self.df)
-        if N < 200:
-            return True, None  # 太短不測
-
-        # 隨機選擇幾個 cut（避開太前/太後，保留窗口）
-        cuts = rng.integers(low=int(N*0.3), high=int(N*0.9), size=n_cuts)
-
-        # 全長版本（作為參考）
-        full = builder_fn(kwargs)
-        full = full.shift(1)  # 與 compute() 保持一致
-        full = full.replace([np.inf, -np.inf], np.nan)
-
-        if not isinstance(full, pd.DataFrame):
-            full = pd.DataFrame(full)
-
-        colnames = list(full.columns)
-
-        for t in cuts:
-            # 截斷到 t 的版本
-            df_trunc = self.df.iloc[:t].copy()
-            # 用相同 builder，但要能在截斷 df 上跑；因此 builder_fn 需關聯 self.df
-            # 我們暫時把 self.df 換掉，跑完再換回來
-            df_backup = self.df
-            try:
-                self.df = df_trunc
-                trunc = builder_fn(kwargs).shift(1).replace([np.inf, -np.inf], np.nan)
-                if not isinstance(trunc, pd.DataFrame):
-                    trunc = pd.DataFrame(trunc)
-            finally:
-                self.df = df_backup
-
-            # 比較第 (t-1) 的值（該點若需要未來才有值，兩者會不同）
-            idx = full.index[min(t-1, len(full)-1)]
-            for c in colnames:
-                v_full  = full.loc[idx, c] if c in full.columns else np.nan
-                v_trunc = trunc.loc[idx, c] if (c in trunc.columns and idx in trunc.index) else np.nan
-                # 允許 NaN 相等
-                if pd.isna(v_full) and pd.isna(v_trunc):
-                    continue
-                # 允許極小數值誤差
-                if not (pd.notna(v_full) and pd.notna(v_trunc) and np.allclose(v_full, v_trunc, atol=1e-8, rtol=1e-5)):
-                    return False, f"[LEAK?] {name} at {idx} col={c}: full={v_full} vs trunc={v_trunc}"
-
-        return True, None
 
     # ---------- 指紋（資料 + 計畫） ----------
     @staticmethod
@@ -379,6 +327,11 @@ class Indicators:
     def _builders(self):
         # 乾淨的 name → builder 對應
         return {
+            "OPEN":   lambda kw: self.df[["open"]],
+            "HIGH":   lambda kw: self.df[["high"]],
+            "LOW":    lambda kw: self.df[["low"]],
+            "CLOSE":  lambda kw: self.df[["close"]],
+            "VOLUME": lambda kw: self.df[["volume"]],
             "RSI":   lambda kw: self._build_RSI(self.df, **kw),
             "MACD":  lambda kw: self._build_MACD(self.df, **kw),
             "MOM":   lambda kw: self._build_MOM(self.df, **kw),
@@ -416,56 +369,34 @@ class Indicators:
         if len(eff_plan.get("features", [])) == 0:
             raise ValueError("計畫中沒有任何 enabled=True 的特徵，請確認 plan 或 Optuna 開關。")
         
+       
         # 2) 以『資料指紋 + 有效計畫指紋』組合快取鍵
         df_fp = self._fingerprint_df(self.df)
-        pl_fp = self._fingerprint_plan(plan)
+        pl_fp = self._fingerprint_plan(eff_plan)
         cpath = self._cache_path(df_fp, pl_fp)
 
         if cpath.exists():
             return pd.read_parquet(cpath)        
-        
-        # # 3) 動態計算
-        # parts = []
-        # for item in eff_plan["features"]:
-        #     name   = item["name"].upper()
-        #     kwargs = item.get("kwargs", {})
-        #     if name not in self._builders:
-        #         raise ValueError(f"Unknown indicator: {name}")
-        #     f = self._builders[name](kwargs)
 
-        #     # 防洩漏：統一 shift(1)
-        #     parts.append(f.shift(1))
-
-
+        # 3) 根據 _builders 建構所有特徵（含 ohlcv）
         parts = []
         for item in eff_plan["features"]:
-            name   = item["name"].upper()
+            name = item["name"].upper()
             kwargs = item.get("kwargs", {})
             if name not in self._builders:
                 raise ValueError(f"Unknown indicator: {name}")
-
-            builder = self._builders[name]  # 這是 lambda kw: self._build_XXX(self.df, **kw)
-
-            # （可選）先跑防漏檢查：prefix invariance
-            
-            ok, msg = self._leak_check_single(builder, name, kwargs, n_cuts=4, seed=42)
-            if not ok:
-                raise RuntimeError(msg)
-
-            f = builder(kwargs)
-
-            # 一律防洩漏
-            if isinstance(f, pd.Series):
-                f = f.to_frame()
-            # 確保只有單欄（保守）
-            if f.shape[1] > 1:
-                f = f.iloc[:, [0]]
-
-            parts.append(f.shift(1))
-
+            feat = self._builders[name](kwargs)
+            feat = feat.shift(1)
+            parts.append(feat)
+        
         # 4) 合併/清理/快取
-        feat = pd.concat(parts, axis=1)
+        feat = pd.concat(parts, axis=1).astype("float32")
         feat = feat.replace([np.inf, -np.inf], np.nan).dropna()
+
+        dups = feat.columns[feat.columns.duplicated()]
+        if len(dups):
+            raise ValueError(f"Duplicate feature names found: {list(dups)}")
+
         feat.to_parquet(cpath, index=True)
         return feat
     

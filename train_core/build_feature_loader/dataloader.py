@@ -7,13 +7,6 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler
 from typing import Literal, Optional
 
-# 小工具：從 cfg 判斷任務
-def _task_type_from_cfg(cfg: dict) -> str:
-    if "task" in cfg and "type" in cfg["task"]:
-        return str(cfg["task"]["type"]).lower()
-    if "target" in cfg and "type" in cfg["target"]:
-        return str(cfg["target"]["type"]).lower()
-    return "classification" if int(cfg["model"].get("num_classes", 1)) >= 2 else "regression"
 
 def split_fold_to_indices(df: pd.DataFrame, fold: dict, cfg: dict):
     train_val_mask = fold["train_val_mask"]
@@ -23,7 +16,7 @@ def split_fold_to_indices(df: pd.DataFrame, fold: dict, cfg: dict):
     df_tv = df.loc[train_val_mask].sort_index()
     df_te = df.loc[test_mask].sort_index()
 
-    split_ratio = cfg.get("data", {}).get("train_val_split", 0.8)
+    split_ratio = cfg["cv"]["train_val_split"]
     split_idx = int(len(df_tv) * split_ratio)
 
     tr_idx = df_tv.index[:split_idx]
@@ -32,56 +25,10 @@ def split_fold_to_indices(df: pd.DataFrame, fold: dict, cfg: dict):
 
     return tr_idx, va_idx, te_idx
 
-# ========== Dataset for sequence-to-label ==========
-# class SeqDataset(Dataset):
-#     def __init__(self, X_df, y_s, seq_len: int, scaler: RobustScaler | None = None, device: str = "cuda"):
-#         X = X_df.values.astype(np.float32, copy=False)
-#         if scaler is not None:
-#             X = scaler.transform(X).astype(np.float32, copy=False)
-#         y = y_s.values.astype(np.int64, copy=False)
-
-#         self.X = torch.from_numpy(X).contiguous()
-#         self.y = torch.from_numpy(y).contiguous()
-#         self.L = int(seq_len)
-#         # 以序列末端對齊標籤（label 早已是 t→t+1 小時／或你自定義的 horizon）
-#         self.idx = np.arange(self.L - 1, len(X) - 1)
-
-#     def __len__(self):
-#         return len(self.idx)
-
-#     def __getitem__(self, i):
-#         j = self.idx[i]
-#         x_seq = self.X[j - self.L + 1: j + 1]  # [T, F]
-#         y_val = self.y[j]
-#         return x_seq, y_val
-    
-# # 直接load進VRAM
-# class PreloadSeqDataset(torch.utils.data.Dataset):
-#     def __init__(self, X_df, y_s, seq_len: int, scaler: RobustScaler | None = None, device="cuda"):
-#         X = X_df.values.astype(np.float32, copy=False)
-#         if scaler is not None:
-#             X = scaler.transform(X).astype(np.float32, copy=False)
-#         y = y_s.values.astype(np.int64, copy=False)
-
-#         L = int(seq_len)
-#         idx = np.arange(L - 1, len(X) - 1)
-
-#         X_seqs = np.stack([X[j - L + 1: j + 1] for j in idx])  # shape: [N, T, F]
-#         y_vals = y[idx]                                        # shape: [N]
-
-#         self.X = torch.tensor(X_seqs, dtype=torch.float32, device=device)
-#         self.y = torch.tensor(y_vals, dtype=torch.long, device=device)
-
-#     def __len__(self):
-#         return len(self.y)
-
-#     def __getitem__(self, i):
-#         return self.X[i], self.y[i]
-
 # -------------------------
-# Preload 到 GPU 的 Dataset
+#  Dataset
 # -------------------------
-class PreloadSeqDataset(Dataset):
+class SeqDataset(Dataset):
     def __init__(
         self,
         X_df,
@@ -124,8 +71,10 @@ class PreloadSeqDataset(Dataset):
 
 # ========== Fold Generator ==========
 class FoldGenerator:
-    def __init__(self, dt_index: pd.DatetimeIndex, mode: str = "rolling", start_month: str = "2021-01-01", **kwargs):
-        # 移除時區資訊（轉換為 naive），且記錄起始時間戳
+    def __init__(self, dt_index: pd.DatetimeIndex, mode: str = "rolling", start_month: str | None = None, **kwargs):
+        """
+        僅根據 index 生成 fold。此 index 應已經過 build_features_and_label 切過範圍。
+        """
         if getattr(dt_index, "tz", None) is not None:
             dt_index = dt_index.tz_convert("Asia/Taipei").tz_localize(None)
         self.dt_index = dt_index
@@ -166,7 +115,6 @@ class FoldGenerator:
             if m.month % 2 == 1:  # 奇數月
                 next_month = m + 1
                 if next_month in self.months:
-                    # ★ 3) 這裡改成用 idx（去時區後），避免 timezone 警告與遮罩錯位
                     train_val_mask = (self.dt_index.to_period("M") == m)
                     test_mask      = (self.dt_index.to_period("M") == next_month)
                     folds.append({
@@ -176,6 +124,7 @@ class FoldGenerator:
                         'test_month':      str(next_month),
                     })
         return folds
+
 
     # =========================
     # 2) Anchored folds 產生器（重點）
@@ -263,71 +212,11 @@ class FoldGenerator:
             })
         return folds
 
-
-# # ========== Build DataLoaders ==========
-# def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, preload_gpu=True):
-#     task_type = _task_type_from_cfg(cfg)
-#     is_reg = (task_type == "regression")
-
-#     tr_idx, va_idx, te_idx = split_fold_to_indices(df, fold, cfg)
-#     X_tr, y_tr = df.loc[tr_idx, feat_cols], df.loc[tr_idx, target_col]
-#     X_va, y_va = df.loc[va_idx, feat_cols], df.loc[va_idx, target_col]
-#     X_te, y_te = df.loc[te_idx, feat_cols], df.loc[te_idx, target_col]
-
-#     # --- 特徵縮放器設定 ---
-#     scaler_kind = (cfg.get("features", {}) or {}).get("scaler", "robust")
-#     if scaler_kind == "robust":
-#         scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(10.0, 90.0))
-#     elif scaler_kind == "standard":
-#         scaler = StandardScaler()
-#     elif scaler_kind == "minmax":
-#         scaler = MinMaxScaler()
-#     else:
-#         scaler = None
-#     if scaler is not None:
-#         scaler.fit(X_tr.values.astype(np.float32, copy=False))
-
-#     # --- 基本設定 ---
-#     L = int(cfg["sequence"]["seq_len"])
-#     label_dtype = "float" if is_reg else "long"
-#     device = cfg.get("train", {}).get("device", "cuda")
-
-#     # --- Dataset 選擇：是否 preload 到 GPU ---
-#     dataset_cls = PreloadSeqDataset if preload_gpu else SeqDataset
-#     dataset_kwargs = dict(seq_len=L, scaler=scaler, label_dtype=label_dtype)
-#     if preload_gpu:
-#         dataset_kwargs["device"] = device
-
-#     ds_tr = PreloadSeqDataset(X_tr, y_tr, **dataset_kwargs)
-#     ds_va = PreloadSeqDataset(X_va, y_va, **dataset_kwargs)
-#     ds_te = PreloadSeqDataset(X_te, y_te, **dataset_kwargs)
-
-#     # --- DataLoader ---
-#     bs = int(cfg["train"]["batch_size"])
-#     num_workers = 0 if preload_gpu else int(cfg["train"].get("num_workers", 2))  # preload 模式不需 worker
-#     pin_mem = not preload_gpu  # preload 模式不用 pin_memory
-
-#     train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=True)
-#     val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False)
-#     test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False)
-
-#     # --- Debug：檢查回歸 label 是否正常 ---
-#     if is_reg:
-#         xb, yb = next(iter(train_loader))
-#         s = float(yb.float().std().item()); u = float(yb.float().mean().item())
-#         print(f"[Data] regression labels check: mean={u:.3e}, std={s:.3e}")
-#         if s == 0.0:
-#             print("[ALERT][dataloader] regression labels std=0 on train batch! 可能被轉整數或切窗錯位。")
-
-#     return train_loader, val_loader, test_loader, {"feat_cols": feat_cols, "target_col": target_col}
-
-
 # -------------------------
 # DataLoader 組裝（永遠 preload）
 # -------------------------
-def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, preload_gpu=True):
-    # 任務型態
-    task_type = _task_type_from_cfg(cfg)
+def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool = False):
+    task_type = cfg["task"]["type"]
     is_reg = (task_type == "regression")
 
     # 時序切分（直接依 YAML 的 train_val_split）
@@ -335,9 +224,12 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, preload_gpu=True
     X_tr, y_tr = df.loc[tr_idx, feat_cols], df.loc[tr_idx, target_col]
     X_va, y_va = df.loc[va_idx, feat_cols], df.loc[va_idx, target_col]
     X_te, y_te = df.loc[te_idx, feat_cols], df.loc[te_idx, target_col]
+    # print("[DEBUG] y_tr.describe():\n", pd.Series(y_tr).describe())
+    # print("[DEBUG] y_tr.unique():", pd.Series(y_tr).unique())
 
-    # Scaler（只 fit 在 train）
-    scaler_kind = (cfg.get("features", {}) or {}).get("scaler", "robust")
+    # Scaler（只 fit 在 train，否則會洩漏）
+    scaler_kind = cfg["sequence"]["scaler"]
+
     if scaler_kind == "robust":
         scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(10.0, 90.0))
     elif scaler_kind == "standard":
@@ -346,23 +238,44 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, preload_gpu=True
         scaler = MinMaxScaler()
     else:
         scaler = None
+
     if scaler is not None:
         scaler.fit(X_tr.values.astype(np.float32, copy=False))
 
-    # 參數
+    # ====== 給 DL 的 Loader（保持原樣）======
     L = int(cfg["sequence"]["seq_len"])
     label_dtype = "float" if is_reg else "long"
-    device = cfg.get("train", {}).get("device", "cuda")
+    device = cfg["device"]
     bs = int(cfg["train"]["batch_size"])
 
     # 永遠使用 Preload 到 GPU
-    ds_tr = PreloadSeqDataset(X_tr, y_tr, L, scaler=scaler, device=device, label_dtype=label_dtype)
-    ds_va = PreloadSeqDataset(X_va, y_va, L, scaler=scaler, device=device, label_dtype=label_dtype)
-    ds_te = PreloadSeqDataset(X_te, y_te, L, scaler=scaler, device=device, label_dtype=label_dtype)
+    ds_tr = SeqDataset(X_tr, y_tr, L, scaler=scaler, device=device, label_dtype=label_dtype)
+    ds_va = SeqDataset(X_va, y_va, L, scaler=scaler, device=device, label_dtype=label_dtype)
+    ds_te = SeqDataset(X_te, y_te, L, scaler=scaler, device=device, label_dtype=label_dtype)
 
     # DataLoader：簡潔版（preload → num_workers=0, pin_memory=False）
-    train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=False,  drop_last=False, num_workers=0, pin_memory=False)
+    train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
     val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
     test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
 
-    return train_loader, val_loader, test_loader, {"feat_cols": feat_cols, "target_col": target_col}
+    info = {"feat_cols": feat_cols, "target_col": target_col}
+
+
+    # ====== 給 XGB 的 numpy（沿用同一個 scaler.transform，無洩漏）======
+    if also_XGB:
+        Xtr = X_tr.values.astype(np.float32, copy=False)
+        Xva = X_va.values.astype(np.float32, copy=False)
+        Xte = X_te.values.astype(np.float32, copy=False)
+        if scaler is not None:
+            Xtr = scaler.transform(Xtr).astype(np.float32, copy=False)
+            Xva = scaler.transform(Xva).astype(np.float32, copy=False)
+            Xte = scaler.transform(Xte).astype(np.float32, copy=False)
+        y_dtype = np.float32 if cfg["task"]["type"] == "regression" else np.int64
+        info["XGB"] = {
+            "X_tr": Xtr, "y_tr": y_tr.values.astype(y_dtype, copy=False),
+            "X_va": Xva, "y_va": y_va.values.astype(y_dtype, copy=False),
+            "X_te": Xte, "y_te": y_te.values.astype(y_dtype, copy=False),
+            "scaler": scaler,
+        }
+
+    return train_loader, val_loader, test_loader, info

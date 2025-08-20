@@ -73,6 +73,7 @@ def run_kmeans_clustering(X_t_scaled: np.ndarray,
         - best_k: 最佳的 k 值（對應最大 Silhouette 分數）
         - sil_scores: 每個 k 對應的 Silhouette 分數 list
     """
+    
     if start_date and end_date:
         save_dir = fr"{save_dir}/k_group_v2_{str(start_date)}_to_{str(end_date)}"
     os.makedirs(save_dir, exist_ok=True)

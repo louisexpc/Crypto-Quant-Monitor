@@ -1,3 +1,4 @@
+# trainer_reg.py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,16 +7,19 @@ from torch import amp
 from .trainer_base import (
     amp_dtype, build_optimizer, build_warmup_scheduler, build_grad_scaler
 )
+from .xgb_trainer import _train_one_fold_xgb
 
+import os
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # 回歸度量/損失/圖表
-from regression_utils import (
-    compute_regression_metrics, build_regression_loss
-)
-from compute_export_metrices import (
+from utils.regression_utils import compute_regression_metrics, build_regression_loss
+from utils.compute_export_metrices import (
     save_fold_metrics, save_result,
     plot_regression_eval, plot_regression_threshold_sweep,
     compute_mixed_objective_np
 )
+from models.xgb_model import XGBRegressorModel
 
 def train_one_fold(
     model,
@@ -27,6 +31,13 @@ def train_one_fold(
     fold_id: int | None = None,
     export_dir: str | None = None
 ):
+    
+    # === XGB 分支：直接改走 numpy 訓練，略過整個 torch 流程 ===
+    if XGBRegressorModel is not None and isinstance(model, XGBRegressorModel):
+        return _train_one_fold_xgb(model, cfg, fold_id, export_dir)
+    
+
+    # === DL: PyTorch 訓練迴圈 ===
     if len(train_loader) == 0:
         print("[ERROR][trainer_reg] empty train loader")
         return None, None
@@ -226,8 +237,8 @@ def train_one_fold(
     }
 
     # 可選：回歸→分類門檻掃描
-    reg2cls = (cfg.get("regression_to_class", {}) or {})
-    if reg2cls.get("enabled", False):
+    reg2cls = cfg["regression_to_class"]
+    if reg2cls["enabled"]:
         plot_regression_threshold_sweep(
             y_true_reg=y_te, y_pred_reg=y_pred_te,
             true_threshold=float(reg2cls.get("true_threshold", 0.0)),
