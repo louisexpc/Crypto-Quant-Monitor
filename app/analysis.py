@@ -96,7 +96,7 @@ class StrategyAnalyzer:
         prev_body = abs(prev_candle['close'] - prev_candle['open'])
         curr_body = abs(current_candle['close'] - current_candle['open'])
 
-        if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.10:
+        if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.50:
             price = (prev_candle['close'] + current_candle['open']) / 2
             level_type = 'resistance' if prev_dir == 1 else 'support'
             self.levels.append(Level(price, level_type, 'SNR1', current_candle.name))
@@ -118,6 +118,14 @@ class StrategyAnalyzer:
                 if is_broken_through_body:
                     level.is_valid = True
                     log.debug(f"Level at {level.price} re-validated at {candle.name}")
+                    # Bug Fix (2023-08-23):
+                    # [EN] Previously, when a level was re-validated (i.e., a previously invalid level became valid again),
+                    # the same candle could immediately trigger a test or flip, which was incorrect.
+                    # To ensure proper validation, after a level is re-validated, we skip further test/flip logic for this candle.
+                    # The candle that re-validates the level does NOT count as a test.
+                    # [ZH] 修正：當失效的水平被重新驗證有效時，必須等到下一根K線才允許進行 test 或 flip。
+                    # 重新驗證的K線不算作測試，避免邏輯錯誤。
+                    continue  
 
             if not level.is_valid:
                 continue  # 尚未被重新驗證，跳過其餘邏輯
