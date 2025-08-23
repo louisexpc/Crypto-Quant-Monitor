@@ -118,9 +118,13 @@ class StrategyAnalyzer:
                 if is_broken_through_body:
                     level.is_valid = True
                     log.debug(f"Level at {level.price} re-validated at {candle.name}")
-                    # Bug Fix : 0823
-                    # 當今天失效K線重新回復有效後，需要再下一次的 test and flip 才算完整檢驗
-                    # 該觸發重新有效的K線不算測試
+                    # Bug Fix (2023-08-23):
+                    # [EN] Previously, when a level was re-validated (i.e., a previously invalid level became valid again),
+                    # the same candle could immediately trigger a test or flip, which was incorrect.
+                    # To ensure proper validation, after a level is re-validated, we skip further test/flip logic for this candle.
+                    # The candle that re-validates the level does NOT count as a test.
+                    # [ZH] 修正：當失效的水平被重新驗證有效時，必須等到下一根K線才允許進行 test 或 flip。
+                    # 重新驗證的K線不算作測試，避免邏輯錯誤。
                     continue  
 
             if not level.is_valid:
