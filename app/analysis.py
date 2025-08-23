@@ -96,7 +96,7 @@ class StrategyAnalyzer:
         prev_body = abs(prev_candle['close'] - prev_candle['open'])
         curr_body = abs(current_candle['close'] - current_candle['open'])
 
-        if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.10:
+        if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.50:
             price = (prev_candle['close'] + current_candle['open']) / 2
             level_type = 'resistance' if prev_dir == 1 else 'support'
             self.levels.append(Level(price, level_type, 'SNR1', current_candle.name))
@@ -118,6 +118,10 @@ class StrategyAnalyzer:
                 if is_broken_through_body:
                     level.is_valid = True
                     log.debug(f"Level at {level.price} re-validated at {candle.name}")
+                    # Bug Fix : 0823
+                    # 當今天失效K線重新回復有效後，需要再下一次的 test and flip 才算完整檢驗
+                    # 該觸發重新有效的K線不算測試
+                    continue  
 
             if not level.is_valid:
                 continue  # 尚未被重新驗證，跳過其餘邏輯
