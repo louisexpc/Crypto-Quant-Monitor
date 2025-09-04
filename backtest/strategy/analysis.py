@@ -25,7 +25,7 @@ class Level:
                 f"valid={self.is_valid}, flipped_at={self.flipped_at})")
 
 class StrategyAnalyzer:
-    def __init__(self, df: pd.DataFrame, symbol: str, timeframe: str):
+    def __init__(self, df: pd.DataFrame, symbol: str, timeframe: str, volume_ema_window: int = 10):
         if df.empty or len(df) < 2:
             raise ValueError("DataFrame for analysis must contain at least 2 candles.")
 
@@ -69,6 +69,15 @@ class StrategyAnalyzer:
         self.last_candle = self.df.iloc[-1]
         # --------------------------------------------------------------
 
+        # 0905 Update:
+        # 新增 volume_ema_window 參數，預設10
+        # 最為 level 產生時，考量的條件之一，來針對訊號做 denoise
+        # 初步想法為：僅在成交量高於該 EMA 時，才允許產生訊號
+        if 'volume' not in self.df.columns:
+            raise ValueError("DataFrame must contain 'volume' column for volume EMA calculation.")
+        self.volume_ema_window = volume_ema_window
+        self.df['volume_ema'] = self.df['volume'].ewm(span=self.volume_ema_window, adjust=False).mean()
+
 
     def _simulate_market_evolution(self):
         """
@@ -88,6 +97,9 @@ class StrategyAnalyzer:
 
     def _identify_new_levels(self, prev_candle: pd.Series, current_candle: pd.Series):
         """根據兩根相鄰的 K 線，判斷是否形成新的 SNR1 或 SNR2 水平。"""
+        # 0905 Update: 僅在成交量高於其 EMA 時，才允許產生新的水平
+        if prev_candle['volume'] < prev_candle['volume_ema']:
+            return
         prev_dir = 1 if prev_candle['close'] > prev_candle['open'] else -1
         curr_dir = 1 if current_candle['close'] > current_candle['open'] else -1
         

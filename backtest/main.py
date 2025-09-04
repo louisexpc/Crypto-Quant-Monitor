@@ -45,6 +45,7 @@ class backtestStrategy:
         df: pd.DataFrame,
         symbol: str,
         timeframe: str,
+        volume_ema_window: int = 10,
         *,
         fees: float = 0.0005,
         slippage: float = 0.0002,
@@ -60,7 +61,7 @@ class backtestStrategy:
         req_cols = {"open", "high", "low", "close"}
         if not req_cols.issubset(df.columns):
             raise ValueError(f"df 需包含欄位：{sorted(req_cols)}")
-
+        self.volume_ema_window = volume_ema_window
         self.df = df.copy()
         # 統一索引：DatetimeIndex、唯一且排序；保留時區亦可（vbt支援），但避免混用
         if not isinstance(self.df.index, pd.DatetimeIndex):
@@ -108,7 +109,7 @@ class backtestStrategy:
         for i in range(lookback - 1, len(self.df)):
             window_df = self.df.iloc[i - lookback + 1 : i + 1]
             try:
-                analyzer = StrategyAnalyzer(window_df, symbol=self.symbol, timeframe=self.timeframe)
+                analyzer = StrategyAnalyzer(window_df, symbol=self.symbol, timeframe=self.timeframe, volume_ema_window=self.volume_ema_window)
                 sigs = analyzer.analyze()  # ← 只判斷最後一根是否觸發
             except Exception:
                 continue
@@ -255,10 +256,11 @@ if __name__ == "__main__":
         df=df,
         symbol="BTCUSDT",
         timeframe="1h",            # 以你的資料頻率為準
+        volume_ema_window=25,
         position_size=0.10,
         leverage=3,
-        tp=0.05,
-        sl=0.02,
+        tp=0.02,
+        sl=0.01,
         fees=0.0005,
         slippage=0.0002,
         funding_rate_per_8h=0.0005,
