@@ -1,31 +1,34 @@
+# config.yaml
 # =========================
 # 基本實驗設定
 # =========================
 seed: 42
 device: cuda
-project_name: BTC_XGB_ohlcv
+project_name: BTC_Two-stream_FNG_reg
 also_XGB: true
+
 # =========================
 # 訓練設定
 # =========================
 train:
-  lr: [1.0e-5, 1.0e-3]
-  weight_decay: [1.0e-6, 1.0e-2]
-  batch_size: 4096
-  epochs: 200
-  grad_clip: [0.0, 1.5]
-  early_stopping_patience: 20
-  threshold: null            # ← 只在分類時用，回歸可忽略
+  lr: [1e-5, 3e-4]
+  weight_decay: [1e-6, 3e-2]
+  batch_size: 512
+  epochs: 300
+  grad_clip: [0.3, 3.0]
+  early_stopping_patience: 30
+  threshold: 0.0            # ← 只在分類時用，回歸可忽略
   amp: true
   warmup_epochs: 5
+
   use_focal: false           # ← 回歸無效，分類才會用到
-  use_temperature: false     # ← 回歸無效，分類才會用到
-  # label_smoothing: 0.05    # ← 只在分類(CE)時有用，回歸忽略
+  label_smoothing: 0.05    # ← 只在分類(CE)時有用，回歸忽略
+  amp_dtype: "bf16"       # "none" / "fp16" / "bf16" / "auto"
 
 loss:
   name: emamse_pearson       # "emamse_pearson" | "mse" | "huber"
-  alpha: 0.5
-  beta: 0.5
+  alpha: 0.3
+  beta: 0.7
   ema_decay: 0.9
   huber_delta: 1.0
   pearson_eps: 1e-8
@@ -36,43 +39,53 @@ loss:
 # =========================
 regression_to_class:
   enabled: true
-  true_threshold: 0.0        # y_true 二值化門檻（>0 視為 1）
-  pred_strategy: opt_fbeta   # "zero" | "opt_fbeta"
+  method: opt_fbeta_on_pred     # 或 fixed_bps / abs_quantile_true / abs_quantile_pred / opt_fbeta_on_pred
+  q_flat: 0.3                   # 中間約 40% 當 flat（1 - 2*q_flat）
   fbeta: 0.5
-  grid_points: 101
-
+  grid_points: 201
+  save_test_arrays: true
 
 
 # =========================
 # Optuna 搜尋
 # =========================
 objective:
-  primary_metric: mixed   # [mixed / pearson / threshold_macro_f05 / macro_f1 / acc / val_loss]
+  primary_metric: mixed   # class: [threshold_macro_f05 / macro_f1 / acc / val_loss] ; regression: [mixed / pearson ]
   direction: minimize     # [minimize / maximize]
   enable_prune: true
 
-task:
-  type: regression        # [classification / regression]
+task:   # [classification / regression]
+  type: regression        
 
 search:
-  n_trials: 1
-  timeout: 2    # 小時
+  n_trials: 200
+  timeout: 6    # 小時
   sampler: tpe
   pruner: median
-  pruner_warmup_folds: 10
+  pruner_warmup_folds: 20
   epoch_pruning: false
   seed: 42
+
+  # === multi-GPU 併行設定 ===
+  multi_gpu:
+    enabled: true           # 打開就會啟兩個子程序併行；false=單進程
+    gpu_ids: [0, 1]         # 5070 Ti / 4060
+    sqlite_timeout_sec: 120  # SQLite 併發鎖等待時間（建議 60~300）
 
 # =========================
 # 數據與切分（← 改用「原始 OHLCV」檔案路徑）
 # =========================
 data:
-  path: data/ohlcv_2024/mexc_swap_BTC-USDT-USDT_1h.csv   #「原始 OHLCV」CSV/Parquet（含 datetime/timestamp + OHLCV）
+  path: data/FNG/btcusdt_15m_with_fng_with_flat_1m.csv
   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
-  freq: "1H"                    # 供缺口提醒（不會自動補齊）
+  freq: "15min"                    # 供缺口提醒（不會自動補齊）
   columns:
     time: ["datetime", "timestamp"]
     ohlcv: ["open","high","low","close","volume"]
+  # 吃1-min的
+  micro:
+    enabled: true
+    window_len: 15                # 每根 15min bar 對應過去 15 個 1min    
 
 # Cross-Validation
 cv:
@@ -81,112 +94,199 @@ cv:
   end_date:   "2025-08-01"
   train_val_split: 0.8  # train/val
   test_freq: M
-  embargo_hours: [24, 48]
+  embargo_hours: 24
   min_train_days: 30
-  train_months: [1, 3, 5, 7, 9]
+  train_months: [1,5]
+
+sequence:
+  seq_len: [72, 96, 108, 144]
+  stride: 4 
+  scaler: standard  # [standard / robust / minmax / rolling / ewm / robust_rolling / none]
+  stride_anchor: 0
+  min_frac: 0.2
 
 # =========================
 # 模型（回歸時請輸出1維）
 # =========================
-# model:
-#   name: "TemporalTransformer"
-#   d_model: [64, 128, 256, 512]
-#   n_heads: [2, 4, 8]
-#   n_layers: [2, 3, 4]
-#   n_layers: 3
-#   mlp_ratio: [2.0, 6.0]
-#   mlp_ratio: 2.3
-#   dropout: [0.0, 0.2]
-#   attn_dropout: [0.0, 0.05]
-#   pooling: attn
-#   use_causal: true
-#   num_classes: 1             # ★ 回歸=1，分類再改成2
-#   # class_names: ["down", "up"]  # ★ 回歸不需要
+model:
+  name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
+  d_model: [64, 96, 128]
+  n_heads: [2, 4, 8]
+  n_layers: [2,3,4]
+  mlp_ratio: 2.0
+  dropout: [0.0, 0.3] 
+  attn_dropout: [0.0, 0.1]
+  pooling: attn     # ["cls" / "attn" / "mean"]
+  use_causal: true
+  num_classes: 1             # ★ 回歸=1，分類再改成3
+  class_names: ["down", "flat", "up"]  # ★ 回歸不需要
+
+  # ==== Two-Stream 新增 ====
+  minute_steps: 15              # 每根 15m bar 含 15 個 1m 切片
+  minute_hidden: [32, 64, 96]
+  minute_layers: [1,3]
+  minute_dropout: [0.0,0.3]
+
 
 # model:
 #   name: LSTM_SE
-#   hidden_size: [64, 128, 192, 256]
+#   # hidden_size: [32, 64, 128, 192, 256]
+#   hidden_size: 64
 #   n_layers: [1, 3]
-#   dropout: [0.0, 0.3]
+#   dropout: [0.0, 0.1]
 #   bidirectional: [false]
-#   num_classes: 1
+#   num_classes: 3
 #   input_norm: layernorm_last
-#   class_names: ["down", "up"]
+#   class_names: ["down", "flat", "up"]
 
-model:
-  name: xgboost
-  n_estimators: 2000     # 上限
-  es_step: 25           # 每次增加的樹數
-  es_patience: 2        # 連續幾個 step 沒進步就停
-  es_min_delta: 0.0     # 最小改善幅度（RMSE 要小於 best_rmse - delta 才算進步）
-  max_depth: 4
-  learning_rate: 0.03
-  subsample: 0.6
-  colsample_bytree: 0.6
-  reg_alpha: 0.0
-  reg_lambda: 1.0
-  min_child_weight: 20
-  tree_method: hist      
-  early_stopping_rounds: 100
-  n_jobs: -1
+
+# model:
+#   name: LSTM_Temporal
+#   hidden_size: 64
+#   n_layers: 2
+#   dropout: 0.15
+#   bidirectional: false
+#   num_classes: 1
+#   use_se: true
+#   se_ratio: 16
+#   pooling: meanmax      # ← 開 mean/max 池化
+#   return_alpha: false
+#   class_names: ["down", "flat", "up"]
+
+# model:
+#   name: xgboost
+#   n_estimators: 2000     # 上限
+#   es_step: 25           # 每次增加的樹數
+#   es_patience: 2        # 連續幾個 step 沒進步就停
+#   es_min_delta: 0.0     # 最小改善幅度（RMSE 要小於 best_rmse - delta 才算進步）
+#   max_depth: 4
+#   learning_rate: 0.03
+#   subsample: 0.6
+#   colsample_bytree: 0.6
+#   reg_alpha: 0.0
+#   reg_lambda: 1.0
+#   min_child_weight: 20
+#   tree_method: hist      
+#   early_stopping_rounds: 100
+#   n_jobs: -1
 
 
 # =========================
 # 標籤與序列
 # =========================
+# label:
+#   horizon: 1
+#   ret_kind: logret             # 或 simple（runtime 產生 0/1 標籤）
+#   cls_threshold: 0.0
 label:
-  horizon: 1
-  ret_kind: logret             # 或 simple（runtime 產生 0/1 標籤）
-  cls_threshold: 0.0
+  ret_shift: 4
 
-sequence:
-  seq_len: 36
-  step: 1
-  scaler: StandardScaler
-  shift_features_by: 0         # ★ 重要：Indicators 已經對所有特徵 shift(1) 防洩漏
+# # (A) 固定 bps 帶（最單純）
+#   mode: bps
+#   horizon: 1
+#   flat_band_bps: 0.005       # |logret| <= 0.0005 → flat
 
-# =========================
-# Runtime 特徵（由 Indicators 動態計算與快取）
-# =========================
+# # (B) 以波動自適應（論文常見）
+#   mode: vol
+#   horizon: 1
+#   k_vol: 0.5             # 門檻 = k * sigma * sqrt(horizon)
+#   vol_window: 96         # 波動估計窗口
+
+# # (C) 百分位分位數（控制類別比例）
+#   mode: quantile
+#   horizon: 1
+#   q_flat: 0.3            # 中間 40% 為 flat（0.3~0.7）
+#   q_min_obs: 500         # 展開最少樣本，避免初期不穩
+
+# # (D) 以交易成本為中性帶
+#   mode: cost
+#   horizon: 1
+#   roundtrip_cost_bps: 10 # 雙邊成本 10bps
+
+# (E) 簡化 triple-barrier（先觸碰上下障礙者勝）
+  mode: triple
+  horizon: 24            # 例如 24 小時內是否觸碰障礙
+  triple_k: 0.5          # 上下障礙 ±kσ（以過去 sigma 估）
+  triple_window: 96
+
+
+
+# # =========================
+# # Runtime 特徵（由 Indicators 動態計算與快取）
+# # =========================
 features:
   cache_dir: cache_features
   plan:
     features:
-      # ===== Group: ohlcv (基礎價格/成交量) =====
-      - {name: OPEN,   kwargs: {}, enabled: true}
-      - {name: HIGH,   kwargs: {}, enabled: true}
-      - {name: LOW,    kwargs: {}, enabled: true}
-      - {name: CLOSE,  kwargs: {}, enabled: true}
-      - {name: VOLUME, kwargs: {}, enabled: true}
+      # ===================== Group: ohlcv（原始） =====================
+      - { name: OPEN,   kwargs: {}, enabled: false }     # 開盤價（原始特徵）
+      - { name: HIGH,   kwargs: {}, enabled: false }     # 最高價（原始特徵）
+      - { name: LOW,    kwargs: {}, enabled: false }     # 最低價（原始特徵）
+      - { name: CLOSE,  kwargs: {}, enabled: false }     # 收盤價（原始特徵）
+      - { name: VOLUME, kwargs: {}, enabled: true }     # 成交量（原始特徵）
 
-      # ===== Group: basic =====
-      - {name: RSI,   kwargs: {length: 14},  enabled: false}
-      - {name: RSI,   kwargs: {length: 30},  enabled: false}      
-      - {name: MACD,  kwargs: {fast: 12, slow: 26, signal: 9}, enabled: false}
-      - {name: MOM,   kwargs: {length: 30},  enabled: false}
-      - {name: LOGRET,    kwargs: {length: 1}, enabled: false}
+      # ===================== Group: volume（原始成交量與量能指標） =====================      
+      - { name: PVO,    kwargs: { fast: 12, slow: 26, signal: 9 }, enabled: false } # 量的 MACD（量能動能）
+      - { name: PVR,    kwargs: {}, enabled: true }                                # 價量比率（price-volume ratio）
+      - { name: BOP,    kwargs: {}, enabled: true }                                # 買方/賣方力量（Body 對區間）
 
-      # ===== Group: momentum =====
-      - {name: STOCH, kwargs: {k: 30,  d: 3, smooth_k: 3}, enabled: false}
-      - {name: STOCH, kwargs: {k: 200, d: 3, smooth_k: 3}, enabled: false}
-      - {name: KDJ,       kwargs: {k: 9, d: 3, smooth_k: 3}, enabled: false}      
-      - {name: RVI,       kwargs: {length: 14}, enabled: false}
-      - {name: WILLR,     kwargs: {length: 14}, enabled: false}
-      - {name: UO,        kwargs: {fast: 7, medium: 14, slow: 28}, enabled: false}
+      # ===================== Group: trend（趨勢/均線/去趨勢） =====================
+      - { name: SLOPE,     kwargs: { length: 5 }, enabled: false }              # 收盤價線性回歸斜率（近端趨勢）
+      - { name: TTM_TRND,  kwargs: { length: 6 }, enabled: true }              # TTM 趨勢過濾
+      - { name: DPO,       kwargs: { length: 20 }, enabled: true }             # 去趨勢震盪器（移除長期趨勢）
+      - { name: AMATE_LR,  kwargs: { fast: 8, slow: 21, mamode: 2 }, enabled: true  }  # AMAT 長週期線（趨勢通道）
 
-      # ===== Group: volatility =====
-      - {name: DPO,       kwargs: {length: 20}, enabled: false}
-      - {name: CCI,       kwargs: {length: 14, c: 0.015}, enabled: false}
-      - {name: BBP,       kwargs: {length: 5, std: 2.0}, enabled: false}
-      - {name: ZS,        kwargs: {length: 30}, enabled: false}
-      - {name: SLOPE,     kwargs: {length: 1}, enabled: false}
-      - {name: EBSW,      kwargs: {length: 40, mamode: 10}, enabled: false}
+      # —— 均線/動能（只輸出 sign：-1/0/1）——
+      - { name: SMA,  kwargs: { length: 50, sign: true }, enabled: false }       # 簡單均線；sign=收盤相對 SMA 的方向
+      - { name: EMA,  kwargs: { length: 21, sign: true }, enabled: false }       # 指數均線；較敏感；sign 同上
+      - { name: TEMA, kwargs: { length: 30, sign: true }, enabled: false }       # 三重 EMA；更平滑、延遲更低；sign 同上
+      - { name: MACD, kwargs: { fast: 12, slow: 26, signal: 9, sign: false }, enabled: false } # MACD 動能；sign=主線相對訊號線
 
-      # ===== Group: volume =====
-      - {name: PVR,       kwargs: {}, enabled: false}      
-      - {name: MASSI,     kwargs: {fast: 9, slow: 25}, enabled: false}
-      - {name: PVO,       kwargs: {fast: 12, slow: 26, signal: 9}, enabled: false}
-      - {name: TRUERANGE, kwargs: {}, enabled: false}
-      - {name: AMATE_LR,  kwargs: {fast: 8, slow: 21, mamode: 2}, enabled: false}
-      - {name: BOP,       kwargs: {}, enabled: false}
+      # ===================== Group: momentum / oscillator（動能/震盪） =====================
+      - { name: RSI,   kwargs: { length: 14 }, enabled: false }                 # 相對強弱（超買超賣）
+      - { name: RSI,   kwargs: { length: 30 }, enabled: true }                 # 較長期 RSI
+      - { name: MOM,   kwargs: { length: 30 }, enabled: false }                 # 價格動量
+      - { name: STOCH, kwargs: { k: 30,  d: 3, smooth_k: 3 }, enabled: true }  # 隨機指標 %K/%D（短期）
+      - { name: STOCH, kwargs: { k: 200, d: 3, smooth_k: 3 }, enabled: true }  # 隨機指標（更長期）
+      - { name: KDJ,   kwargs: { k: 9, d: 3, smooth_k: 3 }, enabled: true }    # KDJ 的 J 線（放大動能）
+      - { name: RVI,   kwargs: { length: 14 }, enabled: true }                 # 相對活力指標
+      - { name: WILLR, kwargs: { length: 14 }, enabled: true }                 # 威廉指標（區間位置）
+      - { name: UO,    kwargs: { fast: 7, medium: 14, slow: 28 }, enabled: true } # 統一動量（多尺度結合）
+      - { name: CCI,   kwargs: { length: 14, c: 0.015 }, enabled: true }       # 商品通道（偏離均值）
+      - { name: ZS,    kwargs: { length: 30 }, enabled: true }                 # 滾動 Z 分數（標準化偏離）
 
+      # ===================== Group: volatility（波動/區間） =====================
+      - { name: TRUERANGE, kwargs: {}, enabled: false }                         # 單期真實區間（HL 與跳空）
+      - { name: ATR,       kwargs: { length: 14, pct: true }, enabled: false }   # 平均真實波動；pct=相對收盤比例
+      - { name: RANGE,     kwargs: { window: 24, pct: true }, enabled: false }   # HL 區間的滾動均值；pct=相對收盤
+      - { name: MASSI,     kwargs: { fast: 9, slow: 25 }, enabled: false }      # Mass Index（高低擴張）
+      - { name: BBP,       kwargs: { length: 5, std: 2.0 }, enabled: true }    # 布林通道百分位位置
+      - { name: EWMRET,    kwargs: { halflife: [6,12,48] }, enabled: true }     # logret 的 EWM 均值/標準差（波動/漂移）
+
+      # ===================== Group: price_volume（價量交互） =====================
+      - { name: PXVOL, kwargs: {}, enabled: true }                              # 方向強度、logret×量變、方向×量
+
+      # ===================== Group: returns（報酬） =====================
+      - { name: LOGRET, kwargs: { lags: [1,2,3,5,10], pct: true }, enabled: true } # 多期簡單報酬（%），含短中期
+
+      # ===================== Group: time（時間週期） =====================
+      - { name: TIME_CYC, kwargs: { tz: "Asia/Taipei", daily: true, weekly: true }, enabled: true } # 日內/週期 sin/cos
+
+      # ===================== Group: funding rate（資金費率） =====================
+      - { name: FOUND, kwargs: {}, enabled: false }                                 # 每 8 小時資金費率，可作為散戶情緒 proxy
+      # ===================== Group: fast signal（15分鐘子訊號） =====================
+      - { name: M15_DIR, kwargs: {}, enabled: false }                               # 三段 m15 漲跌 (01/12/23) → 類似細粒度動能
+      - { name: M15_VOL, kwargs: {}, enabled: false }     
+
+      # ===================== Group: Sentiment index（15分鐘子訊號） =====================
+      - { name: FNG_IDX, kwargs: {}, enabled: true }    
+
+  min_trade_feat:
+    - "imbalance"
+    - "buy_ratio"
+    - "buy_count_ratio"
+    - "price_mean"
+    - "price_vwap"
+    # - "price_min"
+    - "price_max"
+    - "trend_slope"

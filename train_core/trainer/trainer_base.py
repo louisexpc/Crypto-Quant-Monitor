@@ -24,19 +24,44 @@ def get_task_type(cfg: dict) -> str:
     nc = int(cfg["model"].get("num_classes", 1))
     return "classification" if nc >= 2 else "regression"
 
-def amp_dtype():
-    """優先 bf16（若支援），否則 fp16。"""
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
+def amp_dtype(cfg: dict | None = None):
+    """
+    由 YAML 控制 AMP dtype：
+      train.amp_dtype ∈ {"none","fp16","bf16","auto"}
+    - "none": 關閉 autocast
+    - "fp16": torch.float16
+    - "bf16": torch.bfloat16
+    - "auto": 預設走 fp16；只有你明確指定 bf16 才會用 bf16
+    """
+    choice = None
+    if cfg is not None and "train" in cfg and "amp_dtype" in cfg["train"]:
+        choice = str(cfg["train"]["amp_dtype"]).lower()
+
+    if choice == "none":
+        return None
+    if choice == "fp16":
+        return torch.float16
+    if choice == "bf16":
+        # 僅當前裝置宣稱支援時才允許
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        # 不支援則回退 fp16
+        return torch.float16
+
+    # "auto" 或未指定 → 保守使用 fp16
+    if torch.cuda.is_available():
+        return torch.float16
+    return None  # 無 GPU 時直接關閉 AMP
 
 def build_optimizer(model, cfg):
     lr = float(cfg["train"]["lr"])
     wd = float(cfg["train"]["weight_decay"])
-    return torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=wd,
-        fused=True if torch.cuda.is_available() else False
-    )
+    if torch.cuda.is_available():
+        try:
+            return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd, fused=True)
+        except TypeError:
+            pass
+    return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
 
 def build_warmup_scheduler(optimizer, steps_per_epoch: int, cfg):
     from torch.optim.lr_scheduler import LambdaLR
@@ -87,18 +112,13 @@ def find_best_threshold_by_auc(y_true, y_prob_pos):
     }
 
 def fit_temperature_ce(logits, y_true, max_iter=50):
-    """
-    logits: [N, C] (未經 softmax 的原始值)
-    y_true: [N] long
-    回傳溫度 T（torch.Tensor[1]）
-    """
-    T = torch.nn.Parameter(torch.ones(1, device=logits.device))
+    T = torch.nn.Parameter(torch.ones(1, device=logits.device))  # fp32
     opt = torch.optim.LBFGS([T], lr=0.1, max_iter=max_iter)
     y_true = y_true.to(logits.device).long()
 
     def closure():
         opt.zero_grad()
-        loss = F.cross_entropy(logits / T, y_true, reduction="mean")
+        loss = F.cross_entropy((logits.float()) / T, y_true, reduction="mean")  # ★ 強制 fp32
         loss.backward()
         return loss
 

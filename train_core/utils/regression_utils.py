@@ -45,14 +45,6 @@ class EMAMSE_PearsonLoss(nn.Module):
 
 
 
-# def pearson_corr_np(y_true, y_pred, eps=1e-12):
-#     y_true = np.asarray(y_true).ravel()
-#     y_pred = np.asarray(y_pred).ravel()
-#     sy = y_true.std()
-#     sp = y_pred.std()
-#     if not np.isfinite(sy) or not np.isfinite(sp) or sy < eps or sp < eps:
-#         return 0.0  # 或者回傳 np.nan 再由上層統一處理
-#     return float(np.corrcoef(y_true, y_pred)[0, 1])
 
 
 def compute_regression_metrics(y_true, y_pred):

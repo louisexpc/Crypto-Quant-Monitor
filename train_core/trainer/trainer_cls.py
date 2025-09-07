@@ -1,3 +1,4 @@
+# trainer_cls.py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -14,8 +15,9 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # 匯出/視覺化/度量
 from utils.compute_export_metrices import (
-    save_fold_metrics, save_result, compute_metrics, plot_test_eval
+    save_fold_metrics, plot_test_eval
 )
+from utils.metrics_cls import compute_cls_metrics  # ★ 新增
 
 # -----------------------------
 # 分類專屬 Loss（CE / Focal）
@@ -74,19 +76,21 @@ def train_one_fold(
     epochs    = int(cfg["train"]["epochs"])
     patience  = int(cfg["train"]["early_stopping_patience"])
     num_class = int(cfg["model"]["num_classes"])
-    primary   = (cfg.get("task", {}) or {}).get("primary_metric", "val_loss").lower()
+    # primary   = (cfg.get("task", {}) or {}).get("primary_metric", "val_loss").lower()
+    primary_metric = str(cfg.get("objective", {}).get("primary_metric", "val_loss")).lower()
+    primary_is_f05 = primary_metric in ["macro_f05", "f_05_macro", "threshold_macro_f05"]
 
     model = model.to(device)
     optimizer = build_optimizer(model, cfg)
     steps_per_epoch = max(1, len(train_loader))
     scheduler = build_warmup_scheduler(optimizer, steps_per_epoch, cfg)
-    dtype = amp_dtype()
+    dtype = amp_dtype(cfg=cfg)
     scaler = build_grad_scaler(dtype)
 
     # 建 loss 與權重
     # 先確認輸出維度
     model.eval()
-    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
+    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
         xb0, _ = next(iter(train_loader))
         xb0 = xb0[:1].to(device, non_blocking=True)
         logits0 = model(xb0)
@@ -97,8 +101,8 @@ def train_one_fold(
             f"[trainer_cls] 模型 out_dim={out_dim} != num_classes={num_class}。請調整 head。"
         )
     class_weights = infer_class_weights(train_loader, num_class, device)
-    loss_fn = build_classification_loss(cfg, class_weights)
-
+    loss_fn = build_classification_loss(cfg, class_weights=class_weights)
+    
     # Early-stop 狀態
     best_epoch = 0
     best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
@@ -132,7 +136,7 @@ def train_one_fold(
                 printed_shape = True
 
             optimizer.zero_grad(set_to_none=True)
-            with amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
+            with amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
                 logits = model(Xb)
                 loss = loss_fn(logits, yb)
 
@@ -155,7 +159,7 @@ def train_one_fold(
         avg_tr_loss = train_loss_sum / max(1, train_n)
         y_tr = torch.cat(tr_tgts).numpy()
         yhat_tr = torch.cat(tr_preds).numpy()
-        m_tr = compute_metrics(y_tr, yhat_tr)
+        m_tr = compute_cls_metrics(y_tr, yhat_tr)
 
         # -------- VAL --------
         model.eval()
@@ -163,7 +167,7 @@ def train_one_fold(
         val_tgts = []
         val_logits = []
 
-        with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
+        with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
             for Xb, yb in val_loader:
                 Xb = Xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True).long()
@@ -174,11 +178,13 @@ def train_one_fold(
                 val_loss_sum += loss.item() * bs
                 val_n += bs
                 val_tgts.append(yb.detach().cpu())
-                val_logits.append(logits.detach().cpu())
+                val_logits.append(logits.detach())
+                # val_logits.append(logits.detach().cpu())
 
         avg_va_loss = val_loss_sum / max(1, val_n)
         y_va = torch.cat(val_tgts, dim=0).numpy()
-        logits_all = torch.cat(val_logits, dim=0).to(device)  # [N, C]
+        # logits_all = torch.cat(val_logits, dim=0).to(device)  # [N, C]
+        logits_all = torch.cat(val_logits, dim=0)
 
         # 溫度校準（該 epoch 的 T）
         if cfg["train"].get("use_temperature", True):
@@ -186,7 +192,7 @@ def train_one_fold(
         else:
             T_epoch = torch.tensor(1.0, device=device)
 
-        probs_all = F.softmax(logits_all / T_epoch, dim=1).cpu().numpy()
+        probs_all = torch.softmax((logits_all / T_epoch).float(), dim=1).cpu().numpy()
 
         # Binary：找最佳 threshold；multi-class 直接 argmax
         if probs_all.shape[1] == 2:
@@ -201,18 +207,18 @@ def train_one_fold(
             yhat_va = probs_all.argmax(axis=1)
             curr_val_thresh = None
 
-        m_va = compute_metrics(y_va, yhat_va)
+        m_va = compute_cls_metrics(y_va, yhat_va)
 
         # Early Stopping：預設看 F0.5 或 val_loss
-        primary = (cfg.get("task", {}) or {}).get("primary_metric", "val_loss").lower()
-        if primary in ["f05_macro", "f_05_macro"]:
-            improved = (m_va.get("f_05_macro", -1.0) > (best_val_f_05 + 1e-6))
+        # primary = (cfg.get("task", {}) or {}).get("primary_metric", "val_loss").lower()
+        if primary_is_f05:
+            improved = (m_va.get("macro_f05", m_va.get("f_05_macro", -1.0)) > (best_val_f_05 + 1e-6))
         else:
             improved = (avg_va_loss < (best_cls_val_loss - 1e-6))
 
         if epoch == 1 or improved:
             best_val_f1 = m_va.get("macro_f1", best_val_f1)
-            best_val_f_05 = m_va.get("f_05_macro", best_val_f_05)
+            best_val_f_05 = m_va.get("macro_f05", m_va.get("f_05_macro", best_val_f_05))
             best_val_prec = m_va.get("macro_precision", best_val_prec)
             best_val_recall = m_va.get("macro_recall", best_val_recall)
             best_val_thresh = float(curr_val_thresh) if curr_val_thresh is not None else None
@@ -248,8 +254,8 @@ def train_one_fold(
     te_tgts, te_probs = [], []
     test_loss_sum, test_n = 0.0, 0
 
-    loss_fn = build_classification_loss(cfg, infer_class_weights(train_loader, num_class, device))
-    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
+
+    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
         for Xb, yb in test_loader:
             Xb = Xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True).long()
@@ -260,21 +266,41 @@ def train_one_fold(
             test_loss_sum += loss.item() * bs
             test_n += bs
 
-            probs = F.softmax(logits / best_T, dim=1)
+            probs = torch.softmax((logits / best_T).float(), dim=1).float()
             te_probs.append(probs.detach().cpu())
             te_tgts.append(yb.detach().cpu())
 
     avg_te_loss = test_loss_sum / max(1, test_n)
 
     y_te = torch.cat(te_tgts).numpy()
-    y_prob_te = torch.cat(te_probs).numpy()
+    y_prob_te = torch.cat(te_probs).float().numpy() 
     yhat_te = y_prob_te.argmax(axis=1)
-    m_te = compute_metrics(y_te, yhat_te)
-    print(f"{prefix}Test_acc={m_te['acc']:.3f} | test_f1={m_te['macro_f1']:.3f} | test_f05={m_te['f_05_macro']:.3f} | test_prec={m_te['macro_precision']:.3f} | test_re={m_te['macro_recall']:.3f} | mcc={m_te['mcc']:.3f}")
+    # --- 印出前 10 筆測試樣本的預測機率 ---
+    class_names = cfg["model"].get("class_names", [str(i) for i in range(y_prob_te.shape[1])])
+    print("\n[Test Predictions - top 10]")
+    for i in range(min(10, len(y_prob_te))):
+        probs = y_prob_te[i]
+        prob_str = ", ".join([f"{c}: {p:.4f}" for c, p in zip(class_names, probs)])
+        print(f"[{i}] True: {y_te[i]}, Pred: {yhat_te[i]}, Probs: [{prob_str}]")
 
+
+
+    m_te = compute_cls_metrics(y_te, yhat_te)
+    test_f05 = m_te.get("macro_f05", m_te.get("f_05_macro", 0.0))
+    print(
+        f"{prefix}Test_acc={m_te.get('acc', 0.0):.3f} | "
+        f"test_f1={m_te.get('macro_f1', 0.0):.3f} | "
+        f"test_f05={test_f05:.3f} | "
+        f"test_prec={m_te.get('macro_precision', 0.0):.3f} | "
+        f"test_re={m_te.get('macro_recall', 0.0):.3f} | "
+        f"mcc={m_te.get('mcc', 0.0):.3f}"
+    )
+    
     # 二分類的 threshold 報表
-    best_thresh = None
-    if y_prob_te.shape[1] == 2:
+    best_thresh, m_thresh = None, None
+    is_binary_test = (y_prob_te.shape[1] == 2)
+
+    if is_binary_test:
         y_score = y_prob_te[:, 1]
         cfg_thresh = cfg["train"].get("threshold", None)
         if cfg_thresh is not None:
@@ -286,37 +312,63 @@ def train_one_fold(
         else:
             best_thresh = 0.5
 
+        yhat_thresh = (y_score >= best_thresh).astype(int)
+        m_thresh = compute_cls_metrics(y_te, yhat_thresh)
+
+
     result = {
         "history": history,
         "best_epoch": best_epoch,
         "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+        "val_metrics":{
+            "val_loss": float(best_cls_val_loss),
+            "macro_f1": float(best_val_f1),
+            "f_05_macro": float(best_val_f_05),
+            "macro_precision": float(best_val_prec),
+            "macro_recall": float(best_val_recall),},
+
         "test_metrics": {
-            "test_loss": avg_te_loss,
-            "test_acc": m_te["acc"],
-            "test_macro_f1": m_te["macro_f1"],
-            "test_macro_precision": m_te["macro_precision"],
-            "test_macro_recall": m_te["macro_recall"],
-            "test_weighted_f1": m_te["weighted_f1"],
-            "test_MCC": m_te["mcc"]
+        #     "test_loss": avg_te_loss,
+        #     "test_acc": m_te["acc"],
+        #     "test_macro_f1": m_te["macro_f1"],
+        #     "test_macro_precision": m_te["macro_precision"],
+        #     "test_macro_recall": m_te["macro_recall"],
+        #     "test_weighted_f1": m_te["weighted_f1"],
+        #     "test_MCC": m_te["mcc"]
+        # },     
+            "test_acc":        m_te.get("acc", 0.0),
+            "test_macro_f1":   m_te.get("macro_f1", 0.0),
+            "test_weighted_f1":m_te.get("weighted_f1", m_te.get("macro_f1", 0.0)),
+            "test_macro_f05":  m_te.get("macro_f05", m_te.get("f_05_macro", 0.0)),
+            "test_mcc":        m_te.get("mcc", 0.0),
         },
+
         "best_val_thresh": float(best_val_thresh) if best_val_thresh is not None else None,
-        "temperature": float(best_T.item()) if torch.is_tensor(best_T) else 1.0
-    }
-    if y_prob_te.shape[1] == 2:
-        yhat_thresh = (y_prob_te[:, 1] >= best_thresh).astype(int)
-        m_thresh = compute_metrics(y_te, yhat_thresh)
+        "temperature": float(best_T.item()) if torch.is_tensor(best_T) else 1.0,
+
+        "threshold_metrics":{
+            "best_val_thresh": float(best_val_thresh) if best_val_thresh is not None else None,
+            "temperature": float(best_T.item()) if torch.is_tensor(best_T) else 1.0,
+            # "acc": m_thresh["acc"],
+            # "macro_f1": m_thresh["macro_f1"],
+            # "macro_precision": m_thresh["macro_precision"],
+            # "macro_recall": m_thresh["macro_recall"],
+            # "f_05_macro": m_thresh["f_05_macro"],
+            }
+        }
+    if is_binary_test and m_thresh is not None:
         result["threshold_metrics"] = {
             "best_threshold": float(best_thresh),
             "acc": m_thresh["acc"],
             "macro_f1": m_thresh["macro_f1"],
             "macro_precision": m_thresh["macro_precision"],
             "macro_recall": m_thresh["macro_recall"],
-            "f_05_macro": m_thresh["f_05_macro"],
+            "macro_f05": m_thresh.get("macro_f05", m_thresh.get("f_05_macro", 0.0)),
         }
+
 
     # 匯出與作圖
     save_fold_metrics(history, save_dir=export_dir, prefix=f"fold_{fold_id}_")
-    save_result(fold_id=fold_id, export_dir=export_dir, result=result)
     plot_test_eval(
         y_true=y_te, y_pred=yhat_te, y_prob=y_prob_te,
         class_names=cfg["model"].get("class_names", None),

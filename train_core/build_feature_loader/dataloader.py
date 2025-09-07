@@ -1,4 +1,4 @@
-
+# dataloader.py
 import os
 import pandas as pd
 import numpy as np
@@ -34,14 +34,24 @@ class SeqDataset(Dataset):
         X_df,
         y_s,
         seq_len: int,
-        scaler: Optional[RobustScaler] = None,
+        scaler=None,
         device: str = "cuda",
         label_dtype: Literal["auto", "float", "long"] = "auto",
+        stride: int = 1,                 # ★ 新增
+        anchor: int = 0,                 # ★ 新增：0..stride-1，控制起始對齊
     ):
-        X = X_df.values.astype(np.float32, copy=False)
-        if scaler is not None:
-            X = scaler.transform(X).astype(np.float32, copy=False)
+        X_df = X_df.astype(np.float32, copy=False)
 
+        if scaler is None:
+            X = X_df.values
+        elif hasattr(scaler, "transform"):
+            X = scaler.transform(X_df.values).astype(np.float32, copy=False)
+        elif hasattr(scaler, "transform_df"):
+            X = scaler.transform_df(X_df).values.astype(np.float32, copy=False)
+        else:
+            raise TypeError("Unsupported scaler: expected .transform(...) or .transform_df(...)")
+
+        # ---- y ----
         if label_dtype == "auto":
             is_float = np.issubdtype(y_s.values.dtype, np.floating)
             y_np = y_s.values.astype(np.float32 if is_float else np.int64, copy=False)
@@ -49,26 +59,37 @@ class SeqDataset(Dataset):
         elif label_dtype == "float":
             y_np = y_s.values.astype(np.float32, copy=False)
             torch_y_dtype = torch.float32
-        else:  # "long"
+        else:
             y_np = y_s.values.astype(np.int64, copy=False)
             torch_y_dtype = torch.long
 
+        # ---- sliding windows with stride ----
         L = int(seq_len)
         N, M = len(X), len(y_np)
-        idx = np.arange(L - 1, min(N, M))
+        stride = max(1, int(stride))
+        anchor = int(anchor) % stride
 
-        X_seqs = np.stack([X[j - L + 1 : j + 1] for j in idx])  # shape: [N, T, F]
-        y_vals = y_np[idx]                                      # shape: [N]
+        start = (L - 1) + anchor
+        stop = min(N, M)
+        if start >= stop:
+            # 沒有任何可用樣本時，回退到無 anchor
+            start = L - 1
+
+        idx = np.arange(start=start, stop=stop, step=stride, dtype=int)
+
+        # [N, T, F] / [N]
+        X_seqs = np.stack([X[j - L + 1: j + 1] for j in idx]) if len(idx) else np.empty((0, L, X.shape[1]), np.float32)
+        y_vals = y_np[idx] if len(idx) else np.empty((0,), y_np.dtype)
 
         self.X = torch.tensor(X_seqs, dtype=torch.float32, device=device)
         self.y = torch.tensor(y_vals, dtype=torch_y_dtype, device=device)
+
     def __len__(self):
         return self.y.shape[0]
 
     def __getitem__(self, i):
         return self.X[i], self.y[i]
-
-
+    
 # ========== Fold Generator ==========
 class FoldGenerator:
     def __init__(self, dt_index: pd.DatetimeIndex, mode: str = "rolling", start_month: str | None = None, **kwargs):
@@ -99,6 +120,9 @@ class FoldGenerator:
             step = int(test_freq.replace("M", ""))  # "2M" → 2
             return months[::step]
 
+    # =========================
+    # 1) OddEven folds 產生器
+    # =========================
     def make_two_month_folds(self):
         """
         回傳 list of dict:
@@ -127,7 +151,7 @@ class FoldGenerator:
 
 
     # =========================
-    # 2) Anchored folds 產生器（重點）
+    # 2) Anchored folds 產生器
     # =========================
 
     def make_anchored_folds(self,
@@ -179,6 +203,10 @@ class FoldGenerator:
             })
         return folds
 
+    # =========================
+    # 3) Rolling folds 產生器
+    # =========================
+
     def make_rolling_folds(self, train_window, embargo_hours, test_freq="M"):
         """
         每一 fold：
@@ -212,48 +240,86 @@ class FoldGenerator:
             })
         return folds
 
+
+
+
+
 # -------------------------
-# DataLoader 組裝（永遠 preload）
+# DataLoader 組裝
 # -------------------------
+from .scalar import pick_cols_to_scale, _get_scaler, ColumnSubsetScaler
+
 def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool = False):
+    """
+    依 fold 切出 train/val/test，執行縮放與清理，最後包成三個 DataLoader。
+    主要差異點：
+      - 若使用 TimeSafeScaler：先 transform_full，再針對每個 split 分別 dropna；
+        並在 train split 裁掉 warm-up（scaler.warmup_len()）。
+      - 若使用 sklearn 縮放器：先清理 train，再 fit_df(train)；val/test 僅 transform，不看未來。
+    """
+
     task_type = cfg["task"]["type"]
     is_reg = (task_type == "regression")
 
-    # 時序切分（直接依 YAML 的 train_val_split）
-    tr_idx, va_idx, te_idx = split_fold_to_indices(df, fold, cfg)
-    X_tr, y_tr = df.loc[tr_idx, feat_cols], df.loc[tr_idx, target_col]
-    X_va, y_va = df.loc[va_idx, feat_cols], df.loc[va_idx, target_col]
-    X_te, y_te = df.loc[te_idx, feat_cols], df.loc[te_idx, target_col]
-    # print("[DEBUG] y_tr.describe():\n", pd.Series(y_tr).describe())
-    # print("[DEBUG] y_tr.unique():", pd.Series(y_tr).unique())
-
     # Scaler（只 fit 在 train，否則會洩漏）
     scaler_kind = cfg["sequence"]["scaler"]
+    scaler_window = cfg["sequence"]["seq_len"]
+    min_frac = cfg["sequence"]["min_frac"]
 
-    if scaler_kind == "robust":
-        scaler = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(10.0, 90.0))
-    elif scaler_kind == "standard":
-        scaler = StandardScaler()
-    elif scaler_kind == "minmax":
-        scaler = MinMaxScaler()
+    # 1) 決定要縮放的欄位（自動跳過 sign-like / 命名 pattern）
+    tr_idx, va_idx, te_idx = split_fold_to_indices(df, fold, cfg)
+    cols_to_scale = pick_cols_to_scale(df.loc[tr_idx, feat_cols], feat_cols)
+
+    # 2) 建立縮放器
+    scaler = _get_scaler(scaler_kind, window=scaler_window, min_frac=min_frac)
+
+    # 3) 時間安全縮放：先對整段 df 做 transform_full（只動 cols_to_scale）
+    if hasattr(scaler, "is_timesafe") and scaler.is_timesafe:
+        df_scaled = scaler.transform_full(df, cols_to_scale=cols_to_scale)
+        work_df = df_scaled
+        sklearn_scaler = None
     else:
-        scaler = None
+        work_df = df
+        sklearn_scaler = None if scaler is None else ColumnSubsetScaler(
+            scaler, all_cols=feat_cols, cols_to_scale=cols_to_scale
+        )
 
-    if scaler is not None:
-        scaler.fit(X_tr.values.astype(np.float32, copy=False))
 
-    # ====== 給 DL 的 Loader（保持原樣）======
+    # 4) 切 train/val/test（在時間安全模式已經先轉好；sklearn 模式稍後 fit+transform）
+    
+    X_tr, y_tr = work_df.loc[tr_idx, feat_cols], work_df.loc[tr_idx, target_col]
+    X_va, y_va = work_df.loc[va_idx, feat_cols], work_df.loc[va_idx, target_col]
+    X_te, y_te = work_df.loc[te_idx, feat_cols], work_df.loc[te_idx, target_col]
+
+    def _clean_split(X_df, y_s):
+        X_df = X_df.replace([np.inf, -np.inf], np.nan)
+        valid = X_df.notna().all(axis=1) & y_s.notna()
+        return X_df.loc[valid], y_s.loc[valid]
+
+    # 清理nan
+    X_tr, y_tr = _clean_split(X_tr, y_tr)
+    X_va, y_va = _clean_split(X_va, y_va)
+    X_te, y_te = _clean_split(X_te, y_te)
+
+    # 5) sklearn 縮放：只用 train 擬合，SeqDataset 會在 GPU 前再 transform（不洩漏、且只動 cols_to_scale）
+    if sklearn_scaler is not None:
+        sklearn_scaler.fit_df(X_tr)
+
+     # 6) 建 Dataset / Loader（和你原本一致）
     L = int(cfg["sequence"]["seq_len"])
     label_dtype = "float" if is_reg else "long"
     device = cfg["device"]
     bs = int(cfg["train"]["batch_size"])
 
     # 永遠使用 Preload 到 GPU
-    ds_tr = SeqDataset(X_tr, y_tr, L, scaler=scaler, device=device, label_dtype=label_dtype)
-    ds_va = SeqDataset(X_va, y_va, L, scaler=scaler, device=device, label_dtype=label_dtype)
-    ds_te = SeqDataset(X_te, y_te, L, scaler=scaler, device=device, label_dtype=label_dtype)
+    stride = cfg["sequence"]["stride"]
+    anchor = int(cfg["sequence"]["stride_anchor"])%stride
+    
+    ds_tr = SeqDataset(X_tr, y_tr, L, scaler=sklearn_scaler, device=device, label_dtype=label_dtype,stride=stride, anchor=anchor)
+    ds_va = SeqDataset(X_va, y_va, L, scaler=sklearn_scaler, device=device, label_dtype=label_dtype,stride=stride, anchor=anchor)
+    ds_te = SeqDataset(X_te, y_te, L, scaler=sklearn_scaler, device=device, label_dtype=label_dtype,stride=stride, anchor=anchor)
 
-    # DataLoader：簡潔版（preload → num_workers=0, pin_memory=False）
+    # DataLoader:（preload → num_workers=0, pin_memory=False）
     train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
     val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
     test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
@@ -261,21 +327,22 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool =
     info = {"feat_cols": feat_cols, "target_col": target_col}
 
 
-    # ====== 給 XGB 的 numpy（沿用同一個 scaler.transform，無洩漏）======
+    # 7) 也把縮放資訊給 XGB 分支
     if also_XGB:
         Xtr = X_tr.values.astype(np.float32, copy=False)
         Xva = X_va.values.astype(np.float32, copy=False)
         Xte = X_te.values.astype(np.float32, copy=False)
-        if scaler is not None:
-            Xtr = scaler.transform(Xtr).astype(np.float32, copy=False)
-            Xva = scaler.transform(Xva).astype(np.float32, copy=False)
-            Xte = scaler.transform(Xte).astype(np.float32, copy=False)
-        y_dtype = np.float32 if cfg["task"]["type"] == "regression" else np.int64
+        if sklearn_scaler is not None:
+            Xtr = sklearn_scaler.transform(Xtr)
+            Xva = sklearn_scaler.transform(Xva)
+            Xte = sklearn_scaler.transform(Xte)
+        y_dtype = np.float32 if is_reg else np.int64
         info["XGB"] = {
             "X_tr": Xtr, "y_tr": y_tr.values.astype(y_dtype, copy=False),
             "X_va": Xva, "y_va": y_va.values.astype(y_dtype, copy=False),
             "X_te": Xte, "y_te": y_te.values.astype(y_dtype, copy=False),
-            "scaler": scaler,
+            "scaler": sklearn_scaler,
+            "cols_to_scale": cols_to_scale,
         }
 
     return train_loader, val_loader, test_loader, info

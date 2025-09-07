@@ -11,3 +11,8 @@ plots
 outputs
 cache_features
 train_old
+runs_old
+runs
+feature_selection
+utils
+optuna.db

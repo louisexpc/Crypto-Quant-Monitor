@@ -17,6 +17,8 @@ import numpy as np
 import optuna
 import pandas as pd
 import yaml
+import os
+import multiprocessing as mp 
 
 # ---- Objective ----
 from objective.objective import objective
@@ -26,7 +28,7 @@ from utils.compute_export_metrices import dump_best_yaml
 
 # ---- Runtime features ----
 from utils.init_train import setup_cuda_acceleration, set_seed
-from build_feature_loader.indicators import Indicators
+from build_feature_loader.indicators import IndicatorLibrary, FeatureComputer
 from build_feature_loader.build_features import build_features_and_label
 
 
@@ -55,21 +57,23 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
     else:
         raise ValueError("只支援 .csv 或 .parquet 檔案")
 
-    # Indicators（照你原有流程）
-    ind = Indicators(
+    # 1) 規格化 OHLCV
+    lib = IndicatorLibrary(
         df_raw,
-        cache_dir=cfg["features"]["cache_dir"],
-        freq_check=cfg["data"]["freq"],
-        prefer_time_col=index_col,
+        freq_check=cfg["data"]["freq"],        # 例如 "1H"
+        prefer_time_col=index_col,             # "timestamp" 或 "datetime"
     )
+    # 2) 建 特徵計算器（內建 parquet + manifest 快取）
+    fc = FeatureComputer(lib, cache_dir=cfg["features"]["cache_dir"])
+
+    # 3) 計算特徵（支援 plan.groups 與 plan.features）
     plan = cfg["features"]["plan"]
-    feat_df = ind.compute(plan)
-    feat_path = ind.cache_path_for(plan)
+    feat_df = fc.compute(plan, cfg)    # -> 已 shift(1) 防洩漏、已快取
 
     #   回歸→連續 target、分類→二值 label
     X_df, y_s = build_features_and_label(
-        df_base=ind.df,
-        feat_parquet_path=feat_path,
+        df_base=lib.df,
+        feat_parquet_path=None,
         feat_df=feat_df,
         cfg=cfg)
         
@@ -87,14 +91,19 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
     df = pd.concat([X_df, y_s], axis=1)
     assert target_col in df.columns, f"建表失敗：df 缺少 '{target_col}' 欄位。"
 
-    pt_bundle = {"feat_parquet": str(feat_path), "target_col": target_col, "task_type": task_type}
+    # pt_bundle = {"feat_parquet": str(feat_path), "target_col": target_col, "task_type": task_type}
+    pt_bundle = {
+        "target_col": target_col,
+        "task_type": task_type,
+        "feat_cols": feat_df.columns.tolist(),    # ← 傳出去
+    }
     return df, pt_bundle
 
 
 # ======================================================================
 # Section C. 建立 Study（Optuna）
 # ======================================================================
-def build_study(cfg: dict, run_dir: Path) -> optuna.Study:
+def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.Study:
     study_name = cfg["project_name"]
     task = str(cfg["task"]["type"]).lower()
     primary = cfg["objective"]["primary_metric"]
@@ -114,17 +123,27 @@ def build_study(cfg: dict, run_dir: Path) -> optuna.Study:
 
     study_name = f"{study_name}__{task}_{primary}__{study_suffix}"
 
-    db_uri = f"sqlite:///{(run_dir / 'study.db').as_posix()}"
+    # --- SQLite URI with timeout for concurrency ---
+    mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
+    sqlite_timeout = int(mg.get("sqlite_timeout_sec", 120))
+    db_uri = f"sqlite:///{(run_dir / 'study.db').as_posix()}?timeout={sqlite_timeout}"
+
+    # --- Sampler: 平行建議 constant_liar=True ---
+    sampler = optuna.samplers.TPESampler(
+        seed=cfg["search"]["seed"],
+        multivariate=True,
+        group=True,
+        constant_liar=bool(parallel),  # 平行才開
+    )
+
+    # db_uri = f"sqlite:///{(run_dir / 'study.db').as_posix()}"
+
     study = optuna.create_study(
         study_name=study_name,
         storage=db_uri,
         load_if_exists=True,
         direction=direction,  # "maximize" / "minimize" 與 objective_runtime 保持一致
-        sampler=optuna.samplers.TPESampler(
-            seed=cfg["search"]["seed"],
-            multivariate=True,       
-            group=True
-        ),        
+        sampler=sampler,  
         pruner=optuna.pruners.MedianPruner(
             n_warmup_steps=cfg["search"]["pruner_warmup_folds"]  # 以「fold」作為 step
         ),
@@ -135,7 +154,40 @@ def build_study(cfg: dict, run_dir: Path) -> optuna.Study:
 # ======================================================================
 # Section D. 執行訓練與搜尋
 # ======================================================================
-def run(cfg_path: str):
+# def run(cfg_path: str):
+#     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
+#     cfg = load_cfg(cfg_path)
+#     set_seed(int(cfg.get("seed", 42)))
+#     setup_cuda_acceleration()
+
+#     # 2) 建輸出資料夾
+#     run_dir = Path("runs") / cfg.get("project_name", "exp")
+#     run_dir.mkdir(parents=True, exist_ok=True)
+
+#     # 3) 準備資料
+#     df, pt_bundle = prepare_dataframe(cfg)
+
+#     # 4) 建立 Study
+#     study = build_study(cfg, run_dir)
+
+#     # 5) 搜尋（以 folds 為 step 報告分數；objective_runtime 會依 cfg.objective 自動處理 direction）
+#     n_trials = int(cfg["search"]["n_trials"])
+#     time_hour = int(cfg["search"]["timeout"])  # 小時
+#     study.optimize(
+#         lambda t: objective(t, cfg, df, run_dir, pt_bundle),
+#         n_trials=n_trials,
+#         timeout=time_hour * 60 * 60,
+#         show_progress_bar=True
+#     )
+
+#     # 6) 結果輸出
+#     print("Best hyperparameters:", study.best_trial.params)
+#     print(f"Best `{cfg['objective']['primary_metric']}` ({cfg['objective']['direction']}): {study.best_value:.6g}")
+
+#     # 匯出最佳 trial 的 YAML（包含實際 frozen config 與 selected_features）
+#     dump_best_yaml(study, cfg, run_dir)
+
+def run_single(cfg_path: str, *, worker_tag: str | None = None):
     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
     cfg = load_cfg(cfg_path)
     set_seed(int(cfg.get("seed", 42)))
@@ -145,28 +197,54 @@ def run(cfg_path: str):
     run_dir = Path("runs") / cfg.get("project_name", "exp")
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    # 將 worker_tag 寫入環境變數（objective.py 會用來決定 trial 子資料夾）
+    if worker_tag:
+        os.environ["WORKER_TAG"] = str(worker_tag)
+
     # 3) 準備資料
     df, pt_bundle = prepare_dataframe(cfg)
 
-    # 4) 建立 Study
-    study = build_study(cfg, run_dir)
+    # 4) 建立 Study（parallel=True 時 sampler 會開 constant_liar）
+    study = build_study(cfg, run_dir, parallel=bool(worker_tag))
 
-    # 5) 搜尋（以 folds 為 step 報告分數；objective_runtime 會依 cfg.objective 自動處理 direction）
+    # 5) 搜尋
     n_trials = int(cfg["search"]["n_trials"])
     time_hour = int(cfg["search"]["timeout"])  # 小時
     study.optimize(
         lambda t: objective(t, cfg, df, run_dir, pt_bundle),
         n_trials=n_trials,
         timeout=time_hour * 60 * 60,
-        show_progress_bar=True
+        show_progress_bar=not bool(worker_tag)  # worker 不顯示進度條，避免互相干擾
     )
 
-    # 6) 結果輸出
+    # 6) 結果輸出（只在單進程或 worker_tag 是最小的時候做也可；簡單起見都做）
     print("Best hyperparameters:", study.best_trial.params)
     print(f"Best `{cfg['objective']['primary_metric']}` ({cfg['objective']['direction']}): {study.best_value:.6g}")
-
-    # 匯出最佳 trial 的 YAML（包含實際 frozen config 與 selected_features）
     dump_best_yaml(study, cfg, run_dir)
+
+
+def _worker_entry(cfg_path: str, gpu_id: int):
+    # 每個進程只看到自己那張卡，且標上 worker_tag
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    worker_tag = f"gpu{gpu_id}"
+    # 建議用 spawn（WSL/CUDA 友好）
+    run_single(cfg_path, worker_tag=worker_tag)
+
+def run_multi(cfg_path: str):
+    cfg = load_cfg(cfg_path)
+    mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
+    gpu_ids = list(mg.get("gpu_ids", [0, 1]))
+    assert len(gpu_ids) >= 2, "multi_gpu.enabled=true 但 gpu_ids 少於 2"
+
+    mp.set_start_method("spawn", force=True)
+    procs = []
+    for gid in gpu_ids:
+        p = mp.Process(target=_worker_entry, args=(cfg_path, int(gid)), daemon=False)
+        p.start()
+        procs.append(p)
+    for p in procs:
+        p.join()
 
 
 # ======================================================================
@@ -174,5 +252,12 @@ def run(cfg_path: str):
 # ======================================================================
 if __name__ == "__main__":
     import xgboost as xgb
-    print("XGB==============================",xgb.__version__)
-    run("train_core/config.yaml")
+    # print("XGB=", xgb.__version__)
+    cfg_path = "train_core/config.yaml"
+
+    cfg = load_cfg(cfg_path)
+    mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
+    if mg.get("enabled", False):
+        run_multi(cfg_path)
+    else:
+        run_single(cfg_path)

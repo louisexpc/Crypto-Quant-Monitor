@@ -10,9 +10,7 @@ from pathlib import Path
 from sklearn.metrics import (
     roc_curve, auc,
     precision_recall_curve, average_precision_score,
-    confusion_matrix, ConfusionMatrixDisplay,
-    precision_score, recall_score, matthews_corrcoef,
-    precision_recall_fscore_support, accuracy_score, fbeta_score, 
+    confusion_matrix, ConfusionMatrixDisplay,fbeta_score, 
 )
 from sklearn.preprocessing import label_binarize
 
@@ -29,114 +27,6 @@ def _ensure_2d_prob(y_prob: np.ndarray) -> np.ndarray:
     if y_prob.ndim == 1:
         y_prob = y_prob.reshape(-1, 1)
     return y_prob
-
-def compute_metrics(y_true, y_pred):
-    acc = accuracy_score(y_true, y_pred)
-    p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="macro", zero_division=0
-    )
-    p_weight, r_weight, f1_weight, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="weighted", zero_division=0
-    )
-    f05_macro = fbeta_score(y_true, y_pred, beta=0.5, average="macro", zero_division=0)
-    f05_weighted = fbeta_score(y_true, y_pred, beta=0.5, average="weighted", zero_division=0)
-    mcc = matthews_corrcoef(y_true, y_pred)
-
-    return {
-        "acc": acc,
-        "macro_precision": p_macro, "macro_recall": r_macro, "macro_f1": f1_macro,
-        "weighted_precision": p_weight, "weighted_recall": r_weight, "weighted_f1": f1_weight,
-        "f_05_macro": f05_macro, "f_05_weighted": f05_weighted,
-        "mcc": mcc,
-        
-    }
-
-def pearson_corr_np(y_true, y_pred, eps=1e-12):
-    y_true = np.asarray(y_true).ravel()
-    y_pred = np.asarray(y_pred).ravel()
-    sy = y_true.std()
-    sp = y_pred.std()
-    if not np.isfinite(sy) or not np.isfinite(sp) or sy < eps or sp < eps:
-        return 0.0  # 或者回傳 np.nan 再由上層統一處理
-    return float(np.corrcoef(y_true, y_pred)[0, 1])
-
-def ema_mse_np(y_true, y_pred, decay: float = 0.9, eps: float = 1e-12) -> float:
-    """對整個驗證序列做「一次」EMA加權的 MSE（最近樣本權重最大）。"""
-    yt = np.asarray(y_true).reshape(-1)
-    yp = np.asarray(y_pred).reshape(-1)
-    n  = yt.size
-    if n == 0:
-        return float("nan")
-    # 權重：w_t = (1-decay)*decay^{n-1-t}
-    w = (1.0 - decay) * (decay ** np.arange(n-1, -1, -1, dtype=float))
-    w_sum = w.sum()
-    if w_sum <= eps:
-        w = np.ones_like(yt) / n
-    else:
-        w /= w_sum
-    return float(((yp - yt) ** 2 * w).sum())
-
-def compute_mixed_objective_np(y_true, y_pred, alpha: float = 0.7, beta: float = 0.3, ema_decay: float = 0.9):
-    """回傳 (objective_value, components_dict)"""
-    r   = pearson_corr_np(y_true, y_pred)
-    ems = ema_mse_np(y_true, y_pred, decay=ema_decay)
-    obj = float(alpha * ems + beta * (1.0 - r))
-    return obj, {"pearson": float(r), "ema_mse": float(ems)}
-
-
-
-
-def dump_best_yaml(study: optuna.Study, cfg: dict, run_dir: Path):
-    """將最佳 trial 的參數與設定儲存成 YAML 檔與 txt 檔。"""
-    best = study.best_trial
-    params = best.params
-    feats = best.user_attrs.get("selected_features", [])
-
-    outdir = run_dir / "best"
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    # 1. 純參數 YAML
-    with open(outdir / "best_params.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(params, f, sort_keys=False, allow_unicode=True)
-
-    # 2. 完整 config（將搜尋空間替換為實際值）
-    frozen = copy.deepcopy(cfg)
-
-    def _set_num(node, key, default):
-        val = params.get(key, None)
-        if val is None:
-            return default
-        try:
-            v = float(val)
-            if v.is_integer():
-                v = int(v)
-        except Exception:
-            v = val
-        node[key] = v
-        return v
-
-    _set_num(frozen["train"], "lr", frozen["train"]["lr"])
-    _set_num(frozen["train"], "weight_decay", frozen["train"]["weight_decay"])
-    _set_num(frozen["train"], "epochs", frozen["train"]["epochs"])
-    _set_num(frozen["train"], "grad_clip", frozen["train"]["grad_clip"])
-
-    if "hidden_size" in params: frozen["model"]["hidden_size"] = params["hidden_size"]
-    if "n_layers" in params:    frozen["model"]["n_layers"]    = params["n_layers"]
-    if "dropout" in params:     frozen["model"]["dropout"]     = float(params["dropout"])
-    if "seq_len" in params:     frozen["sequence"]["seq_len"]  = params["seq_len"]
-    if "flat_band_bps" in params: frozen["label"]["flat_band_bps"] = params["flat_band_bps"]
-
-    sel = frozen.setdefault("features", {}).setdefault("selection", {})
-    if "k_features" in params: sel["k_range"] = [params["k_features"], params["k_features"]]
-    if "feat_seed" in params:  sel["feat_seed"] = params["feat_seed"]
-
-    # 3. 寫出 selected_features.txt
-    with open(outdir / "selected_features.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(feats))
-
-    # 4. 寫出 best_config.yaml
-    with open(outdir / "best_config.yaml", "w", encoding="utf-8") as f:
-        yaml.safe_dump(frozen, f, sort_keys=False, allow_unicode=True)
 
 
 # =========================
@@ -234,10 +124,10 @@ class ClassificationReporter:
         plt.savefig(self.save_dir / f"{self.prefix}pr_curve.png", dpi=200)
         plt.close()
 
-        # ----- Confusion Matrix -----
-        cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
+        # ----- Confusion Matrix (row-normalized ratio) -----
+        cm = confusion_matrix(y_true, y_pred, labels=list(range(n_classes)), normalize="true")
         disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=self.class_names)
-        disp.plot(cmap="Blues", xticks_rotation=45)
+        disp.plot(cmap="Blues", xticks_rotation=45, values_format=".2f")
         plt.title("Confusion Matrix")
         plt.tight_layout()
         plt.savefig(self.save_dir / f"{self.prefix}confusion_matrix.png", dpi=200)
@@ -275,14 +165,32 @@ class RegressionReporter:
         self.save_dir = _ensure_dir(save_dir)
         self.prefix = prefix or ""
 
+    # @staticmethod
+    # def _pearson_rmse_mae(y_true, y_pred):
+    #     y_true = np.asarray(y_true).reshape(-1)
+    #     y_pred = np.asarray(y_pred).reshape(-1)
+    #     mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    #     y_true, y_pred = y_true[mask], y_pred[mask]
+    #     if y_true.size == 0:
+    #         return 0.0, float("nan"), float("nan"), np.array([]), np.array([])
+    #     err = y_pred - y_true
+    #     mse = float(np.mean(err ** 2))
+    #     rmse = float(np.sqrt(mse))
+    #     mae = float(np.mean(np.abs(err)))
+    #     yt = y_true - y_true.mean()
+    #     yp = y_pred - y_pred.mean()
+    #     denom = (np.sqrt((yt**2).sum()) * np.sqrt((yp**2).sum()))
+    #     pearson = float((yt * yp).sum() / denom) if denom > 1e-12 else 0.0
+    #     return pearson, rmse, mae, y_true, y_pred
+
     @staticmethod
-    def _pearson_rmse_mae(y_true, y_pred):
+    def _corr_rmse_mae_spearman(y_true, y_pred):
         y_true = np.asarray(y_true).reshape(-1)
         y_pred = np.asarray(y_pred).reshape(-1)
         mask = np.isfinite(y_true) & np.isfinite(y_pred)
         y_true, y_pred = y_true[mask], y_pred[mask]
         if y_true.size == 0:
-            return 0.0, float("nan"), float("nan"), np.array([]), np.array([])
+            return 0.0, float("nan"), float("nan"), float("nan"), np.array([]), np.array([])
         err = y_pred - y_true
         mse = float(np.mean(err ** 2))
         rmse = float(np.sqrt(mse))
@@ -291,13 +199,38 @@ class RegressionReporter:
         yp = y_pred - y_pred.mean()
         denom = (np.sqrt((yt**2).sum()) * np.sqrt((yp**2).sum()))
         pearson = float((yt * yp).sum() / denom) if denom > 1e-12 else 0.0
-        return pearson, rmse, mae, y_true, y_pred
 
+        # Spearman：以排名後做 Pearson
+        def _rank_avg(a):
+            a = np.asarray(a)
+            n = a.size
+            order = np.argsort(a, kind="mergesort")
+            ranks = np.empty(n, dtype=float)
+            i = 0
+            while i < n:
+                j = i
+                ai = a[order[i]]
+                while j + 1 < n and a[order[j + 1]] == ai:
+                    j += 1
+                avg_rank = 0.5 * (i + j) + 1.0
+                ranks[order[i:j + 1]] = avg_rank
+                i = j + 1
+            return ranks
+
+        r1 = _rank_avg(y_true)
+        r2 = _rank_avg(y_pred)
+        r1c = r1 - r1.mean()
+        r2c = r2 - r2.mean()
+        denom_s = (np.sqrt((r1c**2).sum()) * np.sqrt((r2c**2).sum()))
+        spearman = float((r1c * r2c).sum() / denom_s) if denom_s > 1e-12 else float("nan")
+
+        return pearson, rmse, mae, spearman, y_true, y_pred
+    
     def plot_eval(self, y_true, y_pred):
-        r, rmse, mae, y_true, y_pred = self._pearson_rmse_mae(y_true, y_pred)
+        r, rmse, mae, spr, y_true, y_pred = self._corr_rmse_mae_spearman(y_true, y_pred)
         if y_true.size == 0:
             print("[RegressionReporter] empty inputs after masking; skip.")
-            return {"pearson": 0.0, "rmse": float("nan"), "mae": float("nan")}
+            return {"pearson": 0.0, "spearman": float("nan"), "rmse": float("nan"), "mae": float("nan")}
 
         err = y_pred - y_true
 
@@ -310,7 +243,7 @@ class RegressionReporter:
         plt.grid(True, linestyle=':', linewidth=0.5)
         plt.axis("equal")
         plt.xlabel("y_true"); plt.ylabel("y_pred")
-        plt.title(f"y_true vs y_pred\nr={r:.3f} | RMSE={rmse:.4g} | MAE={mae:.4g}")
+        plt.title(f"y_true vs y_pred\nPearson r={r:.3f} | Spearman ρ={spr:.3f} | RMSE={rmse:.4g} | MAE={mae:.4g}")
         plt.tight_layout()
         plt.savefig(self.save_dir / f"{self.prefix}reg_scatter.png", dpi=200)
         plt.close()
@@ -339,7 +272,7 @@ class RegressionReporter:
         plt.tight_layout()
         plt.savefig(self.save_dir / f"{self.prefix}reg_residual_vs_pred.png", dpi=200)
         plt.close()
-        return {"pearson": r, "rmse": rmse, "mae": mae}
+        return {"pearson": r, "spearman": spr, "rmse": rmse, "mae": mae}
     
 
     def threshold_sweep(self, y_true_reg, y_pred_reg,
@@ -421,6 +354,7 @@ def save_fold_metrics(metrics: list[dict], save_dir: Path, prefix: str = "",
     # 支援欄位：train_pearson/val_pearson, train_rmse/val_rmse, train_mae/val_mae
     for metric_name, ylabel in [
         ("pearson", "Pearson r"),
+        ("spearman", "Spearman ρ"),
         ("rmse", "RMSE"),
         ("mae", "MAE"),
         ("mse", "MSE"),
@@ -449,19 +383,73 @@ def save_fold_metrics(metrics: list[dict], save_dir: Path, prefix: str = "",
 # =========================
 # 結果輸出（共用）
 # =========================
-def save_result(fold_id, export_dir, result: dict):
+
+# --- B) CV 摘要輸出（置頂 test 平均；逐 fold 列表）---
+def _numeric_dict(d):
+    out = {}
+    for k, v in (d or {}).items():
+        if isinstance(v, (int, float, np.floating)) and np.isfinite(v):
+            out[k] = float(v)
+    return out
+
+def _avg_std_dict(rows: list[dict]):
+    pool = {}
+    for d in rows:
+        for k, v in _numeric_dict(d).items():
+            pool.setdefault(k, []).append(v)
+    avg = {k: float(np.mean(vs)) for k, vs in pool.items()}
+    std = {k: float(np.std(vs, ddof=0)) for k, vs in pool.items()}
+    return avg, std
+
+def save_cv_summary(fold_results: list[dict], export_dir: str | Path, task_type: str):
     export_dir = _ensure_dir(export_dir)
-    json_path = export_dir / f"fold_{fold_id}_result.json"
-    result_to_save = copy.deepcopy(result)
-    result_to_save.pop("state_dict", None)
+    folds_out = []
 
-    if "roc_info" in result_to_save and result_to_save["roc_info"] is not None:
-        for k, v in result_to_save["roc_info"].items():
-            if isinstance(v, np.ndarray):
-                result_to_save["roc_info"][k] = v.tolist()
+    # 收集每個 fold 的 val/test 指標（分類 vs 回歸各自的鍵）
+    for i, res in enumerate(fold_results):
+        if task_type == "classification":
+            val  = _numeric_dict(res.get("val_metrics", {}))
+            test = _numeric_dict(res.get("test_metrics", {}))
+            extra = {}
+        else:  # regression
+            val  = _numeric_dict(res.get("val_metrics_reg", {}))
+            test = _numeric_dict(res.get("test_metrics_reg", {}))
+            extra = {}
+            if "regression_to_class" in res:
+                extra["regression_to_class"] = res["regression_to_class"]  # 原樣放入，當報表
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result_to_save, f, indent=2, ensure_ascii=False)
+        folds_out.append({"fold_id": i, "val": val, "test": test, **extra})
+
+    # 置頂 test 平均 / 標準差（自動對所有數值欄）
+    test_avg, test_std = _avg_std_dict([f["test"] for f in folds_out])
+    val_avg,  val_std  = _avg_std_dict([f["val"]  for f in folds_out])
+
+    summary = {
+        "task_type": task_type,
+        "test_avg": test_avg,         # ★ 置頂
+        "test_std": test_std,
+        "val_avg": val_avg,           #（可選）一起放，方便比對
+        "val_std": val_std,
+        "folds": folds_out
+    }
+    with open(Path(export_dir) / "cv_summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # =========================
 # Optuna 最佳設定輸出（保持）

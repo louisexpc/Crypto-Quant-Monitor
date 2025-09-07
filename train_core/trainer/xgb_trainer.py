@@ -1,162 +1,3 @@
-# # xgb_trainer.py
-# from xgboost.callback import EarlyStopping
-# import cupy as cp
-# import xgboost as xgb
-
-# def _train_one_fold_xgb(model_wrapper, cfg, fold_id, export_dir):
-
-
-#     import numpy as np
-#     from pathlib import Path
-#     from utils.regression_utils import compute_regression_metrics
-#     from utils.compute_export_metrices import (
-#         compute_mixed_objective_np, save_result, plot_regression_eval, plot_regression_threshold_sweep, save_fold_metrics
-#     )
-#     export_dir = Path(export_dir); export_dir.mkdir(parents=True, exist_ok=True)
-
-#     # ==== 超參（早停相關）====
-#     mcfg = cfg["model"]
-#     total_estimators = int(mcfg["n_estimators"])
-#     es_step   = int(mcfg["es_step"]) if "es_step" in mcfg else 50
-#     patience  = int(mcfg["es_patience"]) if "es_patience" in mcfg else 5
-#     min_delta = float(mcfg["es_min_delta"]) if "es_min_delta" in mcfg else 0.0
-
-#     # --- 取資料包 ---
-#     xgbp = cfg["_xgb_pack"]  # dict: X_tr/y_tr/X_va/y_va/X_te/y_te
-#     Xtr, ytr = xgbp["X_tr"], xgbp["y_tr"]
-#     Xva, yva = xgbp["X_va"], xgbp["y_va"]
-#     Xte, yte = xgbp["X_te"], xgbp["y_te"]
-
-#     # ==== 建模 & GPU handoff ====
-#     model = model_wrapper.build()
-#     params = model.get_params()
-#     device = str(params.get("device", "cpu")).lower()
-
-#     # === GPU handoff (把資料搬上 GPU；若沒裝 CuPy 就自動退回 CPU) ===      
-#     if device == "cuda":       
-#         Xtr, ytr = cp.asarray(Xtr), cp.asarray(ytr)
-#         Xva, yva = cp.asarray(Xva), cp.asarray(yva)
-#         Xte, yte = cp.asarray(Xte), cp.asarray(yte)
-
-#     # 評分用 RMSE（放到參數，而不是 fit 的 kw）
-#     model.set_params(eval_metric="rmse")
-
-
-#     # ==== Warm-start 早停：逐步增加樹數 ====
-#     best_rmse = float("inf")
-#     best_t = 0
-#     no_improve = 0
-#     curr = 0
-
-#     # 小工具：計算當前模型在 val 的 RMSE（會處理 CuPy → NumPy）
-#     def _val_rmse_now(trees: int) -> float:
-#         # 用 iteration_range 限制到前 trees 棵（若剛 fit 完，可不寫 iteration_range，但這樣更準）
-#         yva_t = model.predict(Xva, iteration_range=(0, trees))
-#         if device == "cuda":
-#             yva_t = cp.asnumpy(yva_t); yt = cp.asnumpy(yva)
-#         else:
-#             yt = yva
-#         return float(np.sqrt(np.mean((yt - yva_t) ** 2)))
-    
-    
-
-#     # --- 訓練：不帶 early_stopping，保留 eval_set 以便 evals_result() ---
-#     model.fit(Xtr, ytr, eval_set=[(Xtr, ytr), (Xva, yva)], verbose=False)
-
-
-#     # --- 構建 history：每輪 RMSE + PEARSON ---
-#     history = []
-#     ev = model.evals_result()  # {'validation_0': {'rmse': [...]}, 'validation_1': {'rmse': [...]}}
-#     tr_rmse = ev.get("validation_0", {}).get("rmse", [])
-#     va_rmse = ev.get("validation_1", {}).get("rmse", [])
-
-#     # 計算每輪 pearson：用 iteration_range 逐步累加到第 t 棵
-#     ytr_np = cp.asnumpy(ytr); yva_np = cp.asnumpy(yva)
-
-#     T = min(len(tr_rmse), len(va_rmse))
-#     for t in range(1, T + 1):
-#         # 到第 t 棵為止的預測
-#         ytr_t = model.predict(Xtr, iteration_range=(0, t))
-#         yva_t = model.predict(Xva, iteration_range=(0, t))
-#         ytr_t = cp.asnumpy(ytr_t); yva_t = cp.asnumpy(yva_t)
-
-#         pear_tr = float(np.corrcoef(ytr_np, ytr_t)[0, 1]) if len(ytr_np) > 3 else np.nan
-#         pear_va = float(np.corrcoef(yva_np, yva_t)[0, 1]) if len(yva_np) > 3 else np.nan
-
-#         # 列印逐 round 訊息
-#         print(f"[XGB][fold {fold_id}] round={t:04d} | "
-#             f"tr_rmse={float(tr_rmse[t-1]):.6f} va_rmse={float(va_rmse[t-1]):.6f} | "
-#             f"tr_pear={pear_tr:.4f} va_pear={pear_va:.4f}")
-
-#         history.append({
-#             "epoch": t,
-#             "train_rmse": float(tr_rmse[t-1]),
-#             "val_rmse": float(va_rmse[t-1]),
-#             "train_pearson": pear_tr,
-#             "val_pearson": pear_va,
-#             "train_loss": float(tr_rmse[t-1]) ** 2,   # ★ 補上 train_loss
-#             "val_loss": float(va_rmse[t-1]) ** 2,  # 給 save_fold_metrics 畫 val_loss 曲線
-#         })
-
-
-#     # === 用驗證集最小 RMSE 的 round 當作最佳輪，改用它來做最終預測 ===
-#     if T > 0:
-#         best_t = int(np.argmin(va_rmse)) + 1
-#     else:
-#         best_t = int(model.get_params().get("n_estimators", 0)) or 1
-
-#     print(f"[XGB][fold {fold_id}] best_t(by val_rmse) = {best_t}")
-        
-#     # --- 最終驗證/測試推論 ---
-#     yva_pred = model.predict(Xva)
-#     yte_pred = model.predict(Xte)
-
-#     # === 把 GPU 結果轉回 numpy，供後續計算/繪圖 ===        
-#     yva_pred = cp.asnumpy(yva_pred); yte_pred = cp.asnumpy(yte_pred)
-#     yva = cp.asnumpy(yva); yte = cp.asnumpy(yte)
-
-#     # best_epoch = int(getattr(model, "best_iteration_", -1)) + 1
-#     best_epoch = best_t  # ★ 最佳輪數回寫
-
-#     # mixed for validation
-#     alpha = float(cfg["loss"].get("alpha", 0.7))
-#     beta  = float(cfg["loss"].get("beta", 0.3))
-#     decay = float(cfg["loss"].get("ema_decay", 0.9))
-#     val_mixed, comps = compute_mixed_objective_np(y_true=yva, y_pred=yva_pred,
-#                                                   alpha=alpha, beta=beta, ema_decay=decay)
-
-#     # test metrics
-#     m_te = compute_regression_metrics(yte, yte_pred)
-#     result = {
-#         "history": history,
-#         "best_epoch": best_epoch,
-#         "state_dict": {},               # 非 torch 模型，留空即可
-#         "test_metrics_reg": {"test_loss": float(np.mean((yte - yte_pred) ** 2)), **m_te},
-#         "temperature": 1.0,
-#         "best_val_mixed": float(val_mixed),
-#         "best_val_pearson": float(comps["pearson"]),
-#         "best_val_arrays": {"y_va": yva.tolist(), "y_pred_va": yva_pred.tolist()},
-#     }
-
-
-
-#     # 視覺化/匯出（沿用你原有工具）
-#     plot_regression_eval(y_true=yte, y_pred=yte_pred, save_dir=export_dir, prefix=f"fold_{fold_id}_")
-#     reg2cls = (cfg.get("regression_to_class", {}) or {})
-#     if reg2cls.get("enabled", False):
-#         plot_regression_threshold_sweep(
-#             y_true_reg=yte, y_pred_reg=yte_pred,
-#             true_threshold=float(reg2cls.get("true_threshold", 0.0)),
-#             beta=float(reg2cls.get("fbeta", 0.5)),
-#             grid_points=int(reg2cls.get("grid_points", 101)),
-#             save_dir=export_dir, prefix=f"fold_{fold_id}_"
-#         )
-#     save_result(fold_id=fold_id, export_dir=export_dir, result=result)
-#     save_fold_metrics(history, save_dir=export_dir, prefix=f"fold_{fold_id}_")
-#     return model, result
-
-
-
 # xgb_trainer.py
 import cupy as cp
 import xgboost as xgb
@@ -167,7 +8,7 @@ def _train_one_fold_xgb(model_wrapper, cfg, fold_id, export_dir):
     from utils.regression_utils import compute_regression_metrics
     from utils.compute_export_metrices import (
         compute_mixed_objective_np,  # ← 與 trainer_reg.py 對齊
-        save_result, plot_regression_eval, plot_regression_threshold_sweep, save_fold_metrics
+        plot_regression_eval, plot_regression_threshold_sweep, save_fold_metrics
     )
 
     export_dir = Path(export_dir); export_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +166,6 @@ def _train_one_fold_xgb(model_wrapper, cfg, fold_id, export_dir):
             save_dir=export_dir, prefix=f"fold_{fold_id}_"
         )
     save_fold_metrics(history, save_dir=export_dir, prefix=f"fold_{fold_id}_")
-    save_result(fold_id=fold_id, export_dir=export_dir, result=result)
+    # save_result(fold_id=fold_id, export_dir=export_dir, result=result)
     return model, result
 

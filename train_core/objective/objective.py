@@ -8,9 +8,12 @@ import torch
 import optuna
 import yaml
 from copy import deepcopy
+import os
+import re  # === NEW ===
 
 from .objective_utils import (get_task_type, suggest_rolling_and_cv, suggest_cat, suggest_float,
-                             suggest_int, get_enabled_feature_names, suggest_model_hparams, make_folds)
+                             suggest_int, get_enabled_feature_names, suggest_model_hparams, make_folds,
+                             _format_score_tag, _safe_rename_trial_dir)
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -19,7 +22,7 @@ from trainer.trainer_base import get_trainer
 from build_feature_loader.dataloader import make_loaders_for_fold
 from models.model_factory import build_model
 from utils.init_train import set_seed, setup_cuda_acceleration
-
+from utils.compute_export_metrices import save_cv_summary
 
 # ======================================================================
 # Trial 得分計算（依 primary_metric / direction）
@@ -84,7 +87,25 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
     task_type = get_task_type(cfg)
     target_col = "label" if task_type == "classification" else "target"
 
-    trial_dir = run_dir / f"trial_{trial.number:03d}"
+    # === NEW: 讓 gpu1（4060）自動把 batch_size 砍半 ===
+    worker_tag = os.environ.get("WORKER_TAG", "").strip()   # 來自 main_train.run_multi()
+    orig_bs = int(cfg["train"]["batch_size"])
+    m = re.search(r"gpu(\d+)", worker_tag)  # gpu0 / gpu1 / ...
+    if m and int(m.group(1)) == 1:
+        cfg["train"]["batch_size"] = max(1, orig_bs // 2)   # 砍半（至少為 1）
+    # 可選：印一下方便追蹤
+    if worker_tag:
+        print(f"[objective] worker={worker_tag} | batch_size={cfg['train']['batch_size']} (orig={orig_bs})")
+
+    # === NEW: 把 worker_tag / batch_size 寫進 trial 屬性，便於事後追蹤 ===
+    trial.set_user_attr("worker_tag", worker_tag or "single")
+    trial.set_user_attr("batch_size", int(cfg["train"]["batch_size"]))
+
+    # === NEW: 將不同 worker 的輸出分到不同子資料夾（你前面已加，留著提醒）===
+    if worker_tag:
+        trial_dir = run_dir / worker_tag / f"trial_{trial.number:03d}"
+    else:
+        trial_dir = run_dir / f"trial_{trial.number:03d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = suggest_rolling_and_cv(trial, cfg)
@@ -134,34 +155,29 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
     train_one_fold = get_trainer(cfg)
 
     # ==== 每 fold 訓練 ====
-    fold_scores = []
+    fold_scores, fold_results = [], []
     for i, fold in enumerate(folds):
         fold_dir = trial_dir / f"fold_{i}"
-        fold_dir.mkdir(parents=True, exist_ok=True)
-        # tr_loader, va_loader, te_loader, _ = make_loaders_for_fold(
-        #     df, feat_pool, target_col, fold, cfg
-        # )
+        fold_dir.mkdir(parents=True, exist_ok=True)     
 
         tr_loader, va_loader, te_loader, info = make_loaders_for_fold(
             df, feat_pool, target_col, fold, cfg, also_XGB=cfg["also_XGB"]
         )
-        # ★ fold 專屬 cfg，避免污染其他 fold
-        cfg_fold = deepcopy(cfg)
 
-        # ★ 這裡一定要用「同一個大小寫」的 key：XGB
+        cfg_fold = deepcopy(cfg)
         assert "XGB" in info and info["XGB"] is not None, \
             "[objective] info['XGB'] 不存在；請確認 make_loaders_for_fold(..., also_XGB=True)"
         cfg_fold["_xgb_pack"] = info["XGB"]
 
-        model = build_model(cfg, n_features)
 
+        feature_columns = info.get("feat_cols")
+        model = build_model(cfg, n_features,feature_columns)
 
-        # _, result = train_one_fold(model, tr_loader, va_loader, te_loader, cfg, device, i, fold_dir)
         _, result = train_one_fold(
             model, tr_loader, va_loader, te_loader,
             cfg_fold, device=device, fold_id=i, export_dir=fold_dir
         )
-
+        fold_results.append(result)
         score = compute_trial_score(result, cfg)
         fold_scores.append(float(score))
         trial.report(float(score), step=i)
@@ -169,7 +185,63 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
         # 若要啟用 Optuna pruning
         if cfg["objective"]["enable_prune"]:
             if trial.should_prune():
+
                 raise optuna.TrialPruned()
+
+    # ==== 這裡印出 avg 的 metrics（VAL / TEST）====
+    def _numeric_only(d):
+        out = {}
+        for k, v in (d or {}).items():
+            if isinstance(v, (int, float, np.floating)) and np.isfinite(v):
+                out[k] = float(v)
+        return out
+
+    def _avg(rows):
+        pool = {}
+        for d in rows:
+            for k, v in _numeric_only(d).items():
+                pool.setdefault(k, []).append(v)
+        return {k: float(np.mean(vs)) for k, vs in pool.items()}
+
+    if task_type == "classification":
+        val_rows  = [r.get("val_metrics",  {}) for r in fold_results]
+        test_rows = [r.get("test_metrics", {}) for r in fold_results]
+    else:  # regression
+        val_rows  = [r.get("val_metrics_reg",  {}) for r in fold_results]
+        test_rows = [r.get("test_metrics_reg", {}) for r in fold_results]
+
+    val_avg  = _avg(val_rows)
+    test_avg = _avg(test_rows)
+
+    print(f"\n[CV] {task_type.upper()} | folds={len(fold_results)}")
+    if val_avg:
+        print("[CV] VAL  avg:")
+        for k in sorted(val_avg):
+            print(f"  {k}: {val_avg[k]:.6g}")
+    if test_avg:
+        print("[CV] TEST avg:")
+        for k in sorted(test_avg):
+            print(f"  {k}: {test_avg[k]:.6g}")
+            
+    save_cv_summary(fold_results, export_dir=trial_dir, task_type=task_type)  # ★ 產出 cv_summary.json
+
+    # === 依任務型別決定是否改名 ===
+    if task_type == "classification":
+        # 你的 trainer_cls.py 回傳鍵是 "test_mcc"；保留 "mcc" 後備
+        mcc_cv = test_avg.get("test_mcc", test_avg.get("mcc", np.nan))
+        trial.set_user_attr("test_mcc_avg", float(mcc_cv) if np.isfinite(mcc_cv) else None)
+        if np.isfinite(mcc_cv):
+            tag = _format_score_tag("mcc", mcc_cv, digits=3, signed=True)  # 例：__mcc+0.123
+            trial_dir = _safe_rename_trial_dir(trial_dir, [tag])
+
+    elif task_type == "regression":
+        pearson_cv = test_avg.get("pearson", np.nan)
+        trial.set_user_attr("test_pearson_avg", float(pearson_cv) if np.isfinite(pearson_cv) else None)
+        if np.isfinite(pearson_cv):
+            tag = _format_score_tag("pearson", pearson_cv, digits=4, signed=True)
+            trial_dir = _safe_rename_trial_dir(trial_dir, [tag])
+
+
 
     # ==== 紀錄與儲存 ====
     mean_score = float(np.mean(fold_scores))
