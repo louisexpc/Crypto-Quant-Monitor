@@ -3,7 +3,7 @@ python-dotenv
 pyyaml
 ccxt
 pandas
-numpy
+numpy<2.0
 pymongo[srv]
 discord.py
 apscheduler
@@ -11,3 +11,4 @@ apscheduler
 torch --extra-index-url https://download.pytorch.org/whl/cpu
 pandas-ta
 pytz
+pyarrow

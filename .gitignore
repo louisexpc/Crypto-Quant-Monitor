@@ -1,2 +1,17 @@
 /logs
 __pycache__
+.env
+.venv
+data
+.csv
+recycle_bin
+runs
+k_group
+plots
+outputs
+cache_features
+train_old
+runs_old
+runs
+utils
+feature_selections

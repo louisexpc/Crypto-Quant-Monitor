@@ -31,8 +31,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 # 複製應用程式程式碼
 COPY app/ ./app/
-COPY .env ./
-COPY train/ ./train/
+# COPY .env ./
+# COPY train/ ./train/
 
 # 將虛擬環境的路徑添加到 PATH，這樣可以直接執行
 ENV PATH="/opt/venv/bin:$PATH"
