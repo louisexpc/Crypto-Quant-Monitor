@@ -9,7 +9,7 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from utils.init_train import setup_cuda_acceleration
+from train_utils.init_train import setup_cuda_acceleration
 setup_cuda_acceleration()
 
 # -----------------------------

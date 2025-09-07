@@ -5,8 +5,8 @@ import xgboost as xgb
 def _train_one_fold_xgb(model_wrapper, cfg, fold_id, export_dir):
     import numpy as np
     from pathlib import Path
-    from utils.regression_utils import compute_regression_metrics
-    from utils.compute_export_metrices import (
+    from train_utils.regression_utils import compute_regression_metrics
+    from train_utils.compute_export_metrices import (
         compute_mixed_objective_np,  # ← 與 trainer_reg.py 對齊
         plot_regression_eval, plot_regression_threshold_sweep, save_fold_metrics
     )

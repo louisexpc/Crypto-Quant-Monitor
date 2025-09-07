@@ -21,8 +21,8 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from trainer.trainer_base import get_trainer
 from build_feature_loader.dataloader import make_loaders_for_fold
 from models.model_factory import build_model
-from utils.init_train import set_seed, setup_cuda_acceleration
-from utils.compute_export_metrices import save_cv_summary
+from train_utils.init_train import set_seed, setup_cuda_acceleration
+from train_utils.compute_export_metrices import save_cv_summary
 
 # ======================================================================
 # Trial 得分計算（依 primary_metric / direction）

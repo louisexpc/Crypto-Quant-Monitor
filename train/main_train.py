@@ -24,10 +24,10 @@ import multiprocessing as mp
 from objective.objective import objective
 
 # ---- Exports / Reporting（與 trainer.py 同源）----
-from utils.compute_export_metrices import dump_best_yaml
+from train_utils.compute_export_metrices import dump_best_yaml
 
 # ---- Runtime features ----
-from utils.init_train import setup_cuda_acceleration, set_seed
+from train_utils.init_train import setup_cuda_acceleration, set_seed
 from build_feature_loader.indicators import IndicatorLibrary, FeatureComputer
 from build_feature_loader.build_features import build_features_and_label
 
@@ -253,7 +253,7 @@ def run_multi(cfg_path: str):
 if __name__ == "__main__":
     import xgboost as xgb
     # print("XGB=", xgb.__version__)
-    cfg_path = "train_core/config.yaml"
+    cfg_path = "train/config.yaml"
 
     cfg = load_cfg(cfg_path)
     mg = cfg.get("search", {}).get("multi_gpu", {}) or {}

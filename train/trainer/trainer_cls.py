@@ -14,10 +14,10 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # 匯出/視覺化/度量
-from utils.compute_export_metrices import (
+from train_utils.compute_export_metrices import (
     save_fold_metrics, plot_test_eval
 )
-from utils.metrics_cls import compute_cls_metrics  # ★ 新增
+from train_utils.metrics_cls import compute_cls_metrics  # ★ 新增
 
 # -----------------------------
 # 分類專屬 Loss（CE / Focal）

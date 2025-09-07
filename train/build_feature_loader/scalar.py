@@ -1,4 +1,4 @@
-# 放 scalar.py
+# scalar.py
 
 """
 提供特徵縮放工具：
@@ -59,47 +59,6 @@ class ColumnSubsetScaler:
         X_np = X_np.astype(np.float32, copy=False)
         X_np[:, self.idxs] = self.base.transform(X_np[:, self.idxs]).astype(np.float32, copy=False)
         return X_np
-
-# --- 時間安全縮放器（沿時間逐欄；先 shift(1) 保證不看未來）---
-# class TimeSafeScaler:
-#     def __init__(self, mode: str = "rolling", window: int = 96):
-#         mode = str(mode).lower()
-#         assert mode in {"rolling", "ewm", "robust_rolling"}
-#         self.mode = mode
-#         self.window = int(window)
-#         self.is_timesafe = True
-
-#     def _rolling_z(self, X: pd.DataFrame) -> pd.DataFrame:
-#         w = self.window
-#         mu = X.rolling(w, min_periods=max(5, w//5)).mean().shift(1)
-#         sd = X.rolling(w, min_periods=max(5, w//5)).std(ddof=0).shift(1)
-#         return (X - mu) / (sd.replace(0.0, np.nan) + 1e-8)
-
-#     def _ewm_z(self, X: pd.DataFrame) -> pd.DataFrame:
-#         span = self.window
-#         mu  = X.ewm(span=span, adjust=False).mean().shift(1)
-#         var = X.ewm(span=span, adjust=False).var(bias=False).shift(1)
-#         sd  = (var.clip(lower=0.0))**0.5
-#         return (X - mu) / (sd + 1e-8)
-
-#     def _robust_rolling(self, X: pd.DataFrame) -> pd.DataFrame:
-#         w = self.window
-#         med = X.rolling(w, min_periods=max(5, w//5)).median().shift(1)
-#         mad = (X - med).abs().rolling(w, min_periods=max(5, w//5)).median().shift(1)
-#         return (X - med) / (1.4826 * mad + 1e-8)
-
-#     def transform_full(self, df: pd.DataFrame, cols_to_scale: list[str]) -> pd.DataFrame:
-#         out = df.copy()
-#         if cols_to_scale:
-#             X = df.loc[:, cols_to_scale].astype(np.float32)
-#             if self.mode == "rolling":
-#                 Z = self._rolling_z(X)
-#             elif self.mode == "ewm":
-#                 Z = self._ewm_z(X)
-#             else:
-#                 Z = self._robust_rolling(X)
-#             out.loc[:, cols_to_scale] = Z.astype(np.float32)
-#         return out
 
 class TimeSafeScaler:
     """

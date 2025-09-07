@@ -30,7 +30,7 @@ def _ensure_2d_prob(y_prob: np.ndarray) -> np.ndarray:
 
 
 # =========================
-# 封裝：分類圖表與摘要
+# 分類圖表與摘要
 # =========================
 class ClassificationReporter:
     """
@@ -153,7 +153,7 @@ class ClassificationReporter:
 
 
 # =========================
-# 封裝：回歸圖表與門檻掃描
+# 回歸圖表與門檻掃描
 # =========================
 class RegressionReporter:
     """
@@ -384,7 +384,7 @@ def save_fold_metrics(metrics: list[dict], save_dir: Path, prefix: str = "",
 # 結果輸出（共用）
 # =========================
 
-# --- B) CV 摘要輸出（置頂 test 平均；逐 fold 列表）---
+# 摘要輸出（置頂 test 平均；逐 fold 列表）---
 def _numeric_dict(d):
     out = {}
     for k, v in (d or {}).items():
