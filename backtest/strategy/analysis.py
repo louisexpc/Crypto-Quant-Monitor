@@ -94,11 +94,11 @@ class StrategyAnalyzer:
             self._identify_new_levels(prev_candle, current_candle)
             self._update_existing_levels(current_candle)
 
-
+    
     def _identify_new_levels(self, prev_candle: pd.Series, current_candle: pd.Series):
         """根據兩根相鄰的 K 線，判斷是否形成新的 SNR1 或 SNR2 水平。"""
         # 0905 Update: 僅在成交量高於其 EMA 時，才允許產生新的水平
-        if prev_candle['volume'] < prev_candle['volume_ema']:
+        if prev_candle['volume'] < prev_candle['volume_ema'] or current_candle['volume'] < current_candle['volume_ema']:
             return
         prev_dir = 1 if prev_candle['close'] > prev_candle['open'] else -1
         curr_dir = 1 if current_candle['close'] > current_candle['open'] else -1
@@ -106,7 +106,7 @@ class StrategyAnalyzer:
         prev_body = abs(prev_candle['close'] - prev_candle['open'])
         curr_body = abs(current_candle['close'] - current_candle['open'])
 
-        if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.50:
+        if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.25:
             price = (prev_candle['close'] + current_candle['open']) / 2
             level_type = 'resistance' if prev_dir == 1 else 'support'
             self.levels.append(Level(price, level_type, 'SNR1', current_candle.name))
@@ -115,6 +115,7 @@ class StrategyAnalyzer:
             price = (prev_candle['close'] + current_candle['open']) / 2
             level_type = 'support' if curr_dir == 1 else 'resistance'
             self.levels.append(Level(price, level_type, 'SNR2', current_candle.name))
+
 
     def _update_existing_levels(self, candle: pd.Series):
         """根據當前 K 線，更新所有已存在水平的狀態（測試、突破、轉換、失效）。"""
