@@ -14,6 +14,16 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import label_binarize
 
+# 供 XGB 分支使用：與 DL 版混合目標對齊
+def compute_mixed_objective_np(y_true, y_pred, *, alpha: float, beta: float, ema_decay: float):
+    """
+    Wrap metrics_reg.mixed_objective for numpy arrays.
+    Returns (objective_value, components_dict).
+    """
+    from .metrics_reg import mixed_objective
+    val, comps = mixed_objective(y_true, y_pred, alpha=alpha, beta=beta, ema_decay=ema_decay)
+    return val, comps
+
 # =========================
 # 公用小工具
 # =========================

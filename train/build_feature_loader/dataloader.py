@@ -4,7 +4,6 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import RobustScaler, StandardScaler, MinMaxScaler
 from typing import Literal, Optional
 
 
@@ -89,7 +88,8 @@ class SeqDataset(Dataset):
 
     def __getitem__(self, i):
         return self.X[i], self.y[i]
-    
+
+
 # ========== Fold Generator ==========
 class FoldGenerator:
     def __init__(self, dt_index: pd.DatetimeIndex, mode: str = "rolling", start_month: str | None = None, **kwargs):
@@ -240,10 +240,6 @@ class FoldGenerator:
             })
         return folds
 
-
-
-
-
 # -------------------------
 # DataLoader 組裝
 # -------------------------
@@ -308,21 +304,26 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool =
      # 6) 建 Dataset / Loader（和你原本一致）
     L = int(cfg["sequence"]["seq_len"])
     label_dtype = "float" if is_reg else "long"
-    device = cfg["device"]
+    runtime_device = cfg["device"]
     bs = int(cfg["train"]["batch_size"])
 
-    # 永遠使用 Preload 到 GPU
-    stride = cfg["sequence"]["stride"]
-    anchor = int(cfg["sequence"]["stride_anchor"])%stride
-    
-    ds_tr = SeqDataset(X_tr, y_tr, L, scaler=sklearn_scaler, device=device, label_dtype=label_dtype,stride=stride, anchor=anchor)
-    ds_va = SeqDataset(X_va, y_va, L, scaler=sklearn_scaler, device=device, label_dtype=label_dtype,stride=stride, anchor=anchor)
-    ds_te = SeqDataset(X_te, y_te, L, scaler=sklearn_scaler, device=device, label_dtype=label_dtype,stride=stride, anchor=anchor)
+    # 是否預先把整個 Dataset 放上 GPU（容易 OOM）；預設 False → 留在 CPU，再在 trainer 逐 batch 搬到 GPU
+    preload_to_gpu = bool(cfg.get("sequence", {}).get("preload_to_gpu", False))
+    ds_device = runtime_device if (preload_to_gpu and runtime_device == "cuda") else "cpu"
 
-    # DataLoader:（preload → num_workers=0, pin_memory=False）
-    train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
-    val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
-    test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False, drop_last=False, num_workers=0, pin_memory=False)
+    stride = cfg["sequence"]["stride"]
+    anchor = int(cfg["sequence"]["stride_anchor"]) % stride
+
+    ds_tr = SeqDataset(X_tr, y_tr, L, scaler=sklearn_scaler, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
+    ds_va = SeqDataset(X_va, y_va, L, scaler=sklearn_scaler, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
+    ds_te = SeqDataset(X_te, y_te, L, scaler=sklearn_scaler, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
+
+    # DataLoader：若 Dataset 在 CPU 且 runtime 在 CUDA，開啟 pin_memory + num_workers 加速搬運
+    pin = (ds_device == "cpu" and runtime_device == "cuda")
+    num_workers = 10 if pin else 0
+    train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=False, drop_last=False, num_workers=num_workers, pin_memory=pin)
+    val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False, drop_last=False, num_workers=num_workers, pin_memory=pin)
+    test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False, drop_last=False, num_workers=num_workers, pin_memory=pin)
 
     info = {"feat_cols": feat_cols, "target_col": target_col}
 
@@ -346,3 +347,4 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool =
         }
 
     return train_loader, val_loader, test_loader, info
+

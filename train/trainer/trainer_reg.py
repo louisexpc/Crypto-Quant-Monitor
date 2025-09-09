@@ -59,7 +59,7 @@ def train_one_fold(
     optimizer = build_optimizer(model, cfg)
     steps_per_epoch = max(1, len(train_loader))
     scheduler = build_warmup_scheduler(optimizer, steps_per_epoch, cfg)
-    dtype = amp_dtype()
+    dtype = amp_dtype(cfg=cfg)
     scaler = build_grad_scaler(dtype)
 
     # 回歸損失（由 cfg 決定：mse/huber 或 混合 α·EMA-MSE + β·(1-Pearson) 等）

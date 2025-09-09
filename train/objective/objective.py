@@ -9,12 +9,10 @@ import optuna
 import yaml
 from copy import deepcopy
 import os
-import re  # === NEW ===
 
 from .objective_utils import (get_task_type, suggest_rolling_and_cv, suggest_cat, suggest_float,
                              suggest_int, get_enabled_feature_names, suggest_model_hparams, make_folds,
                              _format_score_tag, _safe_rename_trial_dir)
-import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # --- Trainer / Data / Model ---
@@ -36,7 +34,9 @@ def compute_trial_score(result: dict, cfg: dict) -> float:
     primary = str(cfg["objective"].get("primary_metric", "threshold_macro_f05")).lower()
     direction = str(cfg["objective"].get("direction", "maximize")).lower()
     task_type = get_task_type(cfg)
-
+    if result is None:
+        return -1e9  # 或 0.0，依你的 direction
+    
     if task_type == "classification":
         if primary == "threshold_macro_f05":
             # 需要兩類；trainer 已在二分類時寫入 threshold_metrics
@@ -87,12 +87,9 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
     task_type = get_task_type(cfg)
     target_col = "label" if task_type == "classification" else "target"
 
-    # === NEW: 讓 gpu1（4060）自動把 batch_size 砍半 ===
+    # 以 worker_tag 區分輸出資料夾與追蹤資訊（不調整 batch_size）
     worker_tag = os.environ.get("WORKER_TAG", "").strip()   # 來自 main_train.run_multi()
     orig_bs = int(cfg["train"]["batch_size"])
-    m = re.search(r"gpu(\d+)", worker_tag)  # gpu0 / gpu1 / ...
-    if m and int(m.group(1)) == 1:
-        cfg["train"]["batch_size"] = max(1, orig_bs // 2)   # 砍半（至少為 1）
     # 可選：印一下方便追蹤
     if worker_tag:
         print(f"[objective] worker={worker_tag} | batch_size={cfg['train']['batch_size']} (orig={orig_bs})")
@@ -143,6 +140,16 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
     # ==== 模型超參 ====
     cfg = suggest_model_hparams(trial, cfg)
+    
+    # ==== 分數差分（FFD）超參 ====
+    if str(cfg["label"]["ret_type"]).lower() == "fractionally":
+        cfg["label"]["fracdiff"]["d"] = suggest_float(
+            trial,
+            "fracdiff.d",
+            cfg["label"]["fracdiff"]["d"]
+        )
+        # 方便日後追蹤：把本次 d 寫進 trial 屬性
+        trial.set_user_attr("fracdiff_d", float(cfg["label"]["fracdiff"]["d"]))
 
     # ==== 特徵選擇 ====
     feat_pool = get_enabled_feature_names(cfg, df.columns)
