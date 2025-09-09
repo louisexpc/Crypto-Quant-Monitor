@@ -149,7 +149,6 @@ def assign_tbm_labels_to_df(
     out[col_name] = out[col_name].astype("float")  # 0/1 + NaN
     return out
 
-
 def create_labels_adaptive(df: pd.DataFrame,
                            mode: str = "vol",          # "vol" | "event_TBM"
                            flat_band_bps: float = 5.0, # for mode="bps"
@@ -277,79 +276,6 @@ def create_labels_adaptive(df: pd.DataFrame,
     df["y_cls"] = y_cls
     return df
 
-# def create_labels_adaptive(
-#     df: pd.DataFrame,
-#     mode: str = "vol",               # "vol" | "event_tbm"
-#     k_vol: float = 0.5,
-#     vol_window: int = 96,
-#     roundtrip_cost_bps: float = 10.0,
-#     ret_shift: Optional[int] = None,
-#     ret_type: Optional[str] = "logret",
-#     ffd_d: float = 0.3,
-#     ffd_thres: float = 1e-5,
-#     tbm_csv_path: Optional[str] = None,
-#     keep_sides: str = "both",
-#     drop_nan_labels: bool = True,
-#     align_method: str = "exact",
-# ):
-#     df = df.copy()
-
-#     # --- 事件貼標（二分類 0/1）---
-#     if mode == "event_tbm":
-#         if not tbm_csv_path:
-#             raise ValueError("mode='event_tbm' 需要 tbm_csv_path")
-#         return assign_tbm_labels_to_df(
-#             df_15m=df,
-#             tbm_csv_path=tbm_csv_path,
-#             keep_sides=keep_sides,
-#             drop_nan_labels=drop_nan_labels,
-#             align_method=align_method,
-#             col_name="y_cls"
-#         )
-
-#     # --- vol 三分類（Up/Flat/Down）---
-#     if mode != "vol":
-#         raise ValueError(f"Unknown mode: {mode}")
-
-#     if ret_shift is None or ret_shift <= 0:
-#         raise ValueError("vol 模式需要正整數 ret_shift")
-
-#     if "close" not in df.columns:
-#         raise ValueError("vol 模式需要 df['close'] 欄位")
-
-#     close = df["close"].astype(float)
-#     fwd_k = int(ret_shift)
-
-#     # y_reg（僅 vol 模式會算；TBM 模式已 return）
-#     logret_fwd = np.log(close.shift(-fwd_k)) - np.log(close)
-#     if ret_type == "logret":
-#         df["y_reg"] = logret_fwd
-#     elif ret_type == "fractionally":
-#         logp = np.log(close)
-#         logp_fd = fracDiff_FFD(logp, d=ffd_d, thres=ffd_thres)
-#         df["y_reg"] = (logp_fd.shift(-fwd_k) - logp_fd)
-#     else:
-#         raise ValueError(f"Unknown ret_type: {ret_type}")
-
-#     # 門檻 = max( k·σ·√k , 成本下限 )
-#     lr_past = np.log(close).diff()
-#     sigma = lr_past.rolling(vol_window, min_periods=max(2, vol_window//2)).std()
-#     vol_band = (k_vol * sigma * np.sqrt(fwd_k)).reindex(df.index)
-#     cost_band = roundtrip_cost_bps / 10000.0
-#     thr_t = pd.Series(np.maximum(vol_band, cost_band), index=df.index).shift(1)
-
-#     # 三分類
-#     y_cls = np.full(len(df), -1, dtype=int)
-#     cond_up   = logret_fwd >  thr_t
-#     cond_down = logret_fwd < -thr_t
-#     cond_flat = (~cond_up) & (~cond_down)
-#     y_cls[pd.Series(cond_up).fillna(False).values]   = 2
-#     y_cls[pd.Series(cond_down).fillna(False).values] = 0
-#     y_cls[pd.Series(cond_flat).fillna(False).values] = 1
-
-#     df["y_cls"] = y_cls
-#     return df
-
 
 def build_features_and_label(
     df_base: pd.DataFrame,
@@ -431,37 +357,6 @@ def build_features_and_label(
         align_method = Lcfg["align_method"]
 
         )
-
-    # # === 4) 產生 y ===
-    # Lcfg = cfg["label"]
-    # mode = str(Lcfg["mode"]).lower()
-
-    # # 安全檢查
-    # if not {"open","high","low","close","volume"}.issubset(dfb.columns):
-    #     raise KeyError("df_base 缺少 OHLCV 欄位")
-    
-    # if mode == "event_tbm":
-    #     df_lbl = create_labels_adaptive(
-    #         dfb,
-    #         mode=mode,
-    #         # vol 相關參數此分支不使用
-    #         tbm_csv_path = Lcfg["tbm_csv_path"],
-    #         keep_sides   = Lcfg["keep_sides"],
-    #         drop_nan_labels = True,
-    #         align_method = Lcfg["align_method"],   # ← 修正
-    #     )
-    # else:  # vol
-    #     df_lbl = create_labels_adaptive(
-    #         dfb,
-    #         mode=mode,
-    #         k_vol=float(Lcfg["k_vol"]),
-    #         vol_window=int(Lcfg["vol_window"]),
-    #         roundtrip_cost_bps=float(Lcfg.get("roundtrip_cost_bps", 10.0)),  # 若你要全用 cfg["..."]，就確保 config 內一定有這 key
-    #         ret_shift=int(Lcfg["ret_shift"]),
-    #         ret_type=str(Lcfg["ret_type"]).lower(),
-    #         ffd_d=float(Lcfg["fracdiff"]["d"]) if str(Lcfg["ret_type"]).lower()=="fractionally" else 0.3,
-    #         ffd_thres=float(Lcfg["fracdiff"]["thres"]) if str(Lcfg["ret_type"]).lower()=="fractionally" else 1e-5,
-    #     )
 
     # === 5) 依任務挑 y（避免重算）===
     task_type = str(cfg["task"]["type"]).lower()

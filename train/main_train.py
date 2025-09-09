@@ -157,39 +157,6 @@ def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.S
 # ======================================================================
 # Section D. 執行訓練與搜尋
 # ======================================================================
-# def run(cfg_path: str):
-#     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
-#     cfg = load_cfg(cfg_path)
-#     set_seed(int(cfg.get("seed", 42)))
-#     setup_cuda_acceleration()
-
-#     # 2) 建輸出資料夾
-#     run_dir = Path("runs") / cfg.get("project_name", "exp")
-#     run_dir.mkdir(parents=True, exist_ok=True)
-
-#     # 3) 準備資料
-#     df, pt_bundle = prepare_dataframe(cfg)
-
-#     # 4) 建立 Study
-#     study = build_study(cfg, run_dir)
-
-#     # 5) 搜尋（以 folds 為 step 報告分數；objective_runtime 會依 cfg.objective 自動處理 direction）
-#     n_trials = int(cfg["search"]["n_trials"])
-#     time_hour = int(cfg["search"]["timeout"])  # 小時
-#     study.optimize(
-#         lambda t: objective(t, cfg, df, run_dir, pt_bundle),
-#         n_trials=n_trials,
-#         timeout=time_hour * 60 * 60,
-#         show_progress_bar=True
-#     )
-
-#     # 6) 結果輸出
-#     print("Best hyperparameters:", study.best_trial.params)
-#     print(f"Best `{cfg['objective']['primary_metric']}` ({cfg['objective']['direction']}): {study.best_value:.6g}")
-
-#     # 匯出最佳 trial 的 YAML（包含實際 frozen config 與 selected_features）
-#     dump_best_yaml(study, cfg, run_dir)
-
 def run_single(cfg_path: str, *, worker_tag: str | None = None):
     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
     cfg = load_cfg(cfg_path)

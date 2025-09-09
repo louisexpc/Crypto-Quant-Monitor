@@ -15,7 +15,7 @@ from .objective_utils import (get_task_type, suggest_rolling_and_cv, suggest_cat
                              _format_score_tag, _safe_rename_trial_dir)
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-# --- Trainer / Daobjectiveta / Model ---
+# --- Trainer / Data / Model ---
 from trainer.trainer_base import get_trainer
 from build_feature_loader.dataloader import make_loaders_for_fold
 from models.model_factory import build_model
