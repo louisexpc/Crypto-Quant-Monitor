@@ -64,7 +64,12 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
         prefer_time_col=index_col,             # "timestamp" 或 "datetime"
     )
     # 2) 建 特徵計算器（內建 parquet + manifest 快取）
-    fc = FeatureComputer(lib, cache_dir=cfg["features"]["cache_dir"])
+    #    多 GPU 併行時，每個 worker 用不同的 cache 子資料夾，避免寫入競態
+    cache_dir = cfg["features"]["cache_dir"]
+    worker_tag = os.environ.get("WORKER_TAG", "").strip()
+    if worker_tag:
+        cache_dir = str((Path(cache_dir) / worker_tag).as_posix())
+    fc = FeatureComputer(lib, cache_dir=cache_dir)
 
     # 3) 計算特徵（支援 plan.groups 與 plan.features）
     plan = cfg["features"]["plan"]
@@ -135,8 +140,6 @@ def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.S
         group=True,
         constant_liar=bool(parallel),  # 平行才開
     )
-
-    # db_uri = f"sqlite:///{(run_dir / 'study.db').as_posix()}"
 
     study = optuna.create_study(
         study_name=study_name,

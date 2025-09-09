@@ -1,0 +1,22 @@
+exchange:
+  id: binanceusdm      
+  default_type: null   
+
+range:
+  start: "2023-01-01"
+  end: null
+
+io:
+  outdir: "data/ohlcv_2023"
+  fmt: "csv"
+  append: true
+
+fetch:
+  limit: 1000
+  sleep: 0.8
+  max_retries: 5
+  use_exchange_time: true        # ★ 新增：用交易所時間判收盤（可選）
+
+monitoring:
+  - symbol: "BTC/USDT:USDT"
+    timeframes: ["1h", "15m" ]
