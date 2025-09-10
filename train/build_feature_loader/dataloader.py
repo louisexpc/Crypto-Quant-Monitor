@@ -4,10 +4,10 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-from typing import Literal, Optional
+from typing import Literal, Optional, List, Dict
 
 
-def split_fold_to_indices(df: pd.DataFrame, fold: dict, cfg: dict):
+def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
     train_val_mask = fold["train_val_mask"]
     test_mask = fold["test_mask"]
 
@@ -384,9 +384,9 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool =
 
 
 def make_event_loaders_for_fold(df_events: pd.DataFrame,
-                                feat_cols: list[str],
-                                fold: dict,
-                                cfg: dict,
+                                feat_cols: List[str],
+                                fold: Dict,
+                                cfg: Dict,
                                 also_XGB: bool = False,
                                 pre_feat_df: pd.DataFrame | None = None):
     """

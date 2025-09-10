@@ -107,6 +107,8 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
     cfg = suggest_rolling_and_cv(trial, cfg)
     cfg.setdefault("data", {})
+    if "cv" in cfg and "train_val_split" in cfg["cv"]:
+        cfg["data"]["train_val_split"] = float(cfg["cv"]["train_val_split"])
 
     device = "cuda" if (cfg.get("device", "cuda") == "cuda" and torch.cuda.is_available()) else "cpu"
     set_seed(int(cfg.get("seed", 42)) + trial.number)

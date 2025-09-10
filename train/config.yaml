@@ -136,9 +136,9 @@ model:
   attn_dropout: [0.0, 0.1]
   pooling: attn     # ["cls" / "attn" / "mean"]
   use_causal: true
-  num_classes: 2             # ★ 回歸=1，分類再改成3
+  num_classes: 2             # ★ 回歸=1，分類再改成2/3
   # class_names: ["down", "flat", "up"]  
-  class_names: [sl, tp] 
+  class_names: ["sl", "tp"] 
 
   # ==== Two-Stream 新增 ====
   minute_steps: 15              # 每根 15m bar 含 15 個 1m 切片

@@ -272,7 +272,7 @@ def load_features_csv(
 # Builder via FeatureComputer
 # ============================
 def build_event_dataset_via_feature_computer(
-    cfg: dict,
+    cfg: Dict,
     tbm_csv_path: str,
     *,
     seq_len: int = 144,
