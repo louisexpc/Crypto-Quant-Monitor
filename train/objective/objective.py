@@ -107,7 +107,6 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
     cfg = suggest_rolling_and_cv(trial, cfg)
     cfg.setdefault("data", {})
-    cfg["data"]["train_val_split"] = float(cfg["cv"]["train_val_split"])
 
     device = "cuda" if (cfg.get("device", "cuda") == "cuda" and torch.cuda.is_available()) else "cpu"
     set_seed(int(cfg.get("seed", 42)) + trial.number)
@@ -120,11 +119,19 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
     # ==== 分類專用超參 ====
     if task_type == "classification":
-        thr = cfg["train"]["threshold"]
-        if isinstance(thr, list) and len(thr) == 2:
-            cfg["train"]["threshold"] = trial.suggest_float("threshold", float(thr[0]), float(thr[1]))
+        thr_mode = str(cfg.get("train", {}).get("threshold_mode", "auto_auc")).lower()
+        thr = cfg.get("train", {}).get("threshold", None)
+        if thr_mode == "fixed":
+            # 只有 fixed 模式才對 threshold 做搜尋/強制數值
+            if isinstance(thr, list) and len(thr) == 2:
+                cfg["train"]["threshold"] = trial.suggest_float("threshold", float(thr[0]), float(thr[1]))
+            elif thr is None:
+                cfg["train"]["threshold"] = 0.5  # 預設固定門檻
+            else:
+                cfg["train"]["threshold"] = float(thr)
         else:
-            cfg["train"]["threshold"] = float(thr)
+            # 動態掃描（auto_auc/auto_fbeta）不需要固定 threshold
+            cfg["train"]["threshold"] = None
 
     # ==== 回歸專用超參 ====
     if task_type == "regression":
@@ -152,8 +159,38 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
         trial.set_user_attr("fracdiff_d", float(cfg["label"]["fracdiff"]["d"]))
 
     # ==== 特徵選擇 ====
-    feat_pool = get_enabled_feature_names(cfg, df.columns)
+    # 事件模式：改用預先蒐集的 feat_cols（避免誤用 df.columns）
+    label_mode = str(cfg.get("label", {}).get("mode", "")).lower()
+    if label_mode == "event_tbm" and pt_bundle and "feat_cols" in pt_bundle:
+        feat_pool = list(pt_bundle["feat_cols"])  # 僅欄名，不做重算
+    else:
+        feat_pool = get_enabled_feature_names(cfg, df.columns)
     n_features = len(feat_pool)
+
+    # ==== 事件模式：一次計算全量 15m feature grid，供各 fold 重用 ====
+    pre_feat_df = None
+    if label_mode == "event_tbm":
+        from build_feature_loader.indicators import IndicatorLibrary, FeatureComputer
+        import pandas as pd
+        raw_path = cfg["data"]["path"]
+        index_col = cfg["data"]["index_col"]
+        freq = cfg["data"]["freq"]
+
+        if str(raw_path).endswith(".csv"):
+            df_raw = pd.read_csv(raw_path)
+        elif str(raw_path).endswith(".parquet"):
+            df_raw = pd.read_parquet(raw_path)
+        else:
+            raise ValueError("data.path must be .csv or .parquet")
+
+        lib = IndicatorLibrary(df_raw, freq_check=freq, prefer_time_col=index_col)
+        cache_dir = cfg["features"]["cache_dir"]
+        worker_tag = os.environ.get("WORKER_TAG", "").strip()
+        if worker_tag:
+            cache_dir = os.path.join(cache_dir, worker_tag)
+        fc = FeatureComputer(lib, cache_dir=cache_dir)
+        plan = cfg["features"]["plan"]
+        pre_feat_df = fc.compute(plan, cfg, load_if_exists=True)
 
     # ==== folds ====
     folds = make_folds(df, cfg)
@@ -168,7 +205,7 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
         fold_dir.mkdir(parents=True, exist_ok=True)     
 
         tr_loader, va_loader, te_loader, info = make_loaders_for_fold(
-            df, feat_pool, target_col, fold, cfg, also_XGB=cfg["also_XGB"]
+            df, feat_pool, target_col, fold, cfg, also_XGB=cfg["also_XGB"], pre_feat_df=pre_feat_df
         )
 
         cfg_fold = deepcopy(cfg)
