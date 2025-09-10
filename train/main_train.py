@@ -1,4 +1,4 @@
-# main_train.py
+# # main_train.py
 """
 Main entry for Optuna tuning with runtime-built features.
 
@@ -71,16 +71,27 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
         cache_dir = str((Path(cache_dir) / worker_tag).as_posix())
     fc = FeatureComputer(lib, cache_dir=cache_dir)
 
-    # 3) 計算特徵（支援 plan.groups 與 plan.features）
+    # 3) 計算或查詢特徵
     plan = cfg["features"]["plan"]
-    feat_df = fc.compute(plan, cfg)    # -> 已 shift(1) 防洩漏、已快取
 
-    #   回歸→連續 target、分類→二值 label
-    X_df, y_s = build_features_and_label(
-        df_base=lib.df,
-        feat_parquet_path=None,
-        feat_df=feat_df,
-        cfg=cfg)
+    # 事件模式：避免預先重算全量特徵，改走 manifest 欄名，並以原始 OHLCV 的 index 作為時間基準
+    label_mode = str(cfg.get("label", {}).get("mode", "")).lower()
+    if label_mode == "event_tbm":
+        feat_cols = fc.columns_for_plan(plan, cfg)  # 若 manifest 缺少，會觸發一次 compute 以生成
+        # 本階段只需時間索引供 fold 切分；不需要 y 或特徵值
+        df = lib.df.copy()
+        target_col = "label"
+        pt_bundle = {"target_col": target_col, "task_type": task_type, "feat_cols": feat_cols}
+        return df, pt_bundle
+    else:
+        feat_df = fc.compute(plan, cfg)    # -> 已 shift(1) 防洩漏、已快取
+
+        #   回歸→連續 target、分類→二值 label
+        X_df, y_s = build_features_and_label(
+            df_base=lib.df,
+            feat_parquet_path=None,
+            feat_df=feat_df,
+            cfg=cfg)
         
 
     # 小檢查與資訊
@@ -110,23 +121,6 @@ def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
 # ======================================================================
 def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.Study:
     study_name = cfg["project_name"]
-    task = str(cfg["task"]["type"]).lower()
-    primary = cfg["objective"]["primary_metric"]
-    direction = cfg["objective"]["direction"]
-
-    # 模型摘要（讓 DB 名稱更具體）
-    def _sig(lst):
-        if isinstance(lst, list):
-            return "-".join(map(str, lst))
-        return str(lst)
-
-    m = cfg["model"]
-    if m.get("name", "").lower() == "temporaltransformer":
-        study_suffix = f"d{_sig(m.get('d_model', []))}_h{_sig(m.get('n_heads', []))}_L{_sig(m.get('n_layers', []))}"
-    else:
-        study_suffix = f"hs{_sig(m.get('hidden_size', []))}_nl{_sig(m.get('n_layers', []))}"
-
-    study_name = f"{study_name}__{task}_{primary}__{study_suffix}"
 
     # --- SQLite URI with timeout for concurrency ---
     mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
@@ -141,15 +135,19 @@ def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.S
         constant_liar=bool(parallel),  # 平行才開
     )
 
+    # Respect enable_prune flag
+    use_pruner = bool(cfg.get("objective", {}).get("enable_prune", True))
+    pruner = optuna.pruners.MedianPruner(
+        n_warmup_steps=cfg["search"]["pruner_warmup_folds"]
+    ) if use_pruner else None
+
     study = optuna.create_study(
         study_name=study_name,
         storage=db_uri,
         load_if_exists=True,
-        direction=direction,  # "maximize" / "minimize" 與 objective_runtime 保持一致
-        sampler=sampler,  
-        pruner=optuna.pruners.MedianPruner(
-            n_warmup_steps=cfg["search"]["pruner_warmup_folds"]  # 以「fold」作為 step
-        ),
+        direction=cfg["objective"]["direction"],  # "maximize" / "minimize" 與 objective_runtime 保持一致
+        sampler=sampler,
+        pruner=pruner,
     )
     return study
 
@@ -187,7 +185,19 @@ def run_single(cfg_path: str, *, worker_tag: str | None = None):
         show_progress_bar=not bool(worker_tag)  # worker 不顯示進度條，避免互相干擾
     )
 
-    # 6) 結果輸出（只在單進程或 worker_tag 是最小的時候做也可；簡單起見都做）
+    # 6) 結果輸出（容錯：若全部被 PRUNED/FAILED，避免崩潰）
+    trials = study.get_trials(deepcopy=False)
+    from collections import Counter
+    from optuna.trial import TrialState
+    sc = Counter([getattr(t, "state", None) for t in trials])
+    sc_fmt = {str(k).split('.')[-1]: int(v) for k, v in sc.items()}
+    print(f"[Optuna] Trial states: {sc_fmt}")
+
+    has_complete = any(t.state == TrialState.COMPLETE for t in trials)
+    if not has_complete:
+        print("[Optuna] No completed trials (all pruned/failed). Skip best summary/export.")
+        return
+
     print("Best hyperparameters:", study.best_trial.params)
     print(f"Best `{cfg['objective']['primary_metric']}` ({cfg['objective']['direction']}): {study.best_value:.6g}")
     dump_best_yaml(study, cfg, run_dir)

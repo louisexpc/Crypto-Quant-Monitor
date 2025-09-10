@@ -510,23 +510,40 @@ class FeatureComputer:
         return feats
 
     # --- compute（含快取+manifest；不使用 groups）---
-    def compute(self, plan: Dict[str, Any], cfg) -> pd.DataFrame:
-        feat_list = self._prune_features_only(plan)        
+    def compute(self, plan: Dict[str, Any], cfg, *, load_if_exists: bool = True) -> pd.DataFrame:
+        """
+        計算（或從快取載入）特徵欄位。
+
+        - 預設行為：若對應 parquet 快取存在且 `load_if_exists=True`，直接讀取；否則重算並寫入 parquet 與 manifest。
+        - dropna 時機：可由 cfg["features"].get("dropna", True) 控制；True 表示立刻刪除含 NaN 的列。
+        """
+        feat_list = self._prune_features_only(plan)
         if not feat_list:
             raise ValueError("計畫沒有任何 enabled=True 的 features。")
-        
+
         # 保留1-min欄位
         keep_prefixes = DEFAULT_MINUTE_PREFIXES
-        
-        eff_plan = {"features": [{"name": f["name"], "kwargs": f.get("kwargs", {})} for f in feat_list],
-                    "keep_prefixes": list(keep_prefixes), # 保留1-min欄位      
-                    }
-        
+
+        eff_plan = {
+            "features": [{"name": f["name"], "kwargs": f.get("kwargs", {})} for f in feat_list],
+            "keep_prefixes": list(keep_prefixes),
+        }
+
         df_fp = self._fingerprint_df(self.lib.df)
         pl_fp = self._fingerprint_plan(eff_plan)
         cpath = self._cache_path(df_fp, pl_fp)
         mpath = self._manifest_path(df_fp, pl_fp)
 
+        # 若有快取，優先讀取
+        if load_if_exists and cpath.exists():
+            X = pd.read_parquet(cpath)
+            # 仍做數值清理，避免舊快取中殘留 inf
+            X = X.replace([np.inf, -np.inf], np.nan)
+            if (cfg.get("features", {}) or {}).get("dropna", True):
+                X = X.dropna()
+            return X.astype("float32")
+
+        # 計算所有 feature parts
         parts, manifest = [], {}
         for item in feat_list:
             name = str(item["name"]).upper()
@@ -540,44 +557,44 @@ class FeatureComputer:
             manifest[spec] = list(map(str, feat.columns))
             parts.append(feat)
 
-        # --- 2) 保留 minute 前綴欄位（不看 enabled） ---
+        # 保留 minute 前綴欄位（不看 enabled）
         prefixes = tuple(keep_prefixes)
-        min_feat = list(cfg.get("features", {}).get("min_trade_feat", []))  # 白名單 base 名稱
+        min_feat = list(cfg.get("features", {}).get("min_trade_feat", []))
 
         passthrough_cols = []
         for c in self.lib.df.columns:
             s = str(c)
             if not s.startswith(prefixes):
                 continue
-            m = _M_PAT.match(s)           # 只吃 m_-{lag}_{base} 這種命名
+            m = _M_PAT.match(s)
             if not m:
                 continue
             base = m.group(2)
-            # 只保留「過去」的 1-min 特徵（lag >= 1），且 base 在白名單
             if base in min_feat:
                 passthrough_cols.append(s)
 
         if passthrough_cols:
             mdf = self.lib.df.loc[:, passthrough_cols].copy()
-            mdf = mdf.shift(1)  # 同樣 shift(1) 防洩漏
-            # dtype 規一
+            mdf = mdf.shift(1)
             for c in mdf.columns:
                 mdf[c] = pd.to_numeric(mdf[c], errors="coerce").astype("float32")
-            # 寫 manifest（依 prefix 記錄）
             for p in prefixes:
                 keep_cols = [c for c in passthrough_cols if str(c).startswith(p)]
                 if keep_cols:
                     manifest[f"_PASSTHROUGH({p})"] = list(map(str, keep_cols))
             parts.append(mdf)
 
-        # 3. 整併與檢查重複
+        # 整併與檢查重複
         X = pd.concat(parts, axis=1).astype("float32")
-        X = X.replace([np.inf, -np.inf], np.nan).dropna()
+        X = X.replace([np.inf, -np.inf], np.nan)
+        if (cfg.get("features", {}) or {}).get("dropna", True):
+            X = X.dropna()
 
         dups = X.columns[X.columns.duplicated()]
         if len(dups):
             raise ValueError(f"Duplicate feature names: {list(dups)}")
 
+        # 寫入快取與 manifest
         X.to_parquet(cpath, index=True)
         with open(mpath, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -600,13 +617,36 @@ class FeatureComputer:
             return json.load(f)
 
     def columns_for_plan(self, plan: Dict[str, Any], cfg=None) -> List[str]:
+        """
+        回傳此 plan 對應的所有特徵欄位名稱（含 minute 直通欄位）。
+
+        - 先依 features 規格（name+kwargs）收集欄位
+        - 再附加 manifest 中的 _PASSTHROUGH(...) 條目（例如 m_ 前綴的 1-min 打平欄位）
+        可透過 cfg["features"].get("include_passthrough", True) 控制是否包含直通欄位。
+        """
         feat_list = self._prune_features_only(plan)
         mani = self._load_manifest(plan, cfg)
         cols = []
         for item in feat_list:
             spec = self._spec_key(str(item["name"]).upper(), item.get("kwargs", {}) or {})
             cols.extend(mani.get(spec, []))
-        return cols
+
+        include_passthrough = True
+        if cfg is not None:
+            include_passthrough = bool((cfg.get("features", {}) or {}).get("include_passthrough", True))
+        if include_passthrough:
+            for k, v in mani.items():
+                if isinstance(k, str) and k.startswith("_PASSTHROUGH("):
+                    cols.extend(list(v))
+
+        # 去重並保持順序
+        seen = set()
+        out = []
+        for c in cols:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out
 
     def columns_for_feature(self, name: str, kwargs: dict | None = None,
                             plan: Dict[str, Any] | None = None, cfg=None) -> List[str]:
@@ -615,5 +655,3 @@ class FeatureComputer:
             return self.columns_for_plan(tmp,cfg)
         mani = self._load_manifest(plan,cfg)
         return mani.get(self._spec_key(str(name).upper(), kwargs or {}), [])
-
-

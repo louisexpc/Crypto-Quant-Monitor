@@ -273,63 +273,7 @@ def train_one_fold(
         }
     }
     result["val_metrics_reg"] = val_metrics_reg  # ★★ 新增：VAL 摘要
-
-    # ====== Reg -> Cls：用「val 找到的最佳門檻」轉為 test 的分類並保存 ======
-    # reg2cls = cfg["regression_to_class"]
-    # if reg2cls["enabled"]:
-    #     true_thr   = float(reg2cls.get("true_threshold", 0.0))
-    #     beta       = float(reg2cls.get("fbeta", 0.5))
-    #     grid_points = int(reg2cls.get("grid_points", 101))
-
-    #     # 1) 用「最佳 epoch 的 val 預測」來挑門檻（避免 test 洩漏）
-    #     if best_va_arrays is not None and best_va_arrays[0] is not None:
-    #         y_va_best, y_pred_va_best = best_va_arrays
-    #         best_t_val, best_f_val = find_best_threshold_for_regression(
-    #             y_true_reg=y_va_best, y_pred_reg=y_pred_va_best,
-    #             fbeta=beta, grid_points=grid_points, true_threshold=true_thr
-    #         )
-    #     else:
-    #         # 理論上不會發生；保底（用 test 掃，僅供報表，不建議用於正式評估）
-    #         sweep_info = plot_regression_threshold_sweep(
-    #             y_true_reg=y_te, y_pred_reg=y_pred_te,
-    #             true_threshold=true_thr, beta=beta,
-    #             grid_points=grid_points, save_dir=export_dir, prefix=f"fold_{fold_id}_"
-    #         )
-    #         best_t_val = float(sweep_info["best_threshold"])
-    #         best_f_val = float(sweep_info["best_fbeta"])
-
-
-    #     # 2) 在 test 上用「val 的最佳門檻」做二值化並計分
-    #     y_true_te_bin = binarize_regression(y_te, threshold=true_thr)          # 以真值閾值把 y_true 轉成 0/1
-    #     y_hat_te_bin  = (y_pred_te >= best_t_val).astype(int)                  # 用「val 的最佳門檻」切 y_pred
-
-    #     m_te_cls = compute_cls_metrics(y_true_te_bin, y_hat_te_bin)                # acc / macro-F1 / F0.5 / MCC...
-
-
-    #     # （可選）為了診斷，也可以在 test 上「自己找一個最佳門檻」但**僅作報表**，不要拿來主張泛化表現
-    #     best_t_te = None
-    #     if bool(reg2cls.get("also_sweep_on_test_for_report", False)):
-    #         best_t_te, best_f_te = find_best_threshold_for_regression(
-    #             y_true_reg=y_te, y_pred_reg=y_pred_te,
-    #             fbeta=beta, grid_points=grid_points, true_threshold=true_thr
-    #         )
-
-    #     # 3) 併入 result，並可選保存 test 的原始 y / y_pred（之後你要重算別的 β 或門檻會很方便）
-    #     result_reg2cls = {
-    #         "true_threshold": true_thr,        # 把連續 y 轉 0/1 的真值門檻
-    #         "beta": beta,                      # F_beta 的 beta
-    #         "best_threshold_val": float(best_t_val),
-    #         "val_best_fbeta": float(best_f_val),
-    #         "test_metrics_cls_at_val_threshold": {
-    #             "acc": m_te_cls["acc"],
-    #             "macro_f1": m_te_cls["macro_f1"],
-    #             "macro_precision": m_te_cls["macro_precision"],
-    #             "macro_recall": m_te_cls["macro_recall"],
-    #             "f_05_macro": m_te_cls["f_05_macro"],
-    #             "MCC": m_te_cls["mcc"],
-    #         }
-    #     }
-    
+   
     # ====== Reg -> 3-class Cls（對稱雙閾值 ±t）======
     reg2cls = cfg.get("regression_to_class", {})
     if reg2cls.get("enabled", False):
@@ -415,42 +359,6 @@ def train_one_fold(
                 "y_te": y_te.tolist(),
                 "y_pred_te": y_pred_te.tolist(),
             }
-
-
-
-        # if best_t_te is not None:
-        #     result_reg2cls["diagnostic_test_best_threshold"] = float(best_t_te)
-
-
-
-
-        # # === 以 val 做機率校準（避免 test 洩漏） ===
-        # from sklearn.isotonic import IsotonicRegression
-
-        # # 1) 先把 val 的連續 y / ẑ 轉二分類標籤當作校準目標
-        # y_va_best, y_pred_va_best = best_va_arrays  # 這是你早就存好的 (val_y, val_pred) of best epoch
-        # y_va_bin = (y_va_best >= true_thr).astype(int)
-
-        # # 2) 對回歸分數做 Isotonic calibration 得到 p(pos)
-        # iso = IsotonicRegression(out_of_bounds="clip")
-        # iso.fit(y_pred_va_best, y_va_bin)
-
-        # p_te = iso.transform(y_pred_te)                         # p(pos) on test
-        # p_te = np.clip(p_te, 1e-6, 1.0 - 1e-6)                 # 數值安全
-        # y_prob_te = np.stack([1.0 - p_te, p_te], axis=1)       # (N,2) → [p(neg), p(pos)]
-
-        # # 3) 畫圖到 export_dir/cls_results
-        # cls_dir = os.path.join(export_dir, "cls_results")
-        # plot_test_eval(
-        #     y_true=y_true_te_bin,               # 0/1
-        #     y_pred=y_hat_te_bin,                # 0/1（用 val 門檻切出來）
-        #     y_prob=y_prob_te,                   # (N,2)
-        #     save_dir=cls_dir,
-        #     prefix=f"fold_{fold_id}_",
-        #     class_names=["neg", "pos"],         # ★ 強制二分類名稱，避免 3 類設定造成維度不符
-        #     threshold=float(best_t_val)         # 讓圖上標記門檻
-        # )
-        # # result["regression_to_class"] = result_reg2cls  # ← 關鍵
 
     # 繪圖 / 匯出
     plot_regression_eval(
