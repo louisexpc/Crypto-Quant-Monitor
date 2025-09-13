@@ -75,60 +75,54 @@ def suggest_cat(trial: optuna.Trial, name: str, vals):
 # ======================================================================
 def suggest_rolling_and_cv(trial: optuna.Trial, cfg: dict) -> dict:
     """讓 Optuna 針對序列/切分做取樣；對於 list 皆採樣，單值則原樣。"""
+    cv_cfg = cfg["cv"]
+    cv_mode = cv_cfg["type"]
 
     # 1) 序列長度
     cfg["sequence"]["seq_len"] = suggest_int(trial, "sequence.seq_len", cfg["sequence"]["seq_len"])
 
-    # 2) stride（若在 YAML 寫成 list 也能調；否則維持原值）
+    # 2) stride
     if "stride" in cfg["sequence"]:
         cfg["sequence"]["stride"] = suggest_int(trial, "sequence.stride", cfg["sequence"]["stride"])
 
-    # 3) stride_anchor（通常固定 0；但給 list 也可調）
-    if "stride_anchor" in cfg["sequence"]:
-        cfg["sequence"]["stride_anchor"] = suggest_int(trial, "sequence.stride_anchor", cfg["sequence"]["stride_anchor"])
 
-    # 4) Rolling 訓練窗（月數）
-    cfg["cv"]["train_months"] = suggest_int(trial, "cv.train_months", cfg["cv"]["train_months"])
+    if cv_mode == "Purged_kfold":
+        cv_cfg["n_splits"] = suggest_int(trial, "cv.n_splits", cv_cfg["n_splits"])
+    
+    elif cv_mode == "Rolling":
+        # 4) Rolling 訓練窗（月數）
+        cv_cfg["train_months"] = suggest_int(trial, "cv.train_months", cfg["cv"]["train_months"])
 
-    # 5) 測試頻率（可為固定 or 多選）
-    test_freq = cfg["cv"]["test_freq"]
-    cfg["cv"]["test_freq"] = suggest_cat(trial, "cv.test_freq", test_freq) if isinstance(test_freq, list) else test_freq
-
-    # 6) embargo（可為單值或 [low,high]）
-    cfg["cv"]["embargo_hours"] = suggest_int(trial, "cv.embargo_hours", cfg["cv"]["embargo_hours"])
-
-    # 7) train/val split（可為單值或 [low,high]）
-    cfg["cv"]["train_val_split"] = suggest_float(trial, "cv.train_val_split", cfg["cv"]["train_val_split"])
-
-    # 8) label.ret_shift（若你想用 list 搜尋）
-    if "label" in cfg and "ret_shift" in cfg["label"]:
-        cfg["label"]["ret_shift"] = suggest_int(trial, "label.ret_shift", cfg["label"]["ret_shift"])
+        # 5) 測試頻率（可為固定 or 多選）
+        test_freq = cfg["cv"]["test_freq"]
+        cv_cfg["test_freq"] = suggest_cat(trial, "cv.test_freq", test_freq) if isinstance(test_freq, list) else test_freq
+    else:
+        raise KeyError("no such mode")
 
     return cfg
 
 
 
 def make_folds(df, cfg):
-    """依 cfg.cv.type 產生 folds。"""
-    cv_type = cfg["cv"]["type"]
+    """依 cfg.cv.type 產生 folds。"""    
+    cfg_cv = cfg["cv"]
+    cv_type = cfg_cv["type"]
     start_month = cfg["cv"]["start_date"] 
     fold_g = FoldGenerator(dt_index=df.index, mode=cv_type, start_month=start_month)
+    
 
-    if cv_type == "OddEven":
-        return fold_g.make_two_month_folds()
-
-    if cv_type == "Anchored":
-        return fold_g.make_anchored_folds(
-            embargo_hours=cfg["cv"].get("embargo_hours", 24),
-            min_train_days=cfg["cv"].get("min_train_days", 30),
-            test_freq=cfg["cv"].get("test_freq", "M")
+    if cv_type == "Purged_kfold":
+        return fold_g.make_purged_kfold(
+            n_splits=cfg_cv["n_splits"],
+            embargo_hours=cfg_cv["embargo_hours"],
+            min_train_days=cfg_cv["min_train_days"]
         )
 
     if cv_type == "Rolling":
         return fold_g.make_rolling_folds(
-            cfg["cv"]["train_months"],
-            cfg["cv"]["embargo_hours"],
-            test_freq=cfg["cv"].get("test_freq", "M")
+            train_window=cfg_cv["train_months"],
+            embargo_hours=cfg_cv["embargo_hours"],
+            test_freq=cfg_cv["test_freq"]
         )
 
     raise ValueError(f"Unknown fold type: {cv_type}")
@@ -197,11 +191,11 @@ def suggest_model_hparams(trial: optuna.Trial, cfg: dict) -> dict:
 # Section D. 特徵池
 # ======================================================================
 
-def get_enabled_feature_names(cfg: dict, df_columns: list[str], target_col: str | None = None) -> list[str]:
-    if target_col is None:
-        target_col = "label" if str(cfg["task"]["type"]).lower() == "classification" else "target"
-    blacklist = {target_col, "label", "target", "y", "y_cls", "y_reg"}
-    return [c for c in df_columns if c not in blacklist]
+# def get_enabled_feature_names(cfg: dict, df_columns: list[str], target_col: str | None = None) -> list[str]:
+#     if target_col is None:
+#         target_col = "label" if str(cfg["task"]["type"]).lower() == "classification" else "target"
+#     blacklist = {target_col, "label", "target", "y", "y_cls", "y_reg"}
+#     return [c for c in df_columns if c not in blacklist]
 
 
 

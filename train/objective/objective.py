@@ -8,19 +8,21 @@ import torch
 import optuna
 import yaml
 from copy import deepcopy
+import pandas as pd
 import os
-
+from .export_tbm_pred import export_tbm_predictions_for_trial
 from .objective_utils import (get_task_type, suggest_rolling_and_cv, suggest_cat, suggest_float,
-                             suggest_int, get_enabled_feature_names, suggest_model_hparams, make_folds,
+                             suggest_int, suggest_model_hparams, make_folds,
                              _format_score_tag, _safe_rename_trial_dir)
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # --- Trainer / Data / Model ---
 from trainer.trainer_base import get_trainer
-from build_feature_loader.dataloader import make_loaders_for_fold
+from build_feature_loader.dataloader import make_time_loaders_for_fold, make_event_loaders_for_fold
 from models.model_factory import build_model
 from train_utils.init_train import set_seed, setup_cuda_acceleration
 from train_utils.compute_export_metrices import save_cv_summary
+
 
 # ======================================================================
 # Trial 得分計算（依 primary_metric / direction）
@@ -46,8 +48,10 @@ def compute_trial_score(result: dict, cfg: dict) -> float:
                 score = result.get("test_metrics", {}).get("test_macro_f1", 0.0)
         elif primary == "macro_f1":
             score = result.get("test_metrics", {}).get("test_macro_f1", 0.0)
-        elif primary in ["acc", "accuracy"]:
-            score = result.get("test_metrics", {}).get("test_acc", 0.0)
+        
+        elif primary == "mcc":
+            score = result.get("test_metrics", {}).get("test_mcc", 0.0)
+
         else:
             raise ValueError(f"[objective] Unsupported primary_metric for classification: {primary}")
 
@@ -161,38 +165,12 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
         trial.set_user_attr("fracdiff_d", float(cfg["label"]["fracdiff"]["d"]))
 
     # ==== 特徵選擇 ====
-    # 事件模式：改用預先蒐集的 feat_cols（避免誤用 df.columns）
+    # 交由 dataloader 在 runtime 決定與計算；此處不預先決定 n_features
     label_mode = str(cfg.get("label", {}).get("mode", "")).lower()
-    if label_mode == "event_tbm" and pt_bundle and "feat_cols" in pt_bundle:
-        feat_pool = list(pt_bundle["feat_cols"])  # 僅欄名，不做重算
-    else:
-        feat_pool = get_enabled_feature_names(cfg, df.columns)
-    n_features = len(feat_pool)
+    n_features = None
 
     # ==== 事件模式：一次計算全量 15m feature grid，供各 fold 重用 ====
-    pre_feat_df = None
-    if label_mode == "event_tbm":
-        from build_feature_loader.indicators import IndicatorLibrary, FeatureComputer
-        import pandas as pd
-        raw_path = cfg["data"]["path"]
-        index_col = cfg["data"]["index_col"]
-        freq = cfg["data"]["freq"]
-
-        if str(raw_path).endswith(".csv"):
-            df_raw = pd.read_csv(raw_path)
-        elif str(raw_path).endswith(".parquet"):
-            df_raw = pd.read_parquet(raw_path)
-        else:
-            raise ValueError("data.path must be .csv or .parquet")
-
-        lib = IndicatorLibrary(df_raw, freq_check=freq, prefer_time_col=index_col)
-        cache_dir = cfg["features"]["cache_dir"]
-        worker_tag = os.environ.get("WORKER_TAG", "").strip()
-        if worker_tag:
-            cache_dir = os.path.join(cache_dir, worker_tag)
-        fc = FeatureComputer(lib, cache_dir=cache_dir)
-        plan = cfg["features"]["plan"]
-        pre_feat_df = fc.compute(plan, cfg, load_if_exists=True)
+    pre_feat_df = None  # dataloader 會在需要時計算
 
     # ==== folds ====
     folds = make_folds(df, cfg)
@@ -202,28 +180,44 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
     # ==== 每 fold 訓練 ====
     fold_scores, fold_results = [], []
+    fold_models_for_infer = []  # (model, fold_dict, result) for post-infer export
     for i, fold in enumerate(folds):
         fold_dir = trial_dir / f"fold_{i}"
         fold_dir.mkdir(parents=True, exist_ok=True)     
 
-        tr_loader, va_loader, te_loader, info = make_loaders_for_fold(
-            df, feat_pool, target_col, fold, cfg, also_XGB=cfg["also_XGB"], pre_feat_df=pre_feat_df
-        )
+        label_mode = str(cfg.get("label", {}).get("mode", "")).lower()
+        if label_mode == "event_tbm":
+            tr_loader, va_loader, te_loader, info = make_event_loaders_for_fold(
+                df, [], fold, cfg, also_XGB=cfg["also_XGB"], pre_feat_df=pre_feat_df
+            )
+        else:
+            tr_loader, va_loader, te_loader, info = make_time_loaders_for_fold(
+                df, None, None, fold, cfg, also_XGB=cfg["also_XGB"], pre_feat_df=pre_feat_df
+            )
 
         cfg_fold = deepcopy(cfg)
         assert "XGB" in info and info["XGB"] is not None, \
-            "[objective] info['XGB'] 不存在；請確認 make_loaders_for_fold(..., also_XGB=True)"
+            "[objective] info['XGB'] 不存在；請確認 make_*_loaders_for_fold(..., also_XGB=True)"
         cfg_fold["_xgb_pack"] = info["XGB"]
 
+        # Update target_col from dataloader info (may be 'y_cls'/'y_reg')
+        target_col = info.get("target_col", target_col)
 
         feature_columns = info.get("feat_cols")
-        model = build_model(cfg, n_features,feature_columns)
+        if n_features is None:
+            n_features = len(feature_columns)
+        model = build_model(cfg, n_features, feature_columns)
 
-        _, result = train_one_fold(
+        model_trained, result = train_one_fold(
             model, tr_loader, va_loader, te_loader,
             cfg_fold, device=device, fold_id=i, export_dir=fold_dir
         )
         fold_results.append(result)
+        # 保留本 fold 最佳權重模型、fold 定義與結果（溫度/門檻等）供事後推論用
+        try:
+            fold_models_for_infer.append((model_trained, fold, result))
+        except Exception:
+            pass
         score = compute_trial_score(result, cfg)
         fold_scores.append(float(score))
         trial.report(float(score), step=i)
@@ -291,8 +285,8 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
 
     # ==== 紀錄與儲存 ====
     mean_score = float(np.mean(fold_scores))
-    trial.set_user_attr("selected_features", feat_pool)
-    trial.set_user_attr("n_features", n_features)
+    trial.set_user_attr("selected_features", feature_columns if 'feature_columns' in locals() else None)
+    trial.set_user_attr("n_features", int(n_features) if n_features is not None else None)
     trial.set_user_attr("fold_scores", fold_scores)
     trial.set_user_attr("task_type", task_type)
     trial.set_user_attr("primary_metric", str(cfg["objective"]["primary_metric"]))
@@ -302,5 +296,57 @@ def objective(trial: optuna.Trial, base_cfg: dict, df, run_dir: Path, pt_bundle=
     trial_cfg_path = trial_dir / f"trial_config_{cfg['objective']['primary_metric']}={mean_score:.6g}.yaml"
     with open(trial_cfg_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, allow_unicode=True)
+
+    # ===== Optional: 對指定期間的全部 TBM 事件做推論，並把預測欄位寫回 TBM CSV =====
+    try:
+        post_infer = (cfg.get("post_infer", {}) or {}).get("tbm_concat", {}) or {}
+        debug_lines = []
+        debug_lines.append(f"task_type={task_type}")
+        debug_lines.append(f"post_infer_enabled={bool(post_infer.get('enabled', False))}")
+        debug_lines.append(f"trial_dir={trial_dir}")
+        debug_lines.append(f"n_fold_models={len(fold_models_for_infer)}")
+        if bool(post_infer.get("enabled", False)) and task_type == "classification":
+            ds, de = str(post_infer.get("date_start", "2023-01-01")), str(post_infer.get("date_end", "2025-08-01"))
+            out_col = str(post_infer.get("output_column", "pred"))
+            # 若 csv_path_override 為 null/空字串，回退到 cfg.label.tbm_csv_path
+            out_csv = str(post_infer.get("csv_path_override") or cfg.get("label", {}).get("tbm_csv_path"))
+            s_tag = ds.replace('-', '')
+            e_tag = de.replace('-', '')
+            save_csv = trial_dir / f"tbm_with_{out_col}_{s_tag}_{e_tag}.csv"
+            debug_lines.append(f"date_range=[{ds},{de}]")
+            debug_lines.append(f"tbm_src={out_csv}")
+            debug_lines.append(f"save_to={save_csv}")
+            try:
+                export_tbm_predictions_for_trial(
+                    cfg=cfg,
+                    df_index=pd.DatetimeIndex(df.index),
+                    folds=folds,
+                    fold_models=fold_models_for_infer,
+                    date_start=ds,
+                    date_end=de,
+                    src_tbm_csv_path=out_csv,
+                    save_to_path=str(save_csv),
+                    output_column=out_col,
+                    threshold_override=(post_infer.get("threshold_override") if isinstance(post_infer.get("threshold_override", None), (int, float)) else None),
+                )
+                print(f"[PostInfer] Saved TBM with predictions: {save_csv}")
+                debug_lines.append("status=ok")
+            except Exception as e2:
+                debug_lines.append(f"status=error")
+                debug_lines.append(f"error={type(e2).__name__}: {e2}")
+                # 將錯誤記錄到 trial 目錄，方便排查
+                try:
+                    with open(trial_dir / "post_infer_error.txt", "w", encoding="utf-8") as ef:
+                        ef.write("\n".join(debug_lines))
+                except Exception:
+                    pass
+        # 不論是否執行，寫入 debug 紀錄
+        try:
+            with open(trial_dir / "post_infer_debug.txt", "w", encoding="utf-8") as dfp:
+                dfp.write("\n".join(debug_lines))
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[PostInfer][WARN] skip due to error: {e}")
 
     return mean_score

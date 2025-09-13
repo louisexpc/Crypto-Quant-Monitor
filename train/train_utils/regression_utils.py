@@ -60,17 +60,18 @@ def compute_regression_metrics(y_true, y_pred):
 
 
 def build_regression_loss(cfg):
-    name = (cfg.get("loss", {}) or {}).get("name", "emamse_pearson").lower()
+    cfg_reg_loss = cfg["loss"]["reg"]
+    name = cfg_reg_loss["name"]
     if name == "mse":
         return nn.MSELoss()
     if name == "huber":
-        delta = float(cfg["loss"].get("huber_delta", 1.0))
+        delta = float(cfg_reg_loss["huber_delta"])
         return nn.HuberLoss(delta=delta)
     # default: emamse_pearson
-    a = float(cfg["loss"].get("alpha", 0.7))
-    b = float(cfg["loss"].get("beta", 0.3))
-    d = float(cfg["loss"].get("ema_decay", 0.9))
-    eps = float(cfg["loss"].get("pearson_eps", 1e-8))
+    a = float(cfg_reg_loss["alpha"])
+    b = float(cfg_reg_loss["beta"])
+    d = float(cfg_reg_loss["ema_decay"])
+    eps = float(1e-8)
     return EMAMSE_PearsonLoss(alpha=a, beta=b, ema_decay=d, eps=eps)
 
 

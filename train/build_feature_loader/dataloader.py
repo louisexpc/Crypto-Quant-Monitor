@@ -1,21 +1,93 @@
 # dataloader.py
-import os
 import pandas as pd
 import numpy as np
-import torch
 from torch.utils.data import Dataset, DataLoader
 from typing import Literal, Optional, List, Dict
 
+from .scalar import pick_cols_to_scale, _get_scaler, ColumnSubsetScaler
+from .build_features import create_label
+
+import sys, os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from dataset.time_dataset import SeqDataset
+from dataset.event_dataset import EventDataset
+
+
+
+# def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
+#     train_val_mask = fold["train_val_mask"]
+#     test_mask = fold["test_mask"]
+
+#     # 時間排序的訓練+驗證資料
+#     df_tv = df.loc[train_val_mask].sort_index()
+#     df_te = df.loc[test_mask].sort_index()
+
+#     split_ratio = cfg["cv"]["train_val_split"]
+#     split_idx = int(len(df_tv) * split_ratio)
+
+#     tr_idx = df_tv.index[:split_idx]
+#     va_idx = df_tv.index[split_idx:]
+#     te_idx = df_te.index
+
+#     return tr_idx, va_idx, te_idx
 
 def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
-    train_val_mask = fold["train_val_mask"]
-    test_mask = fold["test_mask"]
+    """
+    1. 說明:
+        根據 fold 切出 train/val/test 的索引：
+        - 若 fold 的布林遮罩長度與 df 相同，直接使用布林遮罩（time-driven 情境）。
+        - 否則改用 fold['train_val_times'] / fold['test_times'] 做「時間對齊」（event-driven 推薦）。
+        - 回傳三段 DatetimeIndex（已按時間排序）。
 
-    # 時間排序的訓練+驗證資料
-    df_tv = df.loc[train_val_mask].sort_index()
-    df_te = df.loc[test_mask].sort_index()
+    2. inputs:
+        df (DataFrame): 目標資料（可能是 bar 級，或事件 t0 級）
+        fold (dict):     FoldGenerator 產生的折疊資訊
+        cfg (dict):      含 train/val split 比例（cfg['cv']['train_val_split']）
 
-    split_ratio = cfg["cv"]["train_val_split"]
+    3. return:
+        tr_idx, va_idx, te_idx (DatetimeIndex, DatetimeIndex, DatetimeIndex)
+    """
+    train_val_mask = fold.get("train_val_mask")
+    test_mask = fold.get("test_mask")
+
+    # 標準化 df.index → UTC tz-aware
+    idx = pd.DatetimeIndex(df.index)
+    idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+
+    # 判斷是否可直接用布林遮罩
+    use_mask_direct = (
+        isinstance(train_val_mask, (np.ndarray, pd.Series)) and
+        isinstance(test_mask, (np.ndarray, pd.Series)) and
+        len(train_val_mask) == len(df) and
+        len(test_mask) == len(df)
+    )
+
+    if use_mask_direct:
+        df_tv = df.loc[np.asarray(train_val_mask).astype(bool)].sort_index()
+        df_te = df.loc[np.asarray(test_mask).astype(bool)].sort_index()
+    else:
+        # 後備：用時間集合對齊（FoldGenerator 需在 folds.append 時提供 times）
+        tv_times = fold.get("train_val_times")
+        te_times = fold.get("test_times")
+        if tv_times is None or te_times is None:
+            raise ValueError(
+                "Fold boolean mask 與 df 長度不一致，且缺少 'train_val_times' / 'test_times' 可供時間對齊。"
+                "請更新 FoldGenerator 在每折輸出時間集合。"
+            )
+
+        tv_times = pd.DatetimeIndex(tv_times)
+        te_times = pd.DatetimeIndex(te_times)
+        tv_times = tv_times.tz_localize("UTC") if tv_times.tz is None else tv_times.tz_convert("UTC")
+        te_times = te_times.tz_localize("UTC") if te_times.tz is None else te_times.tz_convert("UTC")
+
+        tv_mask_local = idx.isin(tv_times)
+        te_mask_local = idx.isin(te_times)
+
+        df_tv = df.loc[tv_mask_local].sort_index()
+        df_te = df.loc[te_mask_local].sort_index()
+
+    # train/val split（時間順序）
+    split_ratio = float(cfg["cv"]["train_val_split"])
     split_idx = int(len(df_tv) * split_ratio)
 
     tr_idx = df_tv.index[:split_idx]
@@ -24,213 +96,247 @@ def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
 
     return tr_idx, va_idx, te_idx
 
-# -------------------------
-#  Dataset
-# -------------------------
-class SeqDataset(Dataset):
-    def __init__(
-        self,
-        X_df,
-        y_s,
-        seq_len: int,
-        scaler=None,
-        device: str = "cuda",
-        label_dtype: Literal["auto", "float", "long"] = "auto",
-        stride: int = 1,                 # ★ 新增
-        anchor: int = 0,                 # ★ 新增：0..stride-1，控制起始對齊
-    ):
-        X_df = X_df.astype(np.float32, copy=False)
 
-        if scaler is None:
-            X = X_df.values
-        elif hasattr(scaler, "transform"):
-            X = scaler.transform(X_df.values).astype(np.float32, copy=False)
-        elif hasattr(scaler, "transform_df"):
-            X = scaler.transform_df(X_df).values.astype(np.float32, copy=False)
+def select_plan_columns(feat_df: pd.DataFrame, cfg: Dict) -> List[str]:
+    """
+    根據 cfg.features.plan 產生要使用的欄位集合，包含：
+    - OHLCV（僅在 plan 中對應項目 enabled 時才保留）
+    - 所有 1-min 欄位（以 DEFAULT_MINUTE_PREFIXES 為前綴，例如 'm_...'; 請確保已於上游 drop 掉 datetime/timestamp）
+    - 由 plan 中 enabled 的特徵映射出的實際欄位（與 feat_df.columns 取交集）
+
+    輸出順序遵守原始 feat_df.columns 的順序。
+    """
+    from .indicators import FeatureComputer, DEFAULT_MINUTE_PREFIXES
+    import re
+
+    cols_all = list(map(str, feat_df.columns))
+    # OHLCV 按 plan 控制是否納入特徵（label 計算已在外層處理，不受此處影響）
+    ohlcv_keep: set[str] = set()
+
+    # Minute (1-min flattened) selection via config.features.min_trade_feat
+    # Expect column form like: m_[-lag]_<base>
+    min_feat_list = list(((cfg.get("features", {}) or {}).get("min_trade_feat", [])) or [])
+    minute_cols: set[str] = set()
+    if min_feat_list:
+        m_pat = re.compile(r"^m_(-?\d+)_(.+)$")
+        for c in cols_all:
+            if not any(str(c).startswith(p) for p in DEFAULT_MINUTE_PREFIXES):
+                continue
+            m = m_pat.match(str(c))
+            if not m:
+                continue
+            base = m.group(2)
+            if base in min_feat_list:
+                minute_cols.add(c)
+
+    plan = (cfg.get("features", {}) or {}).get("plan", {}) or {}
+    try:
+        specs = FeatureComputer._enabled_features(plan)
+    except Exception:
+        specs = []
+
+    want = set()
+
+    def add_if_present(names):
+        if isinstance(names, str):
+            if names in feat_df.columns:
+                want.add(names)
         else:
-            raise TypeError("Unsupported scaler: expected .transform(...) or .transform_df(...)")
+            for n in names:
+                if n in feat_df.columns:
+                    want.add(n)
 
-        # ---- y ----
-        if label_dtype == "auto":
-            is_float = np.issubdtype(y_s.values.dtype, np.floating)
-            y_np = y_s.values.astype(np.float32 if is_float else np.int64, copy=False)
-            torch_y_dtype = torch.float32 if is_float else torch.long
-        elif label_dtype == "float":
-            y_np = y_s.values.astype(np.float32, copy=False)
-            torch_y_dtype = torch.float32
+    for item in specs:
+        name = str(item.get("name", "")).upper()
+        kw = item.get("kwargs", {}) or {}
+
+        if name == "SMA":
+            L = int(kw.get("length", 0)); s = str(kw.get("sign", "false")).lower()
+            if s in ("true","sign","both"): add_if_present(f"SSMA_{L}")
+            if s in ("false","cont","both"): add_if_present(f"SMA_{L}")
+        elif name == "EMA":
+            L = int(kw.get("length", 0)); s = str(kw.get("sign", "false")).lower()
+            if s in ("true","sign","both"): add_if_present(f"SEMA_{L}")
+            if s in ("false","cont","both"): add_if_present(f"EMA_{L}")
+        elif name == "TEMA":
+            L = int(kw.get("length", 0)); s = str(kw.get("sign", "false")).lower()
+            if s in ("true","sign","both"): add_if_present(f"STEMA_{L}")
+            if s in ("false","cont","both"): add_if_present(f"TEMA_{L}")
+        elif name == "MACD":
+            f = int(kw.get("fast", 12)); sl = int(kw.get("slow", 26)); sg = int(kw.get("signal", 9))
+            s = str(kw.get("sign", "false")).lower()
+            if s in ("true","sign","both"): add_if_present(f"SMACD_{f}_{sl}_{sg}")
+            if s in ("false","cont","both"): add_if_present(f"MACD_{f}_{sl}_{sg}")
+        elif name == "SLOPE":
+            L = int(kw.get("length", 0)); add_if_present(f"SLOPE_{L}")
+        elif name == "TTM_TRND":
+            L = int(kw.get("length", 6)); add_if_present(f"TTM_TRND_{L}")
+        elif name == "DPO":
+            L = int(kw.get("length", 0)); add_if_present(f"DPO_{L}")
+        elif name == "AMATE_LR":
+            f = int(kw.get("fast", 8)); sl = int(kw.get("slow", 21)); m = int(kw.get("mamode", 2))
+            add_if_present(f"AMATe_LR_{f}_{sl}_{m}")
+
+        elif name == "RSI":
+            L = int(kw.get("length", 14)); add_if_present(f"RSI_{L}")
+        elif name == "MOM":
+            L = int(kw.get("length", 30)); add_if_present(f"MOM_{L}")
+        elif name == "STOCH":
+            k = int(kw.get("k", 14)); add_if_present([f"STOCHk_{k}", f"STOCHd_{k}"])
+        elif name == "KDJ":
+            k = int(kw.get("k", 9)); d = int(kw.get("d", 3)); add_if_present(f"J_{k}_{d}")
+        elif name == "UO":
+            f = int(kw.get("fast", 7)); md = int(kw.get("medium", 14)); sl = int(kw.get("slow", 28)); add_if_present(f"UO_{f}_{md}_{sl}")
+        elif name == "RVI":
+            L = int(kw.get("length", 14)); add_if_present(f"RVI_{L}")
+        elif name == "CCI":
+            L = int(kw.get("length", 14)); c = float(kw.get("c", 0.015)); add_if_present(f"CCI_{L}_{c}")
+        elif name == "ZS":
+            L = int(kw.get("length", 30)); add_if_present(f"ZS_{L}")
+        elif name == "WILLR":
+            L = int(kw.get("length", 14)); add_if_present(f"WILLR_{L}")
+
+        elif name == "TRUERANGE":
+            add_if_present("TRUERANGE_1")
+        elif name == "RANGE":
+            W = int(kw.get("window", 24)); add_if_present(f"RANGE_{W}")
+        elif name == "ATR":
+            L = int(kw.get("length", 14)); add_if_present(f"ATR_{L}")
+            if bool(kw.get("pct", True)): add_if_present(f"ATRP_{L}")
+        elif name == "MASSI":
+            f = int(kw.get("fast", 9)); sl = int(kw.get("slow", 25)); add_if_present(f"MASSI_{f}_{sl}")
+        elif name == "BBP":
+            L = int(kw.get("length", 5)); st = float(kw.get("std", 2.0)); add_if_present(f"BBP_{L}_{st}")
+        elif name == "EWMRET":
+            hls = kw.get("halflife", [])
+            if isinstance(hls, int): hls = [hls]
+            for hl in hls:
+                add_if_present([f"EWM_M_{int(hl)}", f"EWM_S_{int(hl)}"])
+
+        elif name == "PVO":
+            pv_cols = [c for c in cols_all if str(c).startswith("PVO_") or c == "PVO"]
+            add_if_present(pv_cols)
+        elif name == "PVR":
+            add_if_present("PVR")
+        elif name == "BOP":
+            add_if_present("BOP")
+        elif name == "PXVOL":
+            add_if_present(["DIR_STRENGTH","PXV_LR_VCHG","DIRxVOL"])
+
+        elif name == "LOGRET":
+            lags = kw.get("lags", [])
+            lags = lags if isinstance(lags, (list, tuple)) else [lags]
+            for k in lags:
+                add_if_present(f"LOGRET_{int(k)}")
+        elif name == "TIME_CYC":
+            if bool(kw.get("daily", True)):
+                add_if_present(["TOD_SIN","TOD_COS"])
+            if bool(kw.get("weekly", True)):
+                add_if_present(["DOW_SIN","DOW_COS"])
+
+        elif name == "FOUND":
+            add_if_present("funding_rate")
+        elif name == "M15_DIR":
+            add_if_present(["M15_DIR_01","M15_DIR_12","M15_DIR_23"])
+        elif name == "M15_VOL":
+            add_if_present(["M15_VOL_0","M15_VOL_1","M15_VOL_2","M15_VOL_3"])
+        elif name == "FNG_IDX":
+            add_if_present(["sent_fng","sent_fng_diff1","sent_fng_z7d"])
+        elif name in {"OPEN","HIGH","LOW","CLOSE","VOLUME"}:
+            # 僅在 plan 中被 enable 時才保留對應 OHLCV 欄位
+            base = name.lower()
+            if base in feat_df.columns:
+                ohlcv_keep.add(base)
         else:
-            y_np = y_s.values.astype(np.int64, copy=False)
-            torch_y_dtype = torch.long
+            # 未知名稱：忽略
+            pass
 
-        # ---- sliding windows with stride ----
-        L = int(seq_len)
-        N, M = len(X), len(y_np)
-        stride = max(1, int(stride))
-        anchor = int(anchor) % stride
-
-        start = (L - 1) + anchor
-        stop = min(N, M)
-        if start >= stop:
-            # 沒有任何可用樣本時，回退到無 anchor
-            start = L - 1
-
-        idx = np.arange(start=start, stop=stop, step=stride, dtype=int)
-
-        # [N, T, F] / [N]
-        X_seqs = np.stack([X[j - L + 1: j + 1] for j in idx]) if len(idx) else np.empty((0, L, X.shape[1]), np.float32)
-        y_vals = y_np[idx] if len(idx) else np.empty((0,), y_np.dtype)
-
-        self.X = torch.tensor(X_seqs, dtype=torch.float32, device=device)
-        self.y = torch.tensor(y_vals, dtype=torch_y_dtype, device=device)
-
-    def __len__(self):
-        return self.y.shape[0]
-
-    def __getitem__(self, i):
-        return self.X[i], self.y[i]
-
+    keep_set = set().union(ohlcv_keep).union(minute_cols).union(want)
+    feat_cols = [c for c in cols_all if c in keep_set]
+    return feat_cols
 
 # ========== Fold Generator ==========
 class FoldGenerator:
-    def __init__(self, dt_index: pd.DatetimeIndex, mode: str = "rolling", start_month: str | None = None, **kwargs):
+    def __init__(self,
+                 dt_index: pd.DatetimeIndex,
+                 mode: str = "rolling",
+                 start_month: str | None = None,
+                 end_month: str | None = None,
+                 **kwargs):
         """
-        僅根據 index 生成 fold。此 index 應已經過 build_features_and_label 切過範圍。
+        1. 說明:
+            僅根據 index 生成 folds，支援以 config.yaml 的 cv.start_date / cv.end_date
+            限定可用的時間範圍（含起訖），並同時維持 PeriodIndex 與 DatetimeIndex 的時區一致性。
+        2. inputs:
+            dt_index (DatetimeIndex): 原始時間索引（可 naive 或 tz-aware）。最終統一為 UTC tz-aware。
+            mode (str): 目前保留原介面。
+            start_month (str|None): 例如 "2023-01-01"；若為 None 則以資料最小時間。
+            end_month   (str|None): 例如 "2025-04-30"；若為 None 則以資料最大時間。
+        3. return:
+            建立好 self.months（以 Period[M] 表示的月份清單）、以及 aware/naive 的起訖邊界。
         """
-        # 統一使用 UTC（tz-aware）。若為 naive，視為 UTC。
+        # 1) dt_index → UTC tz-aware
         if getattr(dt_index, "tz", None) is None:
             dt_index = dt_index.tz_localize("UTC")
         else:
             dt_index = dt_index.tz_convert("UTC")
         self.dt_index = dt_index
         self.mode = mode
-        # 用於 PeriodIndex 比較：Period.start_time 是 tz-naive，故這裡亦使用 tz-naive
-        self.start_ts = pd.Timestamp(start_month)
         self.kwargs = kwargs
 
-        # 2. 全部 folds 的月列表（但只保留起始時間之後的）
-        # 先轉成 naive UTC 再做 to_period，避免 timezone 丟失警告
+        # 2) 讀取起訖（naive 與 aware 版本各存一份）
+        self.start_ts_naive = pd.Timestamp(start_month) if start_month is not None else pd.Timestamp(dt_index.min().tz_convert("UTC").tz_localize(None))
+        self.end_ts_naive   = pd.Timestamp(end_month)   if end_month   is not None else pd.Timestamp(dt_index.max().tz_convert("UTC").tz_localize(None))
+
+        # 對齊到「日期存在」且 start<=end
+        if self.end_ts_naive < self.start_ts_naive:
+            raise ValueError(f"[FoldGenerator] end_month({self.end_ts_naive}) 早於 start_month({self.start_ts_naive})")
+
+        # aware（UTC）
+        self.start_ts_aware = self.start_ts_naive.tz_localize("UTC")
+        # end 設為當日 23:59:59.999999999（含訖），避免月底被排除
+        self.end_ts_aware   = (self.end_ts_naive + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)).tz_localize("UTC")
+
+        # 3) 先將 dt_index 限縮到 [start,end]（保證後續 months 與遮罩一致）
+        in_range = (self.dt_index >= self.start_ts_aware) & (self.dt_index <= self.end_ts_aware)
+        self.dt_index = self.dt_index[in_range]
+        if len(self.dt_index) == 0:
+            raise ValueError("[FoldGenerator] 篩選後的 dt_index 為空，請檢查 cv.start_date / cv.end_date")
+
+        # 4) 建立月份清單（用 naive；PeriodIndex 皆為 naive）
         dt_index_naive = self.dt_index.tz_convert("UTC").tz_localize(None)
         months_all = pd.PeriodIndex(dt_index_naive.to_period("M")).unique().sort_values()
-        self.months = [m for m in months_all if m.start_time >= self.start_ts]
+        # 僅保留起訖內的月份（用月份的 start_time 與 naive 起訖比較）
+        self.months = [m for m in months_all if (m.start_time >= self.start_ts_naive) and (m.start_time <= self.end_ts_naive)]
 
     def _get_test_months(self, test_freq: str):
         """
-        根據 test_freq（例如 'M', '2M', 'Q'）產生要測試的月份。
+        1. 說明:
+            根據 test_freq（'M','Q' 或 '2M','3M' 這類步長）產生要測試的月份，
+            並且限制在 [start_date, end_date] 內。
+        2. inputs:
+            test_freq (str): 測試頻率。
+        3. return:
+            PeriodIndex 或 list[Period]：測試月份序列。
         """
+        if not self.months:
+            return []
+        # 將起點對齊到月份開頭（避免提供月中日期）
+        start_align = pd.Timestamp(self.start_ts_naive.strftime("%Y-%m-01"))
+        end_align   = self.months[-1]  # 已根據 end 內縮
         if test_freq in {"M", "Q"}:
-            return pd.period_range(self.start_ts, self.months[-1], freq=test_freq)
+            return pd.period_range(start_align, end_align, freq=test_freq)
         else:
-            # e.g., "2M"、"3M" 等非標準 freq（不是 Pandas 原生 freq）
-            # 這裡我們用 manual skip
-            months = self.months
+            # "2M"/"3M" 等：從已內縮的 months 中以步長取樣
             step = int(test_freq.replace("M", ""))  # "2M" → 2
-            return months[::step]
+            return self.months[::step]
 
     # =========================
-    # 1) OddEven folds 產生器
+    # Rolling folds（原行為維持；僅用內縮後的 months 與 aware 邊界）
     # =========================
-    def make_two_month_folds(self):
-        """
-        回傳 list of dict:
-        [{
-        'train_val_mask': <bool array>,
-        'test_mask': <bool array>,
-        'train_val_month': 'YYYY-MM',
-        'test_month': 'YYYY-MM'
-        }, ...]
-        """
-
-        folds = []
-        # 預先建立 naive 的 month period index，避免 tz 警告
-        month_periods = pd.PeriodIndex(self.dt_index.tz_convert("UTC").tz_localize(None).to_period("M"))
-        for m in self.months:
-            if m.month % 2 == 1:  # 奇數月
-                next_month = m + 1
-                if next_month in self.months:
-                    train_val_mask = (month_periods == m)
-                    test_mask      = (month_periods == next_month)
-                    folds.append({
-                        'train_val_mask': train_val_mask,
-                        'test_mask':      test_mask,
-                        'train_val_month': str(m),
-                        'test_month':      str(next_month),
-                    })
-        return folds
-
-
-    # =========================
-    # 2) Anchored folds 產生器
-    # =========================
-
-    def make_anchored_folds(self,
-                            embargo_hours: int = 24,         # train→test 的禁區長度（小時）
-                            min_train_days: int = 30,        # 每個 fold 至少要有多少天的訓練資料（避免太小）
-                            test_freq="M"
-                            ):
-        """
-        產生「Anchored（擴充式）」月度 folds：
-        - 對每個測試月份 m：
-            * test_mask = (timestamp 的 calendar month == m)
-            * train_val_mask = [start_date, test_start - embargo) 的所有資料（擴充式累積）
-        - 注意：embargo 以小時為單位，會從 test 月初往回挖空。
-        回傳：list[dict]，每個 dict 內含
-        - 'train_val_mask': bool array
-        - 'test_mask': bool array
-        - 'test_month': 'YYYY-MM'
-        """
-
-        test_months = self._get_test_months(test_freq)
-        folds = []
-
-        # 預先建立 naive 的 month period index，避免 tz 警告
-        month_periods = pd.PeriodIndex(self.dt_index.tz_convert("UTC").tz_localize(None).to_period("M"))
-        for m in test_months:
-            # 該月的月初（naive）
-            test_start = pd.Timestamp(m.start_time, tz="UTC")
-            embargo_delta = pd.Timedelta(hours=embargo_hours)
-            train_end = test_start - embargo_delta
-
-            # 訓練（擴充式）：從 anchor 起累積到圖上 train_end_exclusive
-            train_mask = (self.dt_index >= self.start_ts) & (self.dt_index < train_end)
-            test_mask  = (month_periods == m)
-
-            # 至少要有一定天數的訓練資料，避免前期 fold 太短
-            if train_mask.sum() == 0:
-                continue
-            n_days = (pd.DatetimeIndex(self.dt_index[train_mask]).date[-1] -
-                    pd.DatetimeIndex(self.dt_index[train_mask]).date[0]).days + 1
-            if n_days < min_train_days:
-                continue
-
-            # 若該月根本沒資料（或 embargo 刨掉太多），也跳過
-            if test_mask.sum() == 0:
-                continue
-
-            folds.append({
-                "train_val_mask": train_mask,
-                "test_mask": test_mask,
-                "test_month": str(m)
-            })
-        return folds
-
-    # =========================
-    # 3) Rolling folds 產生器
-    # =========================
-
     def make_rolling_folds(self, train_window, embargo_hours, test_freq="M"):
-        """
-        每一 fold：
-        - 訓練集為固定長度（例如過去 3 個月）
-        - 測試集為下一個月
-
-        ex. idx = DatetimeIndex(2024-01-01 ~ 2024-05-31)
-        => months = pd.PeriodIndex(idx.to_period("M")).unique().sort_values()
-        => months = [2024-01, 2024-02, 2024-03, 2024-04, 2024-05]
-        """
         test_months = self._get_test_months(test_freq)
         folds = []
-
-        # 預先建立 naive 的 month period index，避免 tz 警告
         month_periods = pd.PeriodIndex(self.dt_index.tz_convert("UTC").tz_localize(None).to_period("M"))
         for m in test_months:
             i = self.months.index(m)
@@ -238,41 +344,186 @@ class FoldGenerator:
                 continue
 
             train_start = pd.Timestamp(self.months[i - train_window].start_time, tz="UTC")
-            test_start = pd.Timestamp(m.start_time, tz="UTC")
+            test_start  = pd.Timestamp(m.start_time, tz="UTC")
             embargo_delta = pd.Timedelta(hours=embargo_hours)
-            train_end = test_start - embargo_delta
+            train_end   = test_start - embargo_delta
 
-            train_mask = (self.dt_index >= train_start) & (self.dt_index < train_end)
-            test_mask  = (month_periods == m)
+            # 也限制在 end_ts_aware 以內
+            train_mask = (self.dt_index >= max(train_start, self.start_ts_aware)) & \
+                         (self.dt_index <  min(train_end,   self.end_ts_aware))
+            test_mask  = (month_periods == m) & (self.dt_index <= self.end_ts_aware)
+
+            if train_mask.sum() == 0 or test_mask.sum() == 0:
+                continue
+   
+            folds.append({
+                'train_val_mask': train_mask,
+                'test_mask':      test_mask,
+                'test_month':     str(m),
+                # 新增：時間集合（對應 bar 級 self.dt_index）
+                'train_val_times': self.dt_index[train_mask],
+                'test_times':      self.dt_index[test_mask],
+            })
+        return folds
+
+    # =========================
+    # Purged K-fold（含 embargo；同時套用起訖）
+    # =========================
+    def make_purged_kfold(self,
+                          n_splits: int = 5,
+                          embargo_hours: int = 24,
+                          min_train_days: int = 30) -> list[dict]:
+        """
+        1. 說明:
+            以「時間」切分的 Purged K-Fold（含 embargo）。
+            - self.months 先依 cv.start_date / cv.end_date 內縮；
+            - 將 months 均分為 n_splits 區段，取每段最後一月為測試月（如 10 個月/5 折 → 2,4,6,8,10）。
+            - 訓練集 = 全資料中，剔除 [test_start - embargo, test_end + embargo) 的樣本，
+              並限制在 [start_date, end_date] 範圍內。
+        2. inputs:
+            n_splits (int): 折數（>=2）
+            embargo_hours (int): 禁運期（小時）
+            min_train_days (int): 訓練天數下限
+        3. return:
+            list[dict]: 每折 {'train_val_mask','test_mask','test_month'}
+        """
+        assert n_splits >= 2, "[make_purged_kfold] n_splits 需 >= 2"
+
+        dt_naive = self.dt_index.tz_convert("UTC").tz_localize(None)
+        month_periods = pd.PeriodIndex(dt_naive.to_period("M"))
+        embargo = pd.Timedelta(hours=int(embargo_hours))
+
+        m_idx = np.arange(len(self.months))
+        groups = np.array_split(m_idx, n_splits)
+
+        folds: list[dict] = []
+        for g in groups:
+            if len(g) == 0:
+                continue
+            test_m = self.months[g[-1]]
+            test_mask = (month_periods == test_m) & (self.dt_index <= self.end_ts_aware)
+            if test_mask.sum() == 0:
+                continue
+
+            test_start = pd.Timestamp(test_m.start_time, tz="UTC")
+            test_end   = pd.Timestamp((test_m + 1).start_time, tz="UTC")
+            purge_start, purge_end = test_start - embargo, test_end + embargo
+
+            # 限制在 [start_aware, end_aware] & Purge
+            base = (self.dt_index >= self.start_ts_aware) & (self.dt_index <= self.end_ts_aware)
+            no_overlap = (self.dt_index < purge_start) | (self.dt_index >= purge_end)
+            train_mask = base & no_overlap & (~test_mask)
+
+            if train_mask.sum() == 0:
+                continue
+            tr_days = (pd.DatetimeIndex(self.dt_index[train_mask]).date[-1] -
+                       pd.DatetimeIndex(self.dt_index[train_mask]).date[0]).days + 1
+            if tr_days < int(min_train_days):
+                continue
 
             folds.append({
                 'train_val_mask': train_mask,
-                'test_mask': test_mask,
-                'test_month': str(m)
+                'test_mask':      test_mask,
+                'test_month':     str(test_m),
+                # 新增：時間集合（對應 bar 級 self.dt_index）
+                'train_val_times': self.dt_index[train_mask],
+                'test_times':      self.dt_index[test_mask],
             })
         return folds
 
 # -------------------------
 # DataLoader 組裝
 # -------------------------
-from .scalar import pick_cols_to_scale, _get_scaler, ColumnSubsetScaler
-from .event_dataset import EventDataset
-from .indicators import IndicatorLibrary, FeatureComputer
 
-def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool = False, pre_feat_df: pd.DataFrame | None = None):
+def make_time_loaders_for_fold(df,
+                               feat_cols: Optional[List[str]] = None,
+                               target_col: Optional[str] = None,
+                               fold: Dict = None,
+                               cfg: Dict = None,
+                               also_XGB: bool = False,
+                               pre_feat_df: pd.DataFrame | None = None):
     """
-    依 fold 切出 train/val/test，執行縮放與清理，最後包成三個 DataLoader。
-    主要差異點：
-      - 若使用 TimeSafeScaler：先 transform_full，再針對每個 split 分別 dropna；
-        並在 train split 裁掉 warm-up（scaler.warmup_len()）。
-      - 若使用 sklearn 縮放器：先清理 train，再 fit_df(train)；val/test 僅 transform，不看未來。
+    時間驅動（time-driven）資料載入器（precomputed-only）：
+    - 僅從 cfg.features.precomputed.path 載入特徵；不做 runtime 特徵計算。
+    - 以預算檔中的 OHLCV 產生 label（create_label）。
+    - 依 fold 切出 train/val/test，執行縮放與清理，最後包成三個 DataLoader。
+    - TimeSafeScaler：transform_full；sklearn 縮放器：fit on train，再 transform 其他 split。
     """
-
-    # 事件驅動：改走 EventDataset 流程
-    if str(cfg.get("label", {}).get("mode", "")).lower() == "event_tbm":
-        return make_event_loaders_for_fold(df, feat_cols, fold, cfg, also_XGB=also_XGB, pre_feat_df=pre_feat_df)
 
     task_type = cfg["task"]["type"]
+    # 參考折疊的原始索引（由 objective.make_folds 基於此索引生成布林遮罩）
+    ref_index = pd.DatetimeIndex(df.index)
+    # 僅使用 precomputed 特徵
+    pre_path = cfg["data"]["path"]
+    if not pre_path and pre_feat_df is None:
+        raise ValueError("請在 config.features.precomputed.path 指定預先計算的特徵檔 (.csv 或 .parquet)")
+    if pre_feat_df is not None:
+        feat_df = pre_feat_df.copy()
+    else:
+        p = str(pre_path)
+        if p.endswith(".csv"):
+            feat_df = pd.read_csv(p)
+        elif p.endswith(".parquet"):
+            feat_df = pd.read_parquet(p)
+        else:
+            raise ValueError("features.precomputed.path 只支援 .csv 或 .parquet")
+        # set index from datetime/timestamp if present
+        if "datetime" in feat_df.columns:
+            idx = pd.to_datetime(feat_df["datetime"], errors="coerce", utc=True)
+            feat_df = feat_df.drop(columns=["datetime"]) 
+            feat_df.index = idx
+        elif "timestamp" in feat_df.columns:
+            ts = pd.to_numeric(feat_df["timestamp"], errors="coerce").astype("Int64")
+            unit = "ms" if (ts.dropna().iloc[0] if len(ts.dropna()) else 0) > 1_000_000_000_000 else "s"
+            idx = pd.to_datetime(ts, unit=unit, utc=True)
+            feat_df = feat_df.drop(columns=["timestamp"]) 
+            feat_df.index = idx
+        feat_df = feat_df.sort_index()
+        feat_df = feat_df[~feat_df.index.duplicated(keep="last")]
+
+        # 對齊時間網格並生成 label（保留 y_reg/y_cls 欄名）
+        # 參考 build_features_and_label 的做法
+        # 對齊時間網格：以 precomputed 索引生成完整網格
+        full_idx = pd.date_range(feat_df.index.min(), feat_df.index.max(), freq=str(cfg["data"]["freq"]), tz="UTC")
+        # 檢查預算檔是否包含 OHLCV 欄位
+        ohlcv_cols = [c for c in ["open","high","low","close","volume"] if c in feat_df.columns]
+        if len(ohlcv_cols) < 5:
+            raise KeyError("預算特徵檔缺少 OHLCV 欄位（需要 open/high/low/close/volume）以產生 time-driven 標籤")
+        dfb = feat_df.loc[:, ohlcv_cols].copy()
+        dfb = dfb.reindex(full_idx)
+        feat_df = feat_df.reindex(full_idx)
+
+        # 篩選被 enable 的特徵（以 plan + OHLCV + 1-min）
+        feat_cols = select_plan_columns(feat_df, cfg)
+        drop_feat = [c for c in feat_df.columns if c not in set(feat_cols)]
+        if drop_feat:
+            print(f"[INFO] Dropping {len(drop_feat)} precomputed cols not enabled: {drop_feat[:10]}{' ...' if len(drop_feat)>10 else ''}")
+        if not feat_cols:
+            raise ValueError("計畫啟用的特徵在預算檔中皆不存在（feat_cols 為空），請檢查 plan 與預算欄位。")
+        feat_df = feat_df.loc[:, feat_cols].astype(np.float32)
+
+        is_reg = (task_type == "regression")
+        y_series = create_label(dfb, cfg, return_what=("reg" if is_reg else "cls"))
+
+        # 清理與對齊
+        feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
+        valid_now = feat_df.notna().all(axis=1)
+        valid_lbl = y_series.notna()
+        keep = valid_now & valid_lbl
+        feat_df = feat_df.loc[keep]
+        y_series = y_series.loc[keep]
+
+        # 時間區間篩選
+        start_date = pd.Timestamp(cfg["cv"]["start_date"]).tz_localize("UTC")
+        end_date   = pd.Timestamp(cfg["cv"]["end_date"]).tz_localize("UTC")
+        mask_range = (feat_df.index >= start_date) & (feat_df.index <= end_date)
+        feat_df = feat_df.loc[mask_range]
+        y_series = y_series.loc[mask_range]
+
+        # 構造 df 與 meta
+        df = pd.concat([feat_df, y_series], axis=1)
+        feat_cols = list(feat_df.columns)
+        target_col = "y_reg" if is_reg else "y_cls"
     is_reg = (task_type == "regression")
 
     # Scaler（只 fit 在 train，否則會洩漏）
@@ -280,8 +531,23 @@ def make_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB: bool =
     scaler_window = cfg["sequence"]["seq_len"]
     min_frac = cfg["sequence"]["min_frac"]
 
-    # 1) 決定要縮放的欄位（自動跳過 sign-like / 命名 pattern）
-    tr_idx, va_idx, te_idx = split_fold_to_indices(df, fold, cfg)
+    # 1) 依 fold（基於 ref_index 的布林遮罩）映射到目前 df.index
+    #    先將布林遮罩轉成時間集合，再以 isin 到當前 df.index 取得對應位置
+    local_index = pd.DatetimeIndex(df.index)
+    tv_times = ref_index[np.asarray(fold["train_val_mask"]).astype(bool)]
+    te_times = ref_index[np.asarray(fold["test_mask"]).astype(bool)]
+    tv_mask_local = local_index.isin(tv_times)
+    te_mask_local = local_index.isin(te_times)
+    df_tv_index = local_index[tv_mask_local]
+    df_te_index = local_index[te_mask_local]
+
+    split_ratio = cfg["cv"]["train_val_split"]
+    split_pos = int(len(df_tv_index) * split_ratio)
+    tr_idx = df_tv_index[:split_pos]
+    va_idx = df_tv_index[split_pos:]
+    te_idx = df_te_index
+
+    # 1b) 決定要縮放的欄位（自動跳過 sign-like / 命名 pattern）
     cols_to_scale = pick_cols_to_scale(df.loc[tr_idx, feat_cols], feat_cols)
 
     # 2) 建立縮放器
@@ -391,7 +657,7 @@ def make_event_loaders_for_fold(df_events: pd.DataFrame,
                                 pre_feat_df: pd.DataFrame | None = None):
     """
     Event-driven loader builder using EventDataset:
-    - Recomputes features via FeatureComputer(plan) to get full 15m grid.
+    - Loads precomputed features (15m grid) from cfg.features.precomputed.path.
     - Applies scaler (time-safe rolling/ewm, or sklearn fit on train windows only).
     - Splits events by t0 alignment time using the given fold masks on df_events.index.
     """
@@ -399,31 +665,36 @@ def make_event_loaders_for_fold(df_events: pd.DataFrame,
     # === Split event index (t0 times) into train/val/test ===
     tr_idx, va_idx, te_idx = split_fold_to_indices(df_events, fold, cfg)
 
-    # === Compute full-grid features via FeatureComputer (or reuse precomputed) ===
-    if pre_feat_df is None:
-        raw_path = cfg["data"]["path"]
-        index_col = cfg["data"]["index_col"]
-        freq = cfg["data"]["freq"]
-
-        if str(raw_path).endswith(".csv"):
-            df_raw = pd.read_csv(raw_path)
-        elif str(raw_path).endswith(".parquet"):
-            df_raw = pd.read_parquet(raw_path)
-        else:
-            raise ValueError("data.path must be .csv or .parquet")
-
-        lib = IndicatorLibrary(df_raw, freq_check=freq, prefer_time_col=index_col)
-        cache_dir = cfg["features"]["cache_dir"]
-        worker_tag = os.environ.get("WORKER_TAG", "").strip()
-        if worker_tag:
-            cache_dir = os.path.join(cache_dir, worker_tag)
-        fc = FeatureComputer(lib, cache_dir=cache_dir)
-        plan = cfg["features"]["plan"]
-        feat_df = fc.compute(plan, cfg)
-    else:
+    # === Load full-grid features from precomputed file only ===
+    if pre_feat_df is not None:
         feat_df = pre_feat_df.copy()
+    else:
+        pre_path = cfg["data"]["path"]
+        if not pre_path:
+            raise ValueError("event 模式需要 config.features.precomputed.path 指定預算特徵檔")
+        p = str(pre_path)
+        if p.endswith(".csv"):
+            feat_df = pd.read_csv(p)
+        elif p.endswith(".parquet"):
+            feat_df = pd.read_parquet(p)
+        else:
+            raise ValueError("features.precomputed.path 只支援 .csv 或 .parquet")
+        if "datetime" in feat_df.columns:
+            idx = pd.to_datetime(feat_df["datetime"], errors="coerce", utc=True)
+            feat_df = feat_df.drop(columns=["datetime"]) 
+            feat_df.index = idx
+        elif "timestamp" in feat_df.columns:
+            ts = pd.to_numeric(feat_df["timestamp"], errors="coerce").astype("Int64")
+            unit = "ms" if (ts.dropna().iloc[0] if len(ts.dropna()) else 0) > 1_000_000_000_000 else "s"
+            idx = pd.to_datetime(ts, unit=unit, utc=True)
+            feat_df = feat_df.drop(columns=["timestamp"]) 
+            feat_df.index = idx
+        feat_df = feat_df.sort_index()
+        feat_df = feat_df[~feat_df.index.duplicated(keep="last")]
 
     # Restrict to selected features only (ensure order)
+    if not feat_cols:
+        feat_cols = select_plan_columns(feat_df, cfg)
     feat_df = feat_df.loc[:, [c for c in feat_cols if c in feat_df.columns]].astype(np.float32)
 
     # === Build scaler ===

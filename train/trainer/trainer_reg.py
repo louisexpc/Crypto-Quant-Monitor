@@ -146,12 +146,13 @@ def train_one_fold(
         m_va = compute_regression_metrics(y_va, y_pred_va)
 
         # 組合指標（Optuna 主目標 / Early-stop 也可用）
+        cfg_reg_loss = cfg["loss"]["reg"]
         val_mixed, comps = mixed_objective(
             y_true=y_va,
             y_pred=y_pred_va,
-            alpha=float(cfg["loss"]["alpha"]),
-            beta=float(cfg["loss"]["beta"]),
-            ema_decay=float(cfg["loss"]["ema_decay"]),
+            alpha=float(cfg_reg_loss["alpha"]),
+            beta=float(cfg_reg_loss["beta"]),
+            ema_decay=float(cfg_reg_loss["ema_decay"]),
         )
         m_va["pearson_global"] = comps["pearson"]
         m_va["spearman_global"]  = comps.get("spearman", np.nan)   # NEW
