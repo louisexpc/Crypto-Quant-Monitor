@@ -347,18 +347,18 @@ def triple_barrier_labels(
 
                 decided = True; break
 
-            elif hit_pt and out.at[eid, 't0'] == t_open:
+            elif hit_pt :
                 out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 1.0
-                if side == -1:
-                    # print(f"hit pt事件 :\nt0 = {t0}\nt1 = {t_open}\nopen: {row['entry_price']}\nlow : {L}\npt:{pt_price}")
-                    pass
+                # if side == -1:
+                #     # print(f"hit pt事件 :\nt0 = {t0}\nt1 = {t_open}\nopen: {row['entry_price']}\nlow : {L}\npt:{pt_price}")
+                #     pass
                 decided = True; break
 
-            elif hit_sl and out.at[eid, 't0'] == t_open:
+            elif hit_sl:
                 out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 0.0
-                if side == -1:
-                    # print(f"hit sl事件 : \nt0 = {t0}\nt1 = {t_open}\nopen: {row['entry_price']}\nhigh : {H}\nsl:{sl_price}")
-                    pass
+                # if side == -1:
+                #     # print(f"hit sl事件 : \nt0 = {t0}\nt1 = {t_open}\nopen: {row['entry_price']}\nhigh : {H}\nsl:{sl_price}")
+                #     pass
                 decided = True; break
 
         if not decided:
@@ -383,14 +383,14 @@ if __name__ == "__main__":
 
     lookback = 36
     vol_method = "atr"  # "ewma" or "atr"
-    # raw_signals_df =generate_signals(
-    #     df = df,
-    #     lookback = lookback,
-    #     symbol = "BTCUSDT",
-    #     timeframe = "1h",
-    #     volume_ema_window = 10,
-    # )
-    raw_signals_df = pd.read_csv("../data/debug_raw_signals.csv")
+    raw_signals_df =generate_signals(
+        df = df,
+        lookback = lookback,
+        symbol = "BTCUSDT",
+        timeframe = "1h",
+        volume_ema_window = 10,
+    )
+   
     labels_df = triple_barrier_labels(
         df=df,
         low_timeframe_df=low_timeframe_df,
