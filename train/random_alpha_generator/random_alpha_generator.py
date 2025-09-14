@@ -8,7 +8,7 @@ import random
 import copy
 from typing import Any, List, Tuple
 from node import Node, Leaf, OpNode
-
+import json, time
 
 # ================== 樹構造函數 ==================
 
@@ -31,30 +31,98 @@ def random_tree(depth=3, terminals=['open', 'close', 'high', 'low', 'volume'],
         return OpNode(operator, left, right)
 
 # ================== 評估函數 ==================
+# ========= 安全版工具 =========
+def safe_corr(x, y, use_rank=False, min_n=10, eps=1e-12):
+    import numpy as np, pandas as pd
+    x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if x.size < min_n: return np.nan
+    if use_rank:
+        rx = pd.Series(x).rank(pct=False).to_numpy()
+        ry = pd.Series(y).rank(pct=False).to_numpy()
+        x, y = rx, ry
+    xm, ym = x.mean(), y.mean()
+    xc, yc = x - xm, y - ym
+    sx = np.sqrt((xc * xc).mean()); sy = np.sqrt((yc * yc).mean())
+    if not np.isfinite(sx) or not np.isfinite(sy) or sx < eps or sy < eps:
+        return np.nan
+    cov = (xc * yc).mean()
+    return cov / (sx * sy)
 
-def calc_ic(signal, returns):
-    """計算信息系數IC"""
-    if signal is None or signal.isnull().all():
-        return np.nan
-    combined = pd.concat([signal, returns], axis=1).dropna()
-    if combined.empty or len(combined) < 10:
-        return np.nan
-    return combined.iloc[:,0].corr(combined.iloc[:,1])
+def daily_rank_ic(df, date_col, alpha_col, ret_col, min_n=20):
+    out, idx = [], []
+    for d, g in df[[date_col, alpha_col, ret_col]].dropna().groupby(date_col):
+        a = g[alpha_col].to_numpy(); r = g[ret_col].to_numpy()
+        if len(a) < min_n or pd.Series(a).nunique() < 2 or pd.Series(r).nunique() < 2:
+            out.append(np.nan)
+        else:
+            out.append(safe_corr(a, r, use_rank=True, min_n=min_n))
+        idx.append(d)
+    return pd.Series(out, index=idx).sort_index()
+
+def safe_sharpe(strategy_returns, ann=252, eps=1e-12):
+    r = pd.Series(strategy_returns, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if r.size < 2: return np.nan
+    mu = r.mean(); sd = r.std(ddof=1)
+    if not np.isfinite(sd) or sd < eps: return np.nan
+    return mu / sd * np.sqrt(ann)
+# ========= /安裝結束 =========
+
+
+def calc_ic(signal, returns, use_rank=False, min_n=10):
+    """時間序列 IC（單標的）；若改做截面 RankIC，見下方備註。"""
+    if signal is None: return np.nan
+    s = pd.concat([signal, returns], axis=1).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(s) < min_n: return np.nan
+    return safe_corr(s.iloc[:,0].values, s.iloc[:,1].values, use_rank=use_rank, min_n=min_n)
 
 def calc_sharpe(signal, returns):
-    """計算基於信號的策略夏普比率"""
-    if signal is None or signal.isnull().all():
-        return np.nan
-    
-    # 簡化策略：信號>0做多，<0做空
-    positions = np.sign(signal.fillna(0))
-    strategy_returns = positions.shift(1) * returns
-    strategy_returns = strategy_returns.dropna()
-    
-    if len(strategy_returns) == 0:
-        return np.nan
-    
-    return strategy_returns.mean() / strategy_returns.std() * np.sqrt(252)
+    """信號多空策略的 Sharpe（安全版）"""
+    if signal is None: return np.nan
+    positions = np.sign(pd.Series(signal).fillna(0))
+    strategy_returns = (positions.shift(1) * returns).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(strategy_returns) == 0: return np.nan
+    return safe_sharpe(strategy_returns)
+
+# ================== 儲存工具 =======================
+# --- 序列化 ---
+def node_to_dict(node):
+    from node import Leaf, OpNode
+    if isinstance(node, Leaf):
+        return {"type": "Leaf", "value": node.value}
+    elif isinstance(node, OpNode):
+        d = {
+            "type": "OpNode",
+            "operator": node.operator,
+            "arity": getattr(node, "arity", None),
+            "left": node_to_dict(node.left) if getattr(node, "left", None) is not None else None,
+            "right": node_to_dict(node.right) if getattr(node, "right", None) is not None else None,
+        }
+        # 若你真的有三元子樹（例如 correlation 的 window），一併存（可選）
+        if hasattr(node, "third") and node.third is not None:
+            d["third"] = node_to_dict(node.third)
+        return d
+    else:
+        raise TypeError(f"Unknown node type: {type(node)}")
+
+# --- 反序列化 ---
+def node_from_dict(d):
+    from node import Leaf, OpNode
+    t = d["type"]
+    if t == "Leaf":
+        return Leaf(d["value"])
+    elif t == "OpNode":
+        left  = node_from_dict(d["left"])  if d.get("left")  is not None else None
+        right = node_from_dict(d["right"]) if d.get("right") is not None else None
+        opn = OpNode(d["operator"], left, right)
+        # 可選：若你支援三元，還原 third
+        if "third" in d and d["third"] is not None:
+            opn.third = node_from_dict(d["third"])
+        return opn
+    else:
+        raise ValueError(f"Unknown dict type: {t}")
+
 
 # ================== 遺傳演算法組件 ==================
 
@@ -65,6 +133,7 @@ class Individual:
         self.fitness = None
         self.ic = None
         self.sharpe = None
+        self.signature = None
 
     def evaluate(self, df, returns, fitness_type='ic'):
         """評估個體適應度"""
@@ -87,6 +156,109 @@ class Individual:
             self.fitness = 0
         
         return self.fitness
+    
+    def show(self) -> str:
+        """
+        將 alpha 公式樹轉為可閱讀字串（中序表示）
+        """
+        def _fmt_const(v):
+            # 盡量印成整數樣式；否則用短格式浮點
+            if isinstance(v, (int, np.integer)):
+                return str(int(v))
+            if isinstance(v, (float, np.floating)):
+                return str(int(v)) if float(v).is_integer() else f"{float(v):.6g}"
+            return str(v)
+
+        def _visit(node: Node) -> str:
+            from typing import Optional
+            if isinstance(node, Leaf):
+                return node.value if isinstance(node.value, str) else _fmt_const(node.value)
+
+            if isinstance(node, OpNode):
+                op = node.operator
+                arity = node.arity
+
+                # --- 算術（中序，強制括號以保結構） ---
+                if op in {"+", "-", "*", "/"}:
+                    left = _visit(node.left)
+                    right = _visit(node.right)
+                    return f"({left} {op} {right})"
+
+                # --- 一元函數：函數式表示 ---
+                if arity == 1:
+                    return f"{op}({_visit(node.left)})"
+
+                # --- 需要 window 的二元（series, window） ---
+                win_ops = {
+                    "rolling_mean","rolling_std",
+                    "signedpower","delay",
+                    "delta","decay_linear","ts_stddev","ts_sum","ts_argmax","ts_argmin",
+                    "ts_product","ts_rank","ts_max","ts_min","ts_mean","ts_wma",
+                    "ts_highday","ts_lowday",
+                }
+                if op in win_ops:
+                    return f"{op}({_visit(node.left)}, {_visit(node.right)})"
+
+                # --- 雙變量統計（series, series[, maybe window]) ---
+                if op in {"covariance", "correlation"}:
+                    left = _visit(node.left)
+                    right = _visit(node.right)
+                    # 若樹節點真的有第三參數（可選）就一併輸出
+                    third = getattr(node, "third", None)
+                    if isinstance(third, Node) and third is not None:
+                        return f"{op}({left}, {right}, {_visit(third)})"
+                    return f"{op}({left}, {right})"
+
+                # --- 其它：通用函數式回退 ---
+                args = []
+                if node.left is not None:
+                    args.append(_visit(node.left))
+                if node.right is not None:
+                    args.append(_visit(node.right))
+                return f"{op}(" + ", ".join(args) + ")"
+
+            # 不期望型別
+            return "<?>"
+
+        return _visit(self.tree)
+    
+    def to_dict(self):
+        return {
+            "tree": node_to_dict(self.tree),
+            "metrics": {
+                "fitness": self.fitness,
+                "ic": self.ic,
+                "sharpe": self.sharpe,
+            },
+            "meta": {
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "fitness_type": getattr(self, "fitness_type", None),
+                "operator_set": getattr(self, "operator_set", None),
+                "depth_limit": getattr(self, "depth", None),
+                "signature": getattr(self, "signature", None),  # 有的話
+            },
+            "formula_str": self.show(),  # 方便人看
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        ind = cls(node_from_dict(d["tree"]))
+        # 指標在重新 evaluate 後會更新；也可先灌進來供顯示
+        m = d.get("metrics", {})
+        ind.fitness = m.get("fitness", None)
+        ind.ic = m.get("ic", None)
+        ind.sharpe = m.get("sharpe", None)
+        ind.signature = d.get("meta", {}).get("signature", None)
+        return ind
+
+def save_alpha(ind: Individual, path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(ind.to_dict(), f, ensure_ascii=False, indent=2)
+
+def load_alpha(path: str) -> Individual:
+    with open(path, "r", encoding="utf-8") as f:
+        d = json.load(f)
+    return Individual.from_dict(d)
 
 class GeneticAlphaSolver:
     """遺傳演算法主體"""
@@ -97,13 +269,14 @@ class GeneticAlphaSolver:
             generations:int=10, 
             fitness_type:str='ic', 
             point_mutation_rate:float=0.3, 
-            population_size:int =20, 
+            crossover_rate:float=0.7,
+            population_size:int =50, 
+            tournament_size:int=5,
             depth:int=3,
             population = None | list[Individual],
             operator_set : list[str] = ["+", "-", "*", "/", "sqrt", "log", "inverse", "sigmoid",
-                    "rank", "scale", "signedpower", "delay", "covariance", "correlation", "delta",
-                    "decay_linear", "ts_stddev", "ts_sum", "ts_argmax", "ts_argmin", "ts_product",
-                    "ts_rank", "ts_max", "ts_min", "ts_mean", "ts_wma", "ts_high", "ts_low"],
+                "rank", "scale", "signedpower", "delay", "covariance", "correlation", "delta",
+                "decay_linear"],
             terminal_set : list[str] = ["open", "close", "high", "low", "volume"]
         ):
         self.df = df
@@ -116,21 +289,24 @@ class GeneticAlphaSolver:
         self.operator_set = operator_set
         self.terminal_set = terminal_set
         self.depth = depth
+        self.tournament_size = tournament_size
+
+        self.crossover_rate = crossover_rate
 
         """
-        根據論文描述，初始種群應該是簡單結構的 alpha 公式，若沒有指定，則隨機生成
+        根據論文描述，初始種群應該是簡單結構的 alpha 公式，若沒有指定，則隨機生成一個當作固定結構 alpha
         """
         if population is None:
-            self.population = [Individual(random_tree()) for _ in range(population_size)]
+            self.population = [Individual(random_tree())]
         else:
             self.population = population
 
 
 
-    def restrictedCrossover(self, parent1:Individual, parent2:Individual)-> Tuple[Individual, Individual]:
+    def restrictedCrossover(self, parent1:Individual, parent2:Individual)-> Tuple[Individual, Individual] | None:
         # 1) 檢查整體結構相容（呼叫你已有的 _identical_structure）
         if not self._identical_structure(parent1.tree, parent2.tree):
-            return parent1, parent2
+            return None
 
         # 2) deep copy 以避免 alias
         treeA = copy.deepcopy(parent1.tree)
@@ -148,7 +324,7 @@ class GeneticAlphaSolver:
 
         if not nodesA or not nodesB or len(nodesA) != len(nodesB):
             # 若數量不符，退回原本（雖然 _identical_structure 應確保相等）
-            return child1, child2
+            return None
 
         # 4) 隨機挑一個 index（即同一位置）
         idx = random.randrange(len(nodesA))
@@ -166,9 +342,9 @@ class GeneticAlphaSolver:
         new_tree2 = self._replace_subtree_by_path(child2.tree, pathB, subtreeA_copy)
 
         # 6) 驗證 depth 或其他 global constraint
-        if new_tree1.tree_depth() > self.depth or new_tree2.tree_depth() > self.depth:
+        if new_tree1.treeDepth() > self.depth or new_tree2.treeDepth() > self.depth:
             # 拒絕此次 crossover（或做 retry 機制）
-            return parent1, parent2  # 或 return child1, child2 unchanged
+            return None 
 
         # 7) 如果一切通過，回傳新的 Individual
         child1.tree = new_tree1
@@ -234,7 +410,7 @@ class GeneticAlphaSolver:
         if hasattr(node, "right"):
             self._set_parent_recursive(node.right, node)
     
-    def _identical_structure(self, node1:Node, node2:Node):
+    def _identical_structure(self, node1:Node, node2:Node, mode :str = 'relaxed')-> bool:
         """檢查兩個子樹是否結構相同: 
         簡化版，僅適用當前的運算符集(不超過二元的運算符)，未來拓展需要考量更多情況：
         - 葉節點（Leaf）要比較 terminal_role，而非單純回傳 True
@@ -243,16 +419,31 @@ class GeneticAlphaSolver:
         - 加入 strict/relaxed 模式
         - 交叉前後應有後驗驗證（validator）
         - 避免只比對 child_roles 的 list 等於
+
+        Args:
+            - node1 (Node): 樹1的根節點
+            - node2 (Node): 樹2的根節點
+            - mode (str): 'strict' or 'relaxed' 模式
         """
+        if mode not in ['strict', 'relaxed']:
+            raise ValueError("mode must be 'strict' or 'relaxed'")
+        
         if type(node1) != type(node2):
             return False
         if isinstance(node1, Leaf):
             if  type(node1.value) == type(node2.value):
-                return True
+                if mode == 'strict':
+                    return node1.value == node2.value
+                elif mode == 'relaxed':
+                    return True
             else:
                 return False
             
         if isinstance(node1, OpNode):
+
+            if mode == 'strict':
+                if node1.operator != node2.operator:
+                    return False
 
             if node1.arity!= node2.arity:
                 return False
@@ -269,7 +460,9 @@ class GeneticAlphaSolver:
 
     def pointMutation(self, individual:Individual):
         """點突變：隨機改變樹中的一個節點"""
-        self._pointMutation(individual.tree)
+        ind_copy = copy.deepcopy(individual)
+        self._pointMutation(ind_copy.tree)
+        return ind_copy
 
     def _pointMutation(self, node:Node):
         """遞迴實現點突變: 單點變異版本"""
@@ -292,15 +485,19 @@ class GeneticAlphaSolver:
                 self._pointMutation(node.right)
                 
 
-
-
-    def selection(self, k=3):
+    def selection(self, parents: List[Individual]=None) -> Individual:
         """錦標賽選擇"""
-        candidates = random.sample(self.population, k)
-        return max(candidates, key=lambda x: x.fitness if x.fitness else 0)
+        if len(parents) <= self.tournament_size:
+            size = len(parents)
+        else:
+            size = self.tournament_size
+
+        tournament = random.sample(parents, size)
+        winner = max(tournament, key=lambda x: x.fitness if x.fitness else 0)
+        return copy.deepcopy(winner)
 
     def evolve(self):
-        """主進化循環
+        """主進化循環 : 實務上這裡應該平行化
         Algorithm 1: Warm Start GP Framework
         Input:
             F(x)        : Fitness function
@@ -365,56 +562,146 @@ class GeneticAlphaSolver:
         Return best individual from Pop(t)
 
         """
-        for gen in range(self.generations):
-            # 評估所有個體
-            # 在論文中預設初始只會有一個
-            # 實務上這邊應該要平行化
-            if len(self.population) == 1 :
-                ind = self.population[0]
-                if gen == 0 or gen== 1:
-                    # 初始兩代只能突變
-                    ind.evaluate(self.df, self.returns, self.fitness_type)
-                    print(f"Gen {gen+1}: Fitness={ind.fitness:.4f}, IC={ind.ic:.4f}, Sharpe={ind.sharpe:.4f}")
-                    new_population = [ind]
-                    while len(new_population) < self.population_size:
-                        parent = self.selection()
-                        child = copy.deepcopy(parent)
-                        self.pointMutation(child)
-                        new_population.append(child)
-                    self.population = new_population
+        for ind in self.population:
+            if ind.fitness is None:
+                ind.evaluate(self.df, self.returns, self.fitness_type)
+
+        # Eealy Stop 機制
+        best_finess = max(ind.fitness if ind.fitness else 0 for ind in self.population)
+        tolerance_trials = 20
+        no_improvement_count = 0
+
+        for gen in range(self.generations) :
+            # Step 1: 保留前一代的最佳個體 (elitism)
+            parents = [copy.deepcopy(ind) for ind in self.population]
+            parents.sort(key=lambda x: x.fitness if x.fitness is not None else float('-inf'), reverse=True)
+            elite = copy.deepcopy(parents[0])
+            
+            new_offspring = [elite]  # 保留最佳個體
+
+            # Fallback 機制，避免無限迴圈
+            max_trials = self.population_size * 20
+            trials = 0
+
+
+            while len(new_offspring) < self.population_size and trials < max_trials:
+                # Step 2: 決定使用哪種操作
+                operation = None
+                if len(parents) == 1:
+                    # Init: only used Point mutation 來增長族群
+                    operation = 'point_mutation'
+                else:
+                    operation = random.choices(['crossover', 'point_mutation'], weights=[self.crossover_rate, self.point_mutation_rate])[0]
+
+              
+                # Step 3: 依據操作產生 offspring
+                if operation == 'crossover':
+                    # 進行交叉操作
+                    parent1 = self.selection(parents)
+                    parent2 = self.selection(parents)
+                    childs = self.restrictedCrossover(copy.deepcopy(parent1), copy.deepcopy(parent2))
+
+                    if childs is None:
+                        # Fallback: 若交叉失敗，則改用點突變
+                        parent = self.selection(parents)
+                        child = self.pointMutation(parent)
+                        # 只加入不重複的個體 and check population size
+                        is_duplicate = False
+                        for ind in new_offspring:
+                            if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
+                                is_duplicate = True
+                                break
+                        if not is_duplicate and len(new_offspring) < self.population_size:
+                            new_offspring.append(child)
+                    else:
+                        # 只加入不重複的個體 and check population size
+                        for child in childs:
+                            is_duplicate = False
+                            for ind in new_offspring:
+                                if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
+                                    is_duplicate = True
+                                    break
+                            if not is_duplicate and len(new_offspring) < self.population_size:
+                                new_offspring.append(child)
+               
+                    
+                elif operation == 'point_mutation':
+                    # 進行點突變操作
+                    parent = self.selection(parents)
+                    child = self.pointMutation(parent)
+                    # 只加入不重複的個體 and check population size
+                    is_duplicate = False
+                    for ind in new_offspring:
+                        if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
+                            is_duplicate = True
+                            break
+                    if not is_duplicate and len(new_offspring) < self.population_size:
+                        new_offspring.append(child)
+                else:
+                    raise ValueError("Unknown operation")
+
+                # Step 4: 避免重複個體 : 採用嚴格比對
+                new_offspring_set = []
+                for i, child in enumerate(new_offspring):
+                    is_duplicate = False
+
+                    # 避免移除 elite
+                    if i == 0:
+                        new_offspring_set.append(child)
+                        continue
+
+                    for ind in parents:
+                        if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
+                            is_duplicate = True
+                            print(f"[Warning] Duplicate individual detected and skipped. Child: {child.show()} matches Parent: {ind.show()}")
+                            break
+                    if not is_duplicate:
+                        new_offspring_set.append(child)
+                   
+                        
+
+                if len(new_offspring_set) == 0:
+                    trials += 1
+                    continue  # 若全是重複，則重試
+                else:
+                    trials = 0  # 成功產生非重複個體，重置計數器
+                new_offspring = new_offspring_set
+
+            self.population = new_offspring
+
+            # Step 5: 計算新族群的適應度
+            for ind in self.population:
+                ind.evaluate(self.df, self.returns, self.fitness_type)
+            
+            self.population.sort(key=lambda x: x.fitness if x.fitness else 0, reverse=True)
+            best = self.population[0]
+            self.best_history.append({
+                'generation': gen + 1,
+                'fitness': best.fitness,
+                'ic': best.ic,
+                'sharpe': best.sharpe
+            })
+
+            print(f"Gen {gen+1}: {best.show()} Best Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}")
+
+            # Early Stopping 檢查
+            current_best_fitness = best.fitness if best.fitness else 0
+            if current_best_fitness > best_finess:
+                best_finess = current_best_fitness
+                no_improvement_count = 0
             else:
-                # 正常的種群迭代
-                for ind in self.population:
-                    ind.evaluate(self.df, self.returns, self.fitness_type)
-                
-                # 排序並記錄最佳個體
-                self.population.sort(key=lambda x: x.fitness if x.fitness else 0, reverse=True)
-                best = self.population[0]
-                self.best_history.append({
-                    'generation': gen + 1,
-                    'fitness': best.fitness,
-                    'ic': best.ic,
-                    'sharpe': best.sharpe
-                })
-                
-                print(f"Gen {gen+1}: Best Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}")
-                
-                # 生成新種群
-                new_population = self.population[:self.population_size//4]  # 保留菁英
-                
-                while len(new_population) < self.population_size:
-                    parent1 = self.selection()
-                    parent2 = self.selection()
-                    child = self.crossover(parent1, parent2)
-                    
-                    if random.random() < self.mutation_rate:
-                        self.mutate(child)
-                    
-                    new_population.append(child)
-                
-                self.population = new_population
-        
-        return self.population[0]
+                no_improvement_count += 1
+            
+            if no_improvement_count >= tolerance_trials:
+                print(f"No improvement in fitness for {tolerance_trials} consecutive generations. Stopping early at generation {gen+1}.")
+                break
+
+        # Step 6: 演化結束，回傳最佳個體
+        self.population.sort(key=lambda x: x.fitness if x.fitness else 0, reverse=True)
+        best = self.population[0]
+        print(f"Final Best: Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}")
+
+        return best
 
 # ================== 使用示例 ==================
 
@@ -431,15 +718,47 @@ if __name__ == "__main__":
     }, index=dates)
     
     returns = data['close'].pct_change().shift(-1)
+
+    # Test Alpha 101 : ***Alpha#40: ((-1 * rank(stddev(high, 10))) * correlation(high, volume, 10)) ***
+    alpha4_tree = OpNode('*',
+                    OpNode('*',
+                        Leaf(-1),
+                        OpNode('rank',
+                            OpNode('rolling_std',
+                                Leaf('high'),
+                                Leaf(10)
+                            )
+                        )
+                    ),
+                    OpNode('correlation',
+                        Leaf('high'),
+                        Leaf('volume'),
+                        Leaf(10)
+                    )
+                )
+    test_individual = Individual(alpha4_tree)
+    fitness = test_individual.evaluate(data, returns, fitness_type='ic')
+    print("Alpha#4 Formula:", test_individual.show())
+    print(f"Alpha#4 Fitness: {fitness:.4f}, IC: {test_individual.ic:.4f}, Sharpe: {test_individual.sharpe:.4f}")
+
     
-    # 執行遺傳演算法
+    # # 執行遺傳演算法
     solver = GeneticAlphaSolver(
         df=data, 
         returns=returns, 
-        population_size=15, 
-        generations=5,
-        fitness_type='ic'
+        population_size=100, 
+        generations=100,
+        fitness_type='ic',
+        population=[test_individual],  # 使用 Alpha#4 作為初始種群
+        depth=10,
+        point_mutation_rate=0.4,
     )
     
     best_alpha = solver.evolve()
-    print(f"\n最佳Alpha - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
+    print(f"\n最佳Alpha {best_alpha.show()} - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
+
+    # 儲存最佳Alpha
+    save_alpha(best_alpha, "best_evolved_alpha.json")
+    # 載入最佳Alpha
+    loaded_alpha = load_alpha("best_evolved_alpha.json")
+    print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")

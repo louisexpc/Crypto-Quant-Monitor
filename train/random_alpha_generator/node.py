@@ -32,9 +32,10 @@ OP_META = {
     'covariance':  {"arity":2, "node_class":"bivar", "child_roles":["series","series"], "opts":"maybe_third_window"},
     'correlation': {"arity":2, "node_class":"bivar", "child_roles":["series","series"], "opts":"maybe_third_window"},
 
-    # ts_* family (unary with window param)
+    # ts_* family (unary with window param): 
     'delta':     {"arity":2, "node_class":"time-stat","child_roles":["series","window"]},
     'decay_linear':{"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 尚未啟用
     'ts_stddev': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
     'ts_sum':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
     'ts_argmax': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
@@ -69,7 +70,7 @@ class Node:
 
 class Leaf(Node):
     """葉子節點：數據欄位或常數"""
-    def __init__(self, value, parent=None):
+    def __init__(self, value: str | float, parent=None):
         super().__init__(parent=parent)
         self.value = value
 
@@ -92,8 +93,11 @@ class OpNode(Node):
     運算符節點
     目前支援的運算符包括：["+", "-", "*", "/", "sqrt", "log", "inverse", "sigmoid",
     "rank", "scale", "signedpower", "delay", "covariance", "correlation", "delta",
-    "decay_linear", "ts_stddev", "ts_sum", "ts_argmax", "ts_argmin", "ts_product",
-    "ts_rank", "ts_max", "ts_min", "ts_mean", "ts_wma", "ts_high", "ts_low"]
+    "decay_linear"]
+
+    TS 系列函數（暫未啟用）：
+    ["ts_stddev", "ts_sum", "ts_argmax", "ts_argmin", "ts_product", "ts_rank",
+    "ts_max", "ts_min", "ts_mean", "ts_wma", "ts_highday", "ts_lowday"]
     """
     def __init__(self, operator, left: Node, right: Node = None, parent: Node = None):
         super().__init__(left=left, right=right, parent=parent)
@@ -106,6 +110,8 @@ class OpNode(Node):
         self.node_class = self.op_meta["node_class"]
         self.child_roles = self.op_meta["child_roles"]
         self.opts = self.op_meta.get("opts", None)
+
+        self.eps = 1e-12  # 用於保護性運算
 
 
     def eval(self, df):
@@ -175,42 +181,43 @@ class OpNode(Node):
         elif self.operator == 'decay_linear':
             d = int(right_val.iloc[0]) if right_val is not None else 5
             return self._decay_linear(left_val, d)
-        elif self.operator == 'ts_stddev':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_stddev(left_val, d)
-        elif self.operator == 'ts_sum':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_sum(left_val, d)
-        elif self.operator == 'ts_argmax':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_argmax(left_val, d)
-        elif self.operator == 'ts_argmin':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_argmin(left_val, d)
-        elif self.operator == 'ts_product':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_product(left_val, d)
-        elif self.operator == 'ts_rank':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_rank(left_val, d)
-        elif self.operator == 'ts_max':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_max(left_val, d)
-        elif self.operator == 'ts_min':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_min(left_val, d)
-        elif self.operator == 'ts_mean':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_mean(left_val, d)
-        elif self.operator == 'ts_wma':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_wma(left_val, d)
-        elif self.operator == 'ts_highday':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_highday(left_val, d)
-        elif self.operator == 'ts_lowday':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._ts_lowday(left_val, d)
+        # --- Bug To Fix: ---#
+        # elif self.operator == 'ts_stddev':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_stddev(left_val, d)
+        # elif self.operator == 'ts_sum':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_sum(left_val, d)
+        # elif self.operator == 'ts_argmax':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_argmax(left_val, d)
+        # elif self.operator == 'ts_argmin':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_argmin(left_val, d)
+        # elif self.operator == 'ts_product':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_product(left_val, d)
+        # elif self.operator == 'ts_rank':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_rank(left_val, d)
+        # elif self.operator == 'ts_max':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_max(left_val, d)
+        # elif self.operator == 'ts_min':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_min(left_val, d)
+        # elif self.operator == 'ts_mean':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_mean(left_val, d)
+        # elif self.operator == 'ts_wma':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_wma(left_val, d)
+        # elif self.operator == 'ts_highday':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_highday(left_val, d)
+        # elif self.operator == 'ts_lowday':
+        #     d = int(right_val.iloc[0]) if right_val is not None else 5
+        #     return self._ts_lowday(left_val, d)
         else:
             raise ValueError(f"Unsupported operator: {self.operator}")
 
@@ -228,7 +235,9 @@ class OpNode(Node):
         Return:
           - pd.Series 計算結果
         """
-        return x1 / x2.replace(0, np.nan)
+        den = x2.copy()
+        den = den.where(np.abs(den) > self.eps, np.nan)
+        return x1 / den
 
     def _protected_sqrt(self, x1: pd.Series):
         """
@@ -267,7 +276,8 @@ class OpNode(Node):
         Return:
           - pd.Series 計算結果
         """
-        return 1 / x1.replace(0, np.nan)
+        den = x1.where(np.abs(x1) > self.eps, np.nan)
+        return 1 / den
 
     def _sigmoid(self, x1: pd.Series):
         """
@@ -308,8 +318,10 @@ class OpNode(Node):
         Return:
           - pd.Series 標度後數據
         """
-        a = int(a)
-        return pd.Series(a * x1 / np.nansum(np.abs(x1)), index=x1.index)
+        den = np.nansum(np.abs(x1))
+        if not np.isfinite(den) or den < 1e-12:
+            return pd.Series(np.nan, index=x1.index)   # 或回 0
+        return pd.Series(a * x1 / den, index=x1.index)
 
     def _signedpower(self, x1: pd.Series, a=2):
         """
@@ -338,7 +350,11 @@ class OpNode(Node):
         Return:
           - pd.Series 延遲結果
         """
-        d = 2 if int(d) <= 0 else int(d)
+        try:
+            d = int(d)
+        except Exception:
+            d = 5
+        d = max(1, d)
         return x1.shift(periods=d)
 
     def _covariance(self, x1: pd.Series, x2: pd.Series, d=5):
@@ -355,7 +371,20 @@ class OpNode(Node):
           - pd.Series 滾動共變異數
         """
         d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).cov(x2)
+        # --- sanitize window ---
+        try:
+            d = int(d)
+        except Exception:
+            d = 5
+        d = max(1, d)
+
+        # --- align index & ensure float ---
+        x1 = pd.Series(x1, dtype="float64")
+        x2 = pd.Series(x2, dtype="float64")
+        x1, x2 = x1.align(x2, join="inner")
+
+        # --- rolling covariance ---
+        return x1.rolling(window=d, min_periods=d).cov(x2)
 
     def _correlation(self, x1: pd.Series, x2: pd.Series, d=5):
         """
@@ -370,8 +399,14 @@ class OpNode(Node):
         Return:
           - pd.Series 滾動相關係數
         """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).corr(x2)
+        d = max(2, int(d))
+        cov = x1.rolling(d, min_periods=d).cov(x2)
+        v1  = x1.rolling(d, min_periods=d).var()
+        v2  = x2.rolling(d, min_periods=d).var()
+        denom = np.sqrt(v1 * v2)
+        out = cov / denom
+        out[(denom<=1e-12) | (~np.isfinite(denom))] = np.nan
+        return out
 
     def _delta(self, x1: pd.Series, d=5):
         """
@@ -400,189 +435,205 @@ class OpNode(Node):
         Return:
           - pd.Series 線性衰減結果
         """
-        d = 2 if int(d) <= 0 else int(d)
-        weights = np.arange(1, d + 1)
-        weights = weights / weights.sum()
-        return x1.rolling(window=d).apply(lambda x: np.dot(x, weights))
+        try:
+            d = int(d)
+        except Exception:
+            d = 5
+        d = max(1, d)
 
-    def _ts_stddev(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動標準差
-        Formula:
-            rolling standard deviation over d periods
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動標準差
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d, min_periods=d).std()
+        w = np.arange(1, d + 1, dtype=float)  # 1..d, 最近期權重最大
 
-    def _ts_sum(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動求和
-        Formula:
-            rolling sum over d periods
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動求和
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d, min_periods=d).sum()
+        def _wavg(s: np.ndarray) -> float:
+            # s: ndarray 長度 d；可能含 NaN
+            m = np.isfinite(s)
+            if not m.any():
+                return np.nan
+            # 僅對有效位置計加權平均；權重與位置一一對應
+            num = np.nansum(s * w)
+            den = (w * m).sum()
+            return num / den if den > 0 else np.nan
 
-    def _ts_argmax(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動最大值位置
-        Formula:
-            position of maximum value in rolling window
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 最大值位置
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).apply(lambda x: x.argmax())
+        return x1.rolling(window=d, min_periods=d).apply(_wavg, raw=True)
+    
+    """    Bug To Fix:"""
+    # def _ts_stddev(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動標準差
+    #     Formula:
+    #         rolling standard deviation over d periods
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動標準差
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d, min_periods=d).std()
 
-    def _ts_argmin(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動最小值位置
-        Formula:
-            position of minimum value in rolling window
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 最小值位置
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).apply(lambda x: x.argmin())
+    # def _ts_sum(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動求和
+    #     Formula:
+    #         rolling sum over d periods
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動求和
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d, min_periods=d).sum()
 
-    def _ts_product(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動乘積
-        Formula:
-            rolling product over d periods
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動乘積
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).apply(lambda x: x.prod())
+    # def _ts_argmax(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動最大值位置
+    #     Formula:
+    #         position of maximum value in rolling window
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 最大值位置
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d).apply(lambda x: x.argmax())
 
-    def _ts_rank(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動排名
-        Formula:
-            rank of current value in rolling window
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動排名
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).rank(pct=True)
+    # def _ts_argmin(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動最小值位置
+    #     Formula:
+    #         position of minimum value in rolling window
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 最小值位置
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d).apply(lambda x: x.argmin())
 
-    def _ts_max(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動最大值
-        Formula:
-            rolling maximum over d periods
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動最大值
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d, min_periods=d).max()
+    # def _ts_product(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動乘積
+    #     Formula:
+    #         rolling product over d periods
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動乘積
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d).apply(lambda x: x.prod())
 
-    def _ts_min(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動最小值
-        Formula:
-            rolling minimum over d periods
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動最小值
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d, min_periods=d).min()
+    # def _ts_rank(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動排名
+    #     Formula:
+    #         rank of current value in rolling window
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動排名
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d).rank(pct=True)
 
-    def _ts_mean(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動平均值
-        Formula:
-            rolling mean over d periods
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 滾動平均值
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d, min_periods=d).mean()
+    # def _ts_max(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動最大值
+    #     Formula:
+    #         rolling maximum over d periods
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動最大值
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d, min_periods=d).max()
 
-    def _ts_wma(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列加權移動平均
-        Formula:
-            weighted moving average with linearly increasing weights
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 窗口大小 (int)
-        Return:
-          - pd.Series 加權移動平均
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        weights = np.arange(1, d + 1)
-        weights = weights / weights.sum()
-        return x1.rolling(window=d).apply(lambda x: np.dot(x, weights))
+    # def _ts_min(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動最小值
+    #     Formula:
+    #         rolling minimum over d periods
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動最小值
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d, min_periods=d).min()
 
-    def _ts_highday(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動最高點距離當前的天數
-        Formula:
-            days since highest value in rolling window
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 距離最高點天數
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).apply(lambda x: d - 1 - x.argmax())
+    # def _ts_mean(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動平均值
+    #     Formula:
+    #         rolling mean over d periods
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 滾動平均值
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d, min_periods=d).mean()
 
-    def _ts_lowday(self, x1: pd.Series, d=5):
-        """
-        Function Description :
-        時間序列滾動最低點距離當前的天數
-        Formula:
-            days since lowest value in rolling window
-        Args:
-          - x1: 輸入時間序列 (pd.Series)
-          - d: 滾動窗口大小 (int)
-        Return:
-          - pd.Series 距離最低點天數
-        """
-        d = 2 if int(d) <= 0 else int(d)
-        return x1.rolling(window=d).apply(lambda x: d - 1 - x.argmin())
+    # def _ts_wma(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列加權移動平均
+    #     Formula:
+    #         weighted moving average with linearly increasing weights
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 窗口大小 (int)
+    #     Return:
+    #       - pd.Series 加權移動平均
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     weights = np.arange(1, d + 1)
+    #     weights = weights / weights.sum()
+    #     return x1.rolling(window=d).apply(lambda x: np.dot(x, weights))
+
+    # def _ts_highday(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動最高點距離當前的天數
+    #     Formula:
+    #         days since highest value in rolling window
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 距離最高點天數
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d).apply(lambda x: d - 1 - x.argmax())
+
+    # def _ts_lowday(self, x1: pd.Series, d=5):
+    #     """
+    #     Function Description :
+    #     時間序列滾動最低點距離當前的天數
+    #     Formula:
+    #         days since lowest value in rolling window
+    #     Args:
+    #       - x1: 輸入時間序列 (pd.Series)
+    #       - d: 滾動窗口大小 (int)
+    #     Return:
+    #       - pd.Series 距離最低點天數
+    #     """
+    #     d = 2 if int(d) <= 0 else int(d)
+    #     return x1.rolling(window=d).apply(lambda x: d - 1 - x.argmin())
