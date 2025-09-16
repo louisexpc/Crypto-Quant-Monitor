@@ -9,6 +9,7 @@ import copy
 from typing import Any, List, Tuple
 from node import Node, Leaf, OpNode
 import json, time
+import talib
 
 # ================== 樹構造函數 ==================
 
@@ -31,8 +32,18 @@ def random_tree(depth=3, terminals=['open', 'close', 'high', 'low', 'volume'],
         return OpNode(operator, left, right)
 
 # ================== 評估函數 ==================
-# ========= 安全版工具 =========
-def safe_corr(x, y, use_rank=False, min_n=10, eps=1e-12):
+def safe_corr(x, y, use_rank: bool =False, min_n:int=10, eps:float=1e-12)-> float:
+    """
+    安全版相關係數計算: For 單一股票池時間序列與時間序列回報的相關性計算
+    若 use_rank=True，則計算 Rank Correlation（Spearman），若 False 則計算 Pearson
+    Args:
+    - x, y: 1D array-like
+    - use_rank: 是否使用秩相關
+    - min_n: 最小有效樣本數
+    - eps: 標準差下限，避免除以零
+    Returns:
+    - correlation coefficient or np.nan if invalid   
+    """
     import numpy as np, pandas as pd
     x = np.asarray(x, dtype=float); y = np.asarray(y, dtype=float)
     m = np.isfinite(x) & np.isfinite(y)
@@ -51,6 +62,7 @@ def safe_corr(x, y, use_rank=False, min_n=10, eps=1e-12):
     return cov / (sx * sy)
 
 def daily_rank_ic(df, date_col, alpha_col, ret_col, min_n=20):
+    """ 計算每日的 Rank IC: 目前無法使用 """
     out, idx = [], []
     for d, g in df[[date_col, alpha_col, ret_col]].dropna().groupby(date_col):
         a = g[alpha_col].to_numpy(); r = g[ret_col].to_numpy()
@@ -61,13 +73,24 @@ def daily_rank_ic(df, date_col, alpha_col, ret_col, min_n=20):
         idx.append(d)
     return pd.Series(out, index=idx).sort_index()
 
-def safe_sharpe(strategy_returns, ann=252, eps=1e-12):
+def safe_sharpe(strategy_returns, ann:int = 252, eps: float=1e-12)->float:
+    """
+    安全版 Sharpe 計算
+    Args:
+    - strategy_returns: 策略日收益率序列
+    - ann: 年化倍數（252交易日）
+    - eps: 標準差下限，避免除以零
+    Returns:
+    - Sharpe ratio or np.nan if invalid
+    """
     r = pd.Series(strategy_returns, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
     if r.size < 2: return np.nan
     mu = r.mean(); sd = r.std(ddof=1)
     if not np.isfinite(sd) or sd < eps: return np.nan
     return mu / sd * np.sqrt(ann)
-# ========= /安裝結束 =========
+
+
+# =========　API　=========
 
 
 def calc_ic(signal, returns, use_rank=False, min_n=10):
@@ -77,8 +100,16 @@ def calc_ic(signal, returns, use_rank=False, min_n=10):
     if len(s) < min_n: return np.nan
     return safe_corr(s.iloc[:,0].values, s.iloc[:,1].values, use_rank=use_rank, min_n=min_n)
 
-def calc_sharpe(signal, returns):
-    """信號多空策略的 Sharpe（安全版）"""
+def calc_sharpe(signal, returns)-> float:
+    """信號多空策略的 Sharpe（安全版）
+    備註：此為單標的時間序列 Sharpe，若要做截面 Sharpe，需先計算每日多空組合收益率序列，再計算其 Sharpe。
+
+    Args:
+    - signal: 時間序列信號（可為 pd.Series 或 np.ndarray）
+    - returns: 時間序列回報（可為 pd.Series 或 np.ndarray）
+    Returns:
+    - Sharpe ratio or np.nan if invalid
+    """
     if signal is None: return np.nan
     positions = np.sign(pd.Series(signal).fillna(0))
     strategy_returns = (positions.shift(1) * returns).replace([np.inf, -np.inf], np.nan).dropna()
@@ -707,58 +738,153 @@ class GeneticAlphaSolver:
 
 if __name__ == "__main__":
     # 生成測試數據
-    np.random.seed(42)
-    dates = pd.date_range('2020-01-01', periods=200, freq='D')
-    data = pd.DataFrame({
-        'open': np.random.uniform(10, 15, 200),
-        'close': np.random.uniform(10, 15, 200), 
-        'high': np.random.uniform(12, 18, 200),
-        'low': np.random.uniform(8, 12, 200),
-        'volume': np.random.uniform(100, 500, 200)
-    }, index=dates)
-    
+    # np.random.seed(42)
+    # dates = pd.date_range('2020-01-01', periods=200, freq='D')
+    # data = pd.DataFrame({
+    #     'open': np.random.uniform(10, 15, 200),
+    #     'close': np.random.uniform(10, 15, 200), 
+    #     'high': np.random.uniform(12, 18, 200),
+    #     'low': np.random.uniform(8, 12, 200),
+    #     'volume': np.random.uniform(100, 500, 200)
+    # }, index=dates)
+
+    """前處理"""
+    data = pd.read_csv('../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv', parse_dates=['datetime'], index_col='datetime')
     returns = data['close'].pct_change().shift(-1)
 
+    #Add Features
+    data[f"obv"] = talib.OBV(data['close'], data['volume'])
+    for n in [5,10,20]:
+        data[f"ema_{n}"] = talib.EMA(data['close'], timeperiod=n)
+        data[f"rsi_{n}"] = talib.RSI(data['close'], timeperiod=n)
+        data[f"atr_{n}"] = talib.ATR(data['high'], data['low'], data['close'], timeperiod=n)
+        data[f"cci_{n}"] = talib.CCI(data['high'], data['low'], data['close'], timeperiod=n)
+        data[f"mfi_{n}"] = talib.MFI(data['high'], data['low'], data['close'], data['volume'], timeperiod=n)
+        data[f"adx_{n}"] = talib.ADX(data['high'], data['low'], data['close'], timeperiod=n)
+        data[f"willr_{n}"] = talib.WILLR(data['high'], data['low'], data['close'], timeperiod=n)
+    feature_cols = data.columns.tolist()
+    feature_cols.remove('timestamp')  # 移除目標變數
+    print("Feature columns:", feature_cols)
+
+    """定義一些已知的 alpha 公式樹（可選）"""
+    alphas = [
+        # Alpha 1: -1 * correlation(volume, close, N)---成交量与收盘价在N日内的背离程度
+        OpNode('*',
+            Leaf(-1),
+            OpNode('correlation',
+                Leaf('volume'),
+                Leaf('close')
+            )
+        ),
+        # Alpha 2: -1 * correlation(delta(volume, 1), delta(close,1), N)---成交量变动与收盘价日内变动在N日内的背离程度
+        OpNode('*',
+            Leaf(-1),
+            OpNode('correlation',
+                OpNode('delta', Leaf('volume'), Leaf(1)),
+                OpNode('delta', Leaf('close'), Leaf(1))
+            )
+        ),
+        # Alpha 3: -1 * correlation(rank(delta(volume), 1)), rank(delta(close,1)), N)
+        OpNode('*',
+            Leaf(-1),
+            OpNode('correlation',
+                OpNode('rank', OpNode('delta', Leaf('volume'), Leaf(1))),
+                OpNode('rank', OpNode('delta', Leaf('close'), Leaf(1)))
+            )
+        ),
+        # Alpha 4: correlation(close,open,N)
+        OpNode('correlation',
+            Leaf('close'),
+            Leaf('open')
+        ),
+        # Alpha 5: (high + low)/2 - close
+        OpNode('-',
+            OpNode('/',
+                OpNode('+', Leaf('high'), Leaf('low')),
+                Leaf(2)
+            ),
+            Leaf('close')
+        ),
+
+        # Alpha 6: (2 * close - low - high) / ( high - low + 0.0001)
+        OpNode('/',
+            OpNode('-',
+                OpNode('*', Leaf(2), Leaf('close')),
+                OpNode('+', Leaf('low'), Leaf('high'))
+            ),
+            OpNode('+',
+                OpNode('-',
+                    Leaf('high'),
+                    Leaf('low')
+                ),
+                Leaf(0.0001)
+            )
+        ),
+    ]
+    # test_ind1 = OpNode('correlation',
+    #                     Leaf('high'),
+    #                     Leaf('volume'),
+    #                 )
+    # print(test_ind1.eval(data))
+    # test_ind2 = OpNode('rank',
+    #                         OpNode('rolling_std',
+    #                             Leaf('high'),
+    #                             Leaf(10)
+    #                         )
+    #                     )
+    # print(test_ind2.eval(data))
+    # test_ind3 = OpNode('*',test_ind2,Leaf(-1))
+    # print(test_ind3.eval(data))
+    # test_ind = OpNode('*',test_ind3,test_ind1)
+    # print(test_ind.eval(data))
     # Test Alpha 101 : ***Alpha#40: ((-1 * rank(stddev(high, 10))) * correlation(high, volume, 10)) ***
-    alpha4_tree = OpNode('*',
-                    OpNode('*',
-                        Leaf(-1),
-                        OpNode('rank',
-                            OpNode('rolling_std',
-                                Leaf('high'),
-                                Leaf(10)
-                            )
-                        )
-                    ),
-                    OpNode('correlation',
-                        Leaf('high'),
-                        Leaf('volume'),
-                        Leaf(10)
-                    )
-                )
-    test_individual = Individual(alpha4_tree)
-    fitness = test_individual.evaluate(data, returns, fitness_type='ic')
-    print("Alpha#4 Formula:", test_individual.show())
-    print(f"Alpha#4 Fitness: {fitness:.4f}, IC: {test_individual.ic:.4f}, Sharpe: {test_individual.sharpe:.4f}")
+    # alpha4_tree = OpNode('*',
+    #                 OpNode('*',
+    #                     Leaf(-1),
+    #                     OpNode('rank',
+    #                         OpNode('rolling_std',
+    #                             Leaf('high'),
+    #                             Leaf(10)
+    #                         )
+    #                     )
+    #                 ),
+    #                 OpNode('correlation',
+    #                     Leaf('high'),
+    #                     Leaf('volume'),
+    #                 )
+    #             )
+    # test_individual = Individual(alpha4_tree)
+    # fitness = test_individual.evaluate(data, returns, fitness_type='ic')
+    # print("Alpha#4 Formula:", test_individual.show())
+    # print(f"Alpha#4 Fitness: {fitness:.4f}, IC: {test_individual.ic:.4f}, Sharpe: {test_individual.sharpe:.4f}")
 
     
-    # # 執行遺傳演算法
-    solver = GeneticAlphaSolver(
-        df=data, 
-        returns=returns, 
-        population_size=100, 
-        generations=100,
-        fitness_type='ic',
-        population=[test_individual],  # 使用 Alpha#4 作為初始種群
-        depth=10,
-        point_mutation_rate=0.4,
-    )
-    
-    best_alpha = solver.evolve()
-    print(f"\n最佳Alpha {best_alpha.show()} - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
+    # # # 執行遺傳演算法
+    for i,ind in enumerate(alphas):
+        test_individual = Individual(ind)
+        print("Alpha Formula:", test_individual.show())
 
-    # 儲存最佳Alpha
-    save_alpha(best_alpha, "best_evolved_alpha.json")
-    # 載入最佳Alpha
-    loaded_alpha = load_alpha("best_evolved_alpha.json")
-    print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")
+        solver = GeneticAlphaSolver(
+            df=data, 
+            returns=returns, 
+            population_size=20, 
+            generations=100,
+            fitness_type='ic',
+            population=[test_individual],  # 使用 Alpha#4 作為初始種群
+            depth=5,
+            point_mutation_rate=0.4,
+            terminal_set=feature_cols  # 使用擴展後的特徵集
+        )
+        
+        best_alpha = solver.evolve()
+        print(f"\n最佳Alpha {best_alpha.show()} - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
+
+        if best_alpha.ic >= 0.3:
+            # 儲存最佳Alpha
+            save_alpha(best_alpha, f"best_evolved_alpha_from_predefined_{i}.json")
+
+    # # 儲存最佳Alpha
+    # save_alpha(best_alpha, "best_evolved_alpha.json")
+    # # 載入最佳Alpha
+    # loaded_alpha = load_alpha("best_evolved_alpha.json")
+    # print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")

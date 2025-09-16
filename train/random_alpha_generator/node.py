@@ -71,13 +71,14 @@ class Node:
 class Leaf(Node):
     """葉子節點：數據欄位或常數"""
     def __init__(self, value: str | float, parent=None):
+        """value: 欄位名稱（str）或常數值（float/int）"""
         super().__init__(parent=parent)
         self.value = value
 
     def eval(self, df) -> pd.Series:
         """
         Function Description :
-        評估葉子節點的值
+        評估葉子節點的值: 如果是欄位名稱，則返回該欄位的pd.Series； 如果是常數，則將常數 broadcast 成常數的pd.Series
         Args:
           - df: 輸入DataFrame
         Return:
@@ -113,6 +114,73 @@ class OpNode(Node):
 
         self.eps = 1e-12  # 用於保護性運算
 
+    #  ============= Helper Functions: 保護性運算，型態保護 =============
+
+    def _as_series(self, v, df_index) -> pd.Series:
+        if isinstance(v, pd.Series):
+            return v.astype(float)
+        if np.isscalar(v):
+            return pd.Series(float(v), index=df_index, dtype="float64")
+        raise TypeError(f"Expect Series or scalar, got {type(v)}")
+
+    def _align2(self, a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series]:
+        a = a.astype(float); b = b.astype(float)
+        return a.align(b, join="inner")
+
+    def _get_win_from_value(self, right_val, default = 1e-12, minwin=1, maxwin=252) -> int:
+        """right_val 可能是常數 Series 或 scalar；取首個有效值並夾限。"""
+        try:
+            if isinstance(right_val, pd.Series):
+                v = right_val.dropna()
+                w = int(round(v.iloc[0])) if len(v) else default
+            else:
+                w = int(round(float(right_val)))
+        except Exception:
+            w = default
+
+        return max(minwin, min(maxwin, w))
+    def _is_const_series(self, s: pd.Series) -> bool:
+        """
+        判斷 Series 是否為常數序列（允許少量 NaN）
+        Args:
+          - s: pd.Series
+        Return:
+            - bool: True if constant, False otherwise
+        """
+        # 允許有少量 NaN，僅用有限值判斷
+        v = s.to_numpy()
+        m = np.isfinite(v)
+        if not m.any():  # 全 NaN 視為「非可用常數參數」
+            return False
+        return np.nanstd(v[m]) < self.eps
+
+    # ================== Order Processing ==================
+
+    def _series_and_win_any_order(self, left_val, right_val, df_index, default=5) -> tuple[pd.Series, int] :
+        """
+        解析 (series, window) 的任意順序輸入：
+        - 其中一個是「真正的 series」；另一個是 scalar 或「常數 series」→ 視為 window。
+        - 若兩邊都是非常數 series → 拋錯（這種就不是 window 類運算）。
+        """
+        a = self._as_series(left_val, df_index)
+        b = self._as_series(right_val, df_index)
+
+        a_const = self._is_const_series(a)
+        b_const = self._is_const_series(b)
+
+        if not a_const and b_const:
+            w = self._get_win_from_value(b.dropna().iloc[0] if b.dropna().size else default, default)
+            return a, w
+        if a_const and not b_const:
+            w = self._get_win_from_value(a.dropna().iloc[0] if a.dropna().size else default, default)
+            return b, w
+        if a_const and b_const:
+            # 兩邊都是常數：任取一邊當 window、另一邊視為「常數 series」→ 其 rolling 有意義但少見
+            # 這裡預設使用 b 當 window，a 當 series
+            w = self._get_win_from_value(b.dropna().iloc[0] if b.dropna().size else default, default)
+            return a, w
+        # 兩邊都是變動的 series：這不是 window 類；讓上層報錯比較好
+        raise TypeError("Expected (series, window) but got (series, series). Provide a constant window Leaf on one side.")
 
     def eval(self, df):
         """
@@ -130,6 +198,7 @@ class OpNode(Node):
 
         # 基本運算符
         if self.operator == '+':
+
             return left_val + right_val
         elif self.operator == '-':
             return left_val - right_val
@@ -137,14 +206,16 @@ class OpNode(Node):
             return left_val * right_val
         elif self.operator == '/':
             return self._protected_division(left_val, right_val)
+
+        # 滾動函數 (series, window): 注意 Order
         elif self.operator == 'rolling_mean':
-            window = int(right_val.iloc[0]) if right_val is not None else 5
-            return left_val.rolling(window).mean()
+            series, window = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
+            return series.rolling(window, min_periods=window).mean()
         elif self.operator == 'rolling_std':
-            window = int(right_val.iloc[0]) if right_val is not None else 5
-            return left_val.rolling(window).std()
-        
-        # 數學函數
+            series, window = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
+            return series.rolling(window, min_periods=window).std()
+
+        # Uniray math 函數
         elif self.operator == 'sqrt':
             return self._protected_sqrt(left_val)
         elif self.operator == 'log':
@@ -153,18 +224,24 @@ class OpNode(Node):
             return self._protected_inverse(left_val)
         elif self.operator == 'sigmoid':
             return self._sigmoid(left_val)
-        
-        # 統計函數
+
+        # 統計函數: 單變量
         elif self.operator == 'rank':
             return pd.Series(self._rank(left_val).flatten(), index=left_val.index)
         elif self.operator == 'scale':
             return self._scale(left_val)
+        
+        # 統計函數: 注意 Order
         elif self.operator == 'signedpower':
-            a = int(right_val.iloc[0]) if right_val is not None else 2
-            return self._signedpower(left_val, a)
+            # (series, power) 任意順序；power 來自常數/常數 series
+            x, p = self._series_and_win_any_order(left_val, right_val, df.index, default=2)
+            p = int(max(1, min(16, p)))
+            return pd.Series(np.sign(x) * np.power(np.abs(x), p), index=x.index)
+        
         elif self.operator == 'delay':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._delay(left_val, d)
+            x, d = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
+            d = max(1, int(d))
+            return x.shift(d)
         
         # 雙變量統計函數
         elif self.operator == 'covariance':
@@ -174,13 +251,19 @@ class OpNode(Node):
             d = int(self.right.eval(df).iloc[0]) if hasattr(self, 'third') and self.third else 5
             return self._correlation(left_val, right_val, d)
         
-        # 時間序列函數
+        # 時間序列函數: 注意 Order
         elif self.operator == 'delta':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._delta(left_val, d)
+            x, d = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
+            d = max(1, int(d))
+            return x - x.shift(d)
+        
         elif self.operator == 'decay_linear':
-            d = int(right_val.iloc[0]) if right_val is not None else 5
-            return self._decay_linear(left_val, d)
+            x, d = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
+            d = max(1, int(d))
+            return x.rolling(d, min_periods=d).apply(self._wavg_linear, raw=True)
+        
+        else:
+            raise ValueError(f"Unsupported operator: {self.operator}")
         # --- Bug To Fix: ---#
         # elif self.operator == 'ts_stddev':
         #     d = int(right_val.iloc[0]) if right_val is not None else 5
@@ -218,8 +301,6 @@ class OpNode(Node):
         # elif self.operator == 'ts_lowday':
         #     d = int(right_val.iloc[0]) if right_val is not None else 5
         #     return self._ts_lowday(left_val, d)
-        else:
-            raise ValueError(f"Unsupported operator: {self.operator}")
 
     # ================== Support Operator ==================
 
