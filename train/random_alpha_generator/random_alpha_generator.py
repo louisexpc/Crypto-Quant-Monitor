@@ -870,7 +870,7 @@ class GeneticAlphaSolver:
                         child = self.pointMutation(parent)
                         # 只加入不重複的個體 and check population size
                         g = child.genotype()
-                        if g not in seen not in seen and len(new_offspring) < self.population_size:
+                        if g not in seen and len(new_offspring) < self.population_size:
                             seen.add(g)
                             new_offspring.append(child)
 

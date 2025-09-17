@@ -260,7 +260,7 @@ class OpNode(Node):
         elif self.operator == 'decay_linear':
             x, d = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
             d = max(1, int(d))
-            return x.rolling(d, min_periods=d).apply(self._wavg_linear, raw=True)
+            return self._decay_linear(x, d)
         
         else:
             raise ValueError(f"Unsupported operator: {self.operator}")
