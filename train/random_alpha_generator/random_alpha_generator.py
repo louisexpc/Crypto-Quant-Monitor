@@ -2,6 +2,7 @@
 # Ref : https://arxiv.org/html/2412.00896v1
 
 
+import hashlib
 import pandas as pd
 import numpy as np
 import random
@@ -10,6 +11,32 @@ from typing import Any, List, Tuple
 from node import Node, Leaf, OpNode
 import json, time
 import talib
+from pprint import pprint,pformat
+# ========== multiprocessing workers (NEW) ==========
+from multiprocessing import get_context
+
+_G_DF = None
+_G_RET = None
+_G_FTYPE = None
+
+def _mp_init(df, returns, fitness_type):
+    """子程序初始化：把大物件放到全域，避免每次 pickling 傳遞。"""
+    global _G_DF, _G_RET, _G_FTYPE
+    _G_DF, _G_RET, _G_FTYPE = df, returns, fitness_type
+
+def _mp_eval_worker(args):
+    """
+    子程序工作：只做純計算，不修改主程序的個體。
+    回傳 (idx, fitness, ic, sharpe)，主程序再寫回。
+    """
+    idx, ind = args
+    try:
+        fit = ind.evaluate(_G_DF, _G_RET, _G_FTYPE)
+        return idx, fit, ind.ic, ind.sharpe
+    except Exception:
+        # 與原本行為一致：錯誤→ fitness=0, ic/sharpe NaN
+        return idx, 0.0, np.nan, np.nan
+
 
 # ================== 樹構造函數 ==================
 
@@ -164,8 +191,17 @@ class Individual:
         self.fitness = None
         self.ic = None
         self.sharpe = None
-        self.signature = None
 
+
+        """Operater Info: 目前支援項目"""
+        self.COMMUTATIVE_OPS = {"+", "*", "correlation", "covariance"}  # 若未來要擴充，照樣加入
+        self.WINDOW_OPS = {"rolling_mean", "rolling_std", "signedpower", "delay",
+                    "delta", "decay_linear", "ts_stddev", "ts_sum", "ts_argmax",
+                    "ts_argmin", "ts_product", "ts_rank", "ts_max", "ts_min",
+                    "ts_mean", "ts_wma", "ts_highday", "ts_lowday"}
+        
+        self.original_signature = self.genotype()          # 原始結構簽名: 初始化後不變
+        self.signature = self.original_signature           # 結構簽名:隨演化突變
     def evaluate(self, df, returns, fitness_type='ic'):
         """評估個體適應度"""
         try:
@@ -281,7 +317,136 @@ class Individual:
         ind.sharpe = m.get("sharpe", None)
         ind.signature = d.get("meta", {}).get("signature", None)
         return ind
+    # Signature 相關
+    def genotype(self)->str:
+        """API: 取得基因型字串表示"""
+        return self.genotype_signature(self.tree)
+    def genotype_signature(self, node:Node) -> str:
+        """
+        取得基因型簽名: 只考慮運算符與結構，不考慮常數與欄位
+        Args:
+        - node: 樹節點
+        Returns:
+        - str: 基因型簽名字串
+        """
+        return self._digest_dict(self.node_to_canonical_dict(node))
 
+    def _normalize_const(self, val: float, ndigits: int = 8) -> float:
+        """
+        將常數標準化為固定小數位數，避免浮點誤差影響結構簽名
+        Args:
+        - val: 常數值
+        - ndigits: 小數位數
+        Returns:
+        - 標準化後的常數
+        """
+        try:
+            return round(float(val), ndigits)
+        except Exception:
+            return float(val)
+    def _is_scalar_leaf(self, node:Node) -> bool:
+        """
+        判斷是否為純數值常數葉節點: Leaf 節點且 value 非字串
+        Args:
+        - node: 樹節點
+        Returns:
+        - 是否為純數值常數葉節點
+        """
+        from node import Leaf
+        return isinstance(node, Leaf) and not isinstance(node.value, str)
+    
+    def _is_field_leaf(self, node:Node) -> bool:
+        """
+        判斷是否為欄位葉節點: Leaf 節點且 value 為字串
+        Args:
+        - node: 樹節點
+        Returns:
+        - 是否為欄位葉節點
+        """
+        from node import Leaf
+        return isinstance(node, Leaf) and isinstance(node.value, str)
+    
+    def _canonical_leaf(self,node:Node) -> dict[str, Any]:
+        """
+        將 Leaf 節點轉為標準化 dict 表示
+        Args:
+        - node: 樹節點
+        Returns:
+        - dict 表示
+        """
+        from node import Leaf
+        assert isinstance(node, Leaf)
+        if isinstance(node.value, str):
+            # 欄位名 Leaf：直接用字串
+            return {"type": "Leaf", "kind": "field", "value": node.value}
+        else:
+            # 常數 Leaf：規格化
+            return {"type": "Leaf", "kind": "const", "value": self._normalize_const(node.value)}
+        
+    def node_to_canonical_dict(self,node:Node) -> dict[str, Any]:
+        """
+        把樹轉為「穩定的、可交換一致、window 語義固定」的 dict 表示。
+        - 對 commutative ops：依子樹簽名排序左右子，消除 (a+b) vs (b+a) 差異。
+        - 對 window 類：強制 left 為 series, right 為 window（若輸入顛倒，這裡重排）。
+        """
+        if isinstance(node, Leaf):
+            return self._canonical_leaf(node)
+
+        assert isinstance(node, OpNode)
+        op = node.operator  # operator: string
+        ar = node.arity     # arity: 1 or 2
+
+        # 先遞迴拿到左右的 canonical dict（暫時不排）
+        left_d  = self.node_to_canonical_dict(node.left) if node.left  is not None else None
+        right_d = self.node_to_canonical_dict(node.right) if node.right is not None else None
+
+        # --- commutative ops: 排序子樹 ---
+        if op in self.COMMUTATIVE_OPS and left_d is not None and right_d is not None:
+            # 以子樹簽名排序：確保 (a+b) 與 (b+a) 的序列化一致
+            lh = self._digest_dict(left_d) # 左子樹雜湊: str
+            rh = self._digest_dict(right_d) # 右子樹雜湊: str
+            if rh < lh:  # 比字典序小就互換
+                left_d, right_d = right_d, left_d
+        
+        # ----- window 類正規化：左=series, 右=window -----
+        if op in self.WINDOW_OPS and left_d is not None and right_d is not None:
+            # 判斷 series vs window：
+            #   series：欄位 leaf 或經運算的子樹（OpNode）
+            #   window：常數 leaf（注意：你也可能用「常數 series」但在樹上會是 Leaf 常數）
+            def _is_series_like(d):
+                return (d["type"] == "Leaf" and d.get("kind") == "field") or (d["type"] == "OpNode")
+            def _is_window_like(d):
+                return (d["type"] == "Leaf" and d.get("kind") == "const")
+            
+            if _is_window_like(left_d) and _is_series_like(right_d):
+                # 交換，固定 series 在左
+                left_d, right_d = right_d, left_d
+        
+        # --- 建立本節點 dict ---
+        out = {
+            "type": "OpNode",
+            "op": op,
+            "arity": ar,
+            "left": left_d,
+            "right": right_d
+        }
+
+        return out
+    # Hash Helper Function
+    def _digest_dict(self,d: dict[str, Any]) -> str:
+        """
+        將 dict 轉為 JSON（鍵排序）後做雜湊，回傳短字串（簽名的「原料」）。
+        也可直接回傳 JSON 字串做 key（0 碰撞），但用雜湊可省記憶體。
+        Args:
+        - d: dict, 可巢狀
+        Returns:
+        - str: 簽名字串
+        """
+        s = json.dumps(d, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        # blake2b 速度快，可調 digest_size 短一點
+        return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
+
+        
 def save_alpha(ind: Individual, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(ind.to_dict(), f, ensure_ascii=False, indent=2)
@@ -298,7 +463,7 @@ class GeneticAlphaSolver:
             df:pd.DataFrame, 
             returns:pd.Series, 
             generations:int=10, 
-            fitness_type:str='ic', 
+            fitness_type:str='ic', # 'ic' / 'sharpe'
             point_mutation_rate:float=0.3, 
             crossover_rate:float=0.7,
             population_size:int =50, 
@@ -308,8 +473,31 @@ class GeneticAlphaSolver:
             operator_set : list[str] = ["+", "-", "*", "/", "sqrt", "log", "inverse", "sigmoid",
                 "rank", "scale", "signedpower", "delay", "covariance", "correlation", "delta",
                 "decay_linear"],
-            terminal_set : list[str] = ["open", "close", "high", "low", "volume"]
+            terminal_set : list[str] = ["open", "close", "high", "low", "volume"],
+            early_stopping_generations:int = 20,
+            # NEW multiprocessing
+            n_jobs:int = 1,                 # NEW: 并行程序數 (1 = 關閉並行)
+            mp_start_method:str | None = None  # NEW: 'spawn' / 'fork' / None→自動            
         ):
+        """
+        Args:
+        - df: 特徵資料集（含時間序列特徵）
+        - returns: 目標回報序列（與 df 對齊）
+        - generations: 演化世代數
+        - fitness_type: 適應度類型 ('ic', 'sharpe')
+        - point_mutation_rate: 點突變率
+        - crossover_rate: 交叉率
+        - population_size: 種群大小
+        - tournament_size: 錦標賽選擇大小
+        - depth: 樹最大深度
+        - population: 初始種群（None 則隨機生成一個簡單個體）
+        - operator_set: 運算符集合
+        - terminal_set: 終端符集合
+        - early_stopping_generations: 若連續 N 代最佳適應度無提升則提前停止
+        - n_jobs: NEW 并行程序數 (1 = 關閉并行)
+        - mp_start_method: NEW 'spawn' / 'fork' / None→自動
+        
+        """
         self.df = df
         self.returns = returns
         self.population_size = population_size
@@ -323,6 +511,7 @@ class GeneticAlphaSolver:
         self.tournament_size = tournament_size
 
         self.crossover_rate = crossover_rate
+        self.early_stopping_generations = early_stopping_generations
 
         """
         根據論文描述，初始種群應該是簡單結構的 alpha 公式，若沒有指定，則隨機生成一個當作固定結構 alpha
@@ -331,6 +520,10 @@ class GeneticAlphaSolver:
             self.population = [Individual(random_tree())]
         else:
             self.population = population
+
+        # NEW multiprocessing
+        self.n_jobs = n_jobs
+        self.mp_start_method = mp_start_method  # None → get_context() 內部選擇        
 
 
 
@@ -440,7 +633,11 @@ class GeneticAlphaSolver:
             self._set_parent_recursive(node.left, node)
         if hasattr(node, "right"):
             self._set_parent_recursive(node.right, node)
-    
+    def _identical_structure_update(self, ind1:Individual, ind2:Individual)-> bool:
+        """Update: 改為 dict 比較"""
+        dict1 = ind1.node_to_canonical_dict(ind1.tree)
+        dict2 = ind2.node_to_canonical_dict(ind2.tree)
+        
     def _identical_structure(self, node1:Node, node2:Node, mode :str = 'relaxed')-> bool:
         """檢查兩個子樹是否結構相同: 
         簡化版，僅適用當前的運算符集(不超過二元的運算符)，未來拓展需要考量更多情況：
@@ -514,6 +711,33 @@ class GeneticAlphaSolver:
             self._pointMutation(node.left)
             if node.right:
                 self._pointMutation(node.right)
+
+        # ========== population evaluation (NEW) ==========
+    def _evaluate_population(self, pop: list[Individual]):
+        """
+        以最小入侵方式把評估並行化：
+        - n_jobs == 1: 完全沿用原本行為（逐一 ind.evaluate(...)）
+        - n_jobs > 1 : multiprocess Pool（純計算，結果回寫）
+        """
+        if self.n_jobs <= 1:
+            # --- 原本同步路徑（行為不變） ---
+            for ind in pop:
+                ind.evaluate(self.df, self.returns, self.fitness_type)
+            return
+
+        # --- 多進程路徑 ---
+        ctx = get_context(self.mp_start_method or "spawn")  # 跨平臺穩定
+        with ctx.Pool(processes=self.n_jobs,
+                      initializer=_mp_init,
+                      initargs=(self.df, self.returns, self.fitness_type)) as pool:
+            tasks = [(i, ind) for i, ind in enumerate(pop)]
+            # 用 imap_unordered 加速回傳；以 idx 回寫，不影響排序穩定性
+            chunksize = max(1, len(tasks) // (self.n_jobs * 4))
+            for idx, fit, ic, sharpe in pool.imap_unordered(_mp_eval_worker, tasks, chunksize=chunksize):
+                pop[idx].fitness = fit
+                pop[idx].ic = ic
+                pop[idx].sharpe = sharpe
+
                 
 
     def selection(self, parents: List[Individual]=None) -> Individual:
@@ -593,29 +817,36 @@ class GeneticAlphaSolver:
         Return best individual from Pop(t)
 
         """
-        for ind in self.population:
-            if ind.fitness is None:
-                ind.evaluate(self.df, self.returns, self.fitness_type)
+        # for ind in self.population:
+        #     if ind.fitness is None:
+        #         ind.evaluate(self.df, self.returns, self.fitness_type)
+        self._evaluate_population(self.population)
 
         # Eealy Stop 機制
         best_finess = max(ind.fitness if ind.fitness else 0 for ind in self.population)
-        tolerance_trials = 20
+        tolerance_trials = self.early_stopping_generations
         no_improvement_count = 0
 
         for gen in range(self.generations) :
+            start_time = time.time()
             # Step 1: 保留前一代的最佳個體 (elitism)
             parents = [copy.deepcopy(ind) for ind in self.population]
             parents.sort(key=lambda x: x.fitness if x.fitness is not None else float('-inf'), reverse=True)
             elite = copy.deepcopy(parents[0])
             
             new_offspring = [elite]  # 保留最佳個體
+            seen = {ind.genotype() for ind in parents}  # 用基因型簽名避免重複
 
             # Fallback 機制，避免無限迴圈
             max_trials = self.population_size * 20
             trials = 0
 
-
+            # 進行繁殖直到滿足條件
+            # Test
+            cross_count = 0
+            mutate_count = 0
             while len(new_offspring) < self.population_size and trials < max_trials:
+                prev_len = len(new_offspring)
                 # Step 2: 決定使用哪種操作
                 operation = None
                 if len(parents) == 1:
@@ -630,68 +861,72 @@ class GeneticAlphaSolver:
                     # 進行交叉操作
                     parent1 = self.selection(parents)
                     parent2 = self.selection(parents)
-                    childs = self.restrictedCrossover(copy.deepcopy(parent1), copy.deepcopy(parent2))
+                    childs = self.restrictedCrossover(parent1, parent2)  # 內部已 deepcopy，這裡不再 copy
+
 
                     if childs is None:
                         # Fallback: 若交叉失敗，則改用點突變
                         parent = self.selection(parents)
                         child = self.pointMutation(parent)
                         # 只加入不重複的個體 and check population size
-                        is_duplicate = False
-                        for ind in new_offspring:
-                            if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
-                                is_duplicate = True
-                                break
-                        if not is_duplicate and len(new_offspring) < self.population_size:
+                        g = child.genotype()
+                        if g not in seen not in seen and len(new_offspring) < self.population_size:
+                            seen.add(g)
                             new_offspring.append(child)
+
                     else:
                         # 只加入不重複的個體 and check population size
                         for child in childs:
-                            is_duplicate = False
-                            for ind in new_offspring:
-                                if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
-                                    is_duplicate = True
-                                    break
-                            if not is_duplicate and len(new_offspring) < self.population_size:
-                                new_offspring.append(child)
+                            if len(new_offspring) >= self.population_size:
+                                break
+                            g = child.genotype()
+                            if g in seen:
+                                continue
+                            seen.add(g)
+                            new_offspring.append(child)
+                            cross_count += 1
+
                
                     
                 elif operation == 'point_mutation':
                     # 進行點突變操作
                     parent = self.selection(parents)
                     child = self.pointMutation(parent)
+                    g = child.genotype()
                     # 只加入不重複的個體 and check population size
-                    is_duplicate = False
-                    for ind in new_offspring:
-                        if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
-                            is_duplicate = True
-                            break
-                    if not is_duplicate and len(new_offspring) < self.population_size:
+                    if g not in seen and len(new_offspring) < self.population_size:
+                        seen.add(g)
                         new_offspring.append(child)
+                        mutate_count += 1
+
                 else:
                     raise ValueError("Unknown operation")
 
                 # Step 4: 避免重複個體 : 採用嚴格比對
-                new_offspring_set = []
-                for i, child in enumerate(new_offspring):
-                    is_duplicate = False
+                # 前述以比對過，這裡省略
+                new_offspring_set = new_offspring
+                # for i, child in enumerate(new_offspring):
+                #     is_duplicate = False
 
-                    # 避免移除 elite
-                    if i == 0:
-                        new_offspring_set.append(child)
-                        continue
+                #     # 避免移除 elite
+                #     if i == 0:
+                #         new_offspring_set.append(child)
+                #         continue
 
-                    for ind in parents:
-                        if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
-                            is_duplicate = True
-                            print(f"[Warning] Duplicate individual detected and skipped. Child: {child.show()} matches Parent: {ind.show()}")
-                            break
-                    if not is_duplicate:
-                        new_offspring_set.append(child)
+                #     for ind in parents:
+                #         if self._identical_structure(child.tree, ind.tree, mode = 'strict'):
+                #             is_duplicate = True
+                #             print(f"[Warning] Duplicate individual detected and skipped. Child: {child.show()} matches Parent: {ind.show()}")
+                #             break
+                #     if not is_duplicate:
+                #         new_offspring_set.append(child)
                    
                         
 
-                if len(new_offspring_set) == 0:
+                if len(new_offspring_set) == prev_len:
+                    
+                    if trials!=0 and trials%5 ==0:
+                        print(f"[Info] All new offspring are duplicates. Retrying... (Trial {trials}/{max_trials}) Current population size: {len(new_offspring_set)}")
                     trials += 1
                     continue  # 若全是重複，則重試
                 else:
@@ -701,8 +936,9 @@ class GeneticAlphaSolver:
             self.population = new_offspring
 
             # Step 5: 計算新族群的適應度
-            for ind in self.population:
-                ind.evaluate(self.df, self.returns, self.fitness_type)
+            # for ind in self.population:
+            #     ind.evaluate(self.df, self.returns, self.fitness_type)
+            self._evaluate_population(self.population)
             
             self.population.sort(key=lambda x: x.fitness if x.fitness else 0, reverse=True)
             best = self.population[0]
@@ -712,8 +948,11 @@ class GeneticAlphaSolver:
                 'ic': best.ic,
                 'sharpe': best.sharpe
             })
+            execution_time = time.time() - start_time
+            execution_min = int(execution_time // 60)
+            execution_sec = execution_time % 60
 
-            print(f"Gen {gen+1}: {best.show()} Best Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}")
+            print(f"Gen {gen+1}: {best.show()} Best Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}, Time={execution_min:.2f} min {execution_sec:.2f} sec , Cross={cross_count}, Mutate={mutate_count}, Population={len(self.population)}")
 
             # Early Stopping 檢查
             current_best_fitness = best.fitness if best.fitness else 0
@@ -747,9 +986,13 @@ if __name__ == "__main__":
     #     'low': np.random.uniform(8, 12, 200),
     #     'volume': np.random.uniform(100, 500, 200)
     # }, index=dates)
-
-    """前處理"""
+    # import os 
+    # print(f"可能核心數量 : {os.cpu_count()}")
+    
+    # """前處理"""
     data = pd.read_csv('../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv', parse_dates=['datetime'], index_col='datetime')
+    data = data[data.index <="2025-04-30 23:00:00+08:00"]
+    print(f"Data Range: {data.index.min()} to {data.index.max()}, Total Rows: {len(data)}")
     returns = data['close'].pct_change().shift(-1)
 
     #Add Features
@@ -821,6 +1064,42 @@ if __name__ == "__main__":
             )
         ),
     ]
+    """Signature Test"""
+    # test_ind = Individual((
+    #     OpNode('*',
+    #            OpNode(
+    #                "rank",
+    #                  OpNode(
+    #                       'rolling_std',
+    #                       Leaf('close'),
+    #                       Leaf(10)
+    #                  ),
+    #                  Leaf(15)
+    #            ),
+    #             Leaf(-1)
+    #     )
+    # ))
+    # print(f"Alpha Formula: {test_ind.show()}, Signature: {test_ind.signature}")
+    # print(pformat(test_ind.node_to_canonical_dict(test_ind.tree), indent=2, width=50))
+    # test_ind2 = Individual((
+    #     OpNode('*', 
+    #            OpNode(
+    #                'rank', 
+    #                Leaf(10),
+    #                OpNode(
+    #                    'rolling_std',
+    #                     Leaf('close'),
+    #                     Leaf(10)
+    #                )
+    #             ),
+    #             Leaf(-1)
+    #         )
+    # ))
+
+    # print(f"Alpha Formula: {test_ind2.show()}, Signature: {test_ind2.signature}")
+    
+    # print(pformat(test_ind2.node_to_canonical_dict(test_ind2.tree), indent=2, width=50))
+    #pprint(f"dict: {test_ind2.node_to_canonical_dict(test_ind2.tree)}",indent=2, width=80, sort_dicts=False)
     # test_ind1 = OpNode('correlation',
     #                     Leaf('high'),
     #                     Leaf('volume'),
@@ -867,19 +1146,23 @@ if __name__ == "__main__":
         solver = GeneticAlphaSolver(
             df=data, 
             returns=returns, 
-            population_size=20, 
+            population_size=150, 
             generations=100,
-            fitness_type='ic',
-            population=[test_individual],  # 使用 Alpha#4 作為初始種群
+            fitness_type='ic',  # 可選 'ic' 或 'sharpe'
+            population=[test_individual],  # 初始種群:只能放一個
             depth=5,
             point_mutation_rate=0.4,
-            terminal_set=feature_cols  # 使用擴展後的特徵集
+            terminal_set=feature_cols,  # 使用擴展後的特徵集
+            early_stopping_generations=20,
+            # NEW multiprocessing
+            n_jobs=30,  # 使用進程數量
+            mp_start_method='spawn'    # ← 跨平台穩定；Linux 可不填或用 'fork'
         )
         
         best_alpha = solver.evolve()
         print(f"\n最佳Alpha {best_alpha.show()} - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
 
-        if best_alpha.ic >= 0.3:
+        if abs(best_alpha.ic) >= 0.02 and best_alpha.sharpe >= 0.9:
             # 儲存最佳Alpha
             save_alpha(best_alpha, f"best_evolved_alpha_from_predefined_{i}.json")
 

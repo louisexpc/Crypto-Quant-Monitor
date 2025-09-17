@@ -36,18 +36,18 @@ OP_META = {
     'delta':     {"arity":2, "node_class":"time-stat","child_roles":["series","window"]},
     'decay_linear':{"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
     # 尚未啟用
-    'ts_stddev': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_sum':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_argmax': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_argmin': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_product':{"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_rank':   {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_max':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_min':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_mean':   {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_wma':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_highday':{"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
-    'ts_lowday': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_stddev': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_sum':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_argmax': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_argmin': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_product':{"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_rank':   {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_max':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_min':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_mean':   {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_wma':    {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_highday':{"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
+    # 'ts_lowday': {"arity":2,"node_class":"time-stat","child_roles":["series","window"]},
 }
 # ================== 樹狀結構組件 ==================
 
@@ -213,9 +213,9 @@ class OpNode(Node):
             return series.rolling(window, min_periods=window).mean()
         elif self.operator == 'rolling_std':
             series, window = self._series_and_win_any_order(left_val, right_val, df.index, default=5)
-            return series.rolling(window, min_periods=window).std()
+            return self._rolling_std_safe(series, window)
 
-        # Uniray math 函數
+        # Uniray math 函數: always using single left operand(series)
         elif self.operator == 'sqrt':
             return self._protected_sqrt(left_val)
         elif self.operator == 'log':
@@ -225,7 +225,7 @@ class OpNode(Node):
         elif self.operator == 'sigmoid':
             return self._sigmoid(left_val)
 
-        # 統計函數: 單變量
+        # 統計函數: 單變量: always using single left operand(series)
         elif self.operator == 'rank':
             return pd.Series(self._rank(left_val).flatten(), index=left_val.index)
         elif self.operator == 'scale':
@@ -245,10 +245,10 @@ class OpNode(Node):
         
         # 雙變量統計函數
         elif self.operator == 'covariance':
-            d = int(self.right.eval(df).iloc[0]) if hasattr(self, 'third') and self.third else 5
+            d = int(self.right.eval(df).iloc[0]) if hasattr(self, 'third') and self.third else random.randint(2, 20)
             return self._covariance(left_val, right_val, d)
         elif self.operator == 'correlation':
-            d = int(self.right.eval(df).iloc[0]) if hasattr(self, 'third') and self.third else 5
+            d = int(self.right.eval(df).iloc[0]) if hasattr(self, 'third') and self.third else random.randint(2, 20)
             return self._correlation(left_val, right_val, d)
         
         # 時間序列函數: 注意 Order
@@ -303,6 +303,12 @@ class OpNode(Node):
         #     return self._ts_lowday(left_val, d)
 
     # ================== Support Operator ==================
+    def _rolling_std_safe(self, s: pd.Series, w: int) -> pd.Series:
+        # 使用 var 再 sqrt，並對 var 做下截斷，避免 sqrt(微負)
+        v = pd.Series(s, dtype="float64").replace([np.inf, -np.inf], np.nan) \
+            .rolling(w, min_periods=w).var(ddof=1)
+        v = v.clip(lower=0)
+        return np.sqrt(v)
 
     def _protected_division(self, x1: pd.Series, x2: pd.Series):
         """
@@ -331,7 +337,10 @@ class OpNode(Node):
         Return:
           - pd.Series 結果
         """
-        return np.sqrt(np.abs(x1))
+        #轉 float、清掉 inf，保留 NaN（NaN 不會引發 sqrt 警告）
+        s = pd.Series(x1, dtype="float64").replace([np.inf, -np.inf], np.nan)
+        s = s.clip(lower=0)  # 負數轉 0
+        return np.sqrt(s)
 
     def _protected_log(self, x1: pd.Series):
         """
@@ -371,7 +380,12 @@ class OpNode(Node):
         Return:
           - pd.Series sigmoid值
         """
-        return 1 / (1 + np.exp(-x1))
+
+        s = pd.Series(x1, dtype="float64").replace([np.inf, -np.inf], np.nan)
+        # numerically stable: σ(x) = 0.5 * (1 + tanh(x/2))
+        return 0.5 * (1.0 + np.tanh(0.5 * s))
+
+        
 
     def _rank(self, x1: pd.Series):
         """
