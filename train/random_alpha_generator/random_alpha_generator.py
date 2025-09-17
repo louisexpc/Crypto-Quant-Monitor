@@ -637,7 +637,7 @@ class GeneticAlphaSolver:
         """Update: 改為 dict 比較"""
         dict1 = ind1.node_to_canonical_dict(ind1.tree)
         dict2 = ind2.node_to_canonical_dict(ind2.tree)
-        
+
     def _identical_structure(self, node1:Node, node2:Node, mode :str = 'relaxed')-> bool:
         """檢查兩個子樹是否結構相同: 
         簡化版，僅適用當前的運算符集(不超過二元的運算符)，未來拓展需要考量更多情況：
@@ -1171,3 +1171,6 @@ if __name__ == "__main__":
     # # 載入最佳Alpha
     # loaded_alpha = load_alpha("best_evolved_alpha.json")
     # print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")
+
+    """HOW TO USE"""
+    # return_features  = loaded_alpha.tree.eval(your_dataframe)
