@@ -238,197 +238,10 @@ def _iter_batches(loader, device: str, batch_size: int):
     # 回退：沿用原本 DataLoader 逐批產生
     for xb, yb in loader:
         yield xb, yb
+
 # =========================================================
 # CollapseGuard：PPR/平均熵 監控與自救
 # =========================================================
-# def prob_entropy_from_logits_binary(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-#     """
-#     1. 說明:
-#         將二分類 logits 轉為正類機率 p 與二元熵 H(p)。
-#         兼容 logits 形狀: [B], [B,1], [B,2]。
-#     2. inputs:
-#         logits (Tensor): 未經 sigmoid/softmax 的分數
-#     3. return:
-#         p (Tensor): [B]，正類機率 ∈ (0,1)
-#         H (Tensor): [B]，二元熵
-#     """
-#     if logits.ndim == 2 and logits.size(-1) == 2:
-#         p = F.softmax(logits, dim=-1)[:, 1]
-#     elif logits.ndim == 2 and logits.size(-1) == 1:
-#         p = torch.sigmoid(logits.squeeze(1))
-#     elif logits.ndim == 1:
-#         p = torch.sigmoid(logits)
-#     else:
-#         raise ValueError(f"Unexpected logits shape: {tuple(logits.shape)}")
-#     p = p.clamp(1e-8, 1 - 1e-8)
-#     H = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
-#     return p, H
-
-# class CollapseGuard:
-#     """
-#     1. 說明:
-#         訓練時監控 PPR 與平均熵，當異常持續達耐心值後執行「自救」：
-#         - 提高 λ_cp（若 loss 模組有 conf_penalty 屬性）
-#         - 衰減學習率
-#         - （可選）回滾最佳權重 via callback
-
-#     2. inputs:
-#         pos_threshold (float): PPR 計算用門檻（建議用推論門檻；預設 0.5）
-#         ppr_warn_band (tuple): 合理帶 (low, high)；超出連續 warn_patience 步→告警
-#         warn_patience (int):   告警耐心
-#         ppr_extreme_band (tuple): 極端帶 (low, high)；超出連續 extreme_patience 步→觸發自救
-#         extreme_patience (int):   觸發耐心（例：100）
-#         cp_boost_factor (float):  觸發時 λ_cp 乘法因子（例：1.25）
-#         lr_decay (float):         觸發時學習率乘法因子（例：0.5）
-#         max_conf_penalty (float): λ_cp 上限（例：0.2）
-#         on_trigger (Callable):    觸發回呼（可回滾最佳權重）
-#         smoothing (float):        EMA 平滑係數（0~1；0=不用 EMA）
-
-#     3. return:
-#         經由 on_batch_end()/on_epoch_end() 回傳監控 dict
-#     """
-#     def __init__(self, 
-#                 pos_threshold: float = 0.5,
-#                 ppr_warn_band: Tuple[float, float] = (0.05, 0.60),
-#                 warn_patience: int = 50,
-#                 ppr_extreme_band: Tuple[float, float] = (0.02, 0.98),
-#                 extreme_patience: int = 100,
-#                 cp_boost_factor: float = 1.25,
-#                 lr_decay: float = 0.5,
-#                 max_conf_penalty: float = 0.20,
-#                 on_trigger: Optional[Callable[[Dict], None]] = None,
-#                 smoothing: float = 0.0,
-#                 warmup_steps: int = 2000,        # ★ 新增：暖身步數（依你每 epoch 的步數調）
-#                 entropy_hi: float = 0.60,        # ★ 新增：高熵門檻（二分類最大 ≈ 0.693）
-#                 cooldown_steps: int = 200        # ★ 新增：觸發後冷卻（避免連環觸發）
-#                 ) -> None:
-#         self.pos_threshold = float(pos_threshold)
-#         self.ppr_low, self.ppr_high = map(float, ppr_warn_band)
-#         self.warn_patience = int(warn_patience)
-#         self.ext_low, self.ext_high = map(float, ppr_extreme_band)
-#         self.extreme_patience = int(extreme_patience)
-#         self.cp_boost_factor = float(cp_boost_factor)
-#         self.lr_decay = float(lr_decay)
-#         self.max_conf_penalty = float(max_conf_penalty)
-#         self.on_trigger = on_trigger
-#         self.alpha = float(smoothing)
-#         self.warmup_steps = int(warmup_steps)
-#         self.entropy_hi = float(entropy_hi)
-#         self.cooldown_steps = int(cooldown_steps)
-#         self._last_trigger_step = -10**9
-
-#         self._warn_streak = 0
-#         self._extreme_streak = 0
-#         self._ema_ppr = None
-#         self._ema_entropy = None
-#         self._step = 0
-        
-
-#     def _ema(self, prev: Optional[float], value: float) -> float:
-#         if self.alpha <= 0 or prev is None:
-#             return value
-#         return self.alpha * prev + (1 - self.alpha) * value
-
-#     @torch.no_grad()
-#     def on_batch_end(self,
-#                      logits: torch.Tensor,
-#                      loss_module: nn.Module,
-#                      optimizer: torch.optim.Optimizer,
-#                      model: Optional[nn.Module] = None) -> Dict:
-#         """
-#         1. 說明:
-#             每個 batch 結束呼叫，更新 PPR/熵，必要時觸發自救。
-#         2. inputs:
-#             logits (Tensor): 本 batch 的模型輸出（支援 [B], [B,1], [B,2]）
-#             loss_module (nn.Module): 若含 .conf_penalty，觸發時會調整
-#             optimizer (Optimizer):   觸發時衰減 LR
-#             model (nn.Module|None):  供回呼使用（回滾最佳權重）
-#         3. return:
-#             info (dict): 指標與觸發資訊
-#         """
-#         self._step += 1
-#         p, H = prob_entropy_from_logits_binary(logits)
-#         ppr = float((p >= self.pos_threshold).float().mean().item())
-#         entropy_mean = float(H.mean().item())
-
-#         # EMA 平滑
-#         self._ema_ppr = self._ema(self._ema_ppr, ppr)
-#         self._ema_entropy = self._ema(self._ema_entropy, entropy_mean)
-#         ppr_use = self._ema_ppr if self.alpha > 0 else ppr
-
-#         # 告警/極端
-#         outside = (ppr_use < self.ppr_low) or (ppr_use > self.ppr_high)
-#         self._warn_streak = self._warn_streak + 1 if outside else 0
-#         warn_hit = self._warn_streak >= self.warn_patience
-
-#         extreme = (ppr_use < self.ext_low) or (ppr_use > self.ext_high)
-#         self._extreme_streak = self._extreme_streak + 1 if extreme else 0
-#         trigger = self._extreme_streak >= self.extreme_patience
-
-#         did_adjust_cp = False
-#         did_decay_lr = False
-#         if trigger:
-#             # 1) 調高 λ_cp（若支援）
-#             if hasattr(loss_module, "conf_penalty"):
-#                 old_cp = float(loss_module.conf_penalty)
-#                 new_cp = min(self.max_conf_penalty, old_cp * self.cp_boost_factor if old_cp > 0 else 0.02)
-#                 loss_module.conf_penalty = new_cp
-#                 did_adjust_cp = (new_cp != old_cp)
-
-#             # 2) 衰減 LR
-#             for pg in optimizer.param_groups:
-#                 if "lr" in pg and pg["lr"] > 0:
-#                     pg["lr"] *= self.lr_decay
-#                     did_decay_lr = True
-
-#             # 3) 回呼（可回滾最佳權重）
-#             if self.on_trigger is not None:
-#                 ctx = dict(step=self._step, ppr=ppr, ppr_ema=self._ema_ppr,
-#                            entropy=entropy_mean, entropy_ema=self._ema_entropy,
-#                            adjusted_cp=did_adjust_cp, decayed_lr=did_decay_lr,
-#                            loss_module=loss_module, optimizer=optimizer, model=model)
-#                 try:
-#                     self.on_trigger(ctx)
-#                 except Exception as e:
-#                     print(f"[CollapseGuard] on_trigger error: {e}")
-
-#             # 重置極端計數避免連環觸發
-#             self._extreme_streak = 0
-
-#         return {
-#             "step": self._step,
-#             "ppr": ppr, "ppr_ema": self._ema_ppr,
-#             "entropy": entropy_mean, "entropy_ema": self._ema_entropy,
-#             "warn": bool(warn_hit), "extreme": bool(extreme),
-#             "triggered": bool(trigger),
-#             "did_adjust_cp": did_adjust_cp, "did_decay_lr": did_decay_lr,
-#         }
-
-#     @torch.no_grad()
-#     def on_epoch_end(self) -> Dict:
-#         """
-#         1. 說明:
-#             每個 epoch 收尾呼叫，回傳當前 EMA 指標與連續計數。
-#         2. inputs:
-#             無
-#         3. return:
-#             info (dict): 摘要指標
-#         """
-#         return {
-#             "ppr_ema": self._ema_ppr,
-#             "entropy_ema": self._ema_entropy,
-#             "warn_streak": self._warn_streak,
-#             "extreme_streak": self._extreme_streak,
-#         }
-    
-#     def set_pos_threshold(self, thr: float):
-#         """讓 Guard 能在每次驗證後，改成當輪驗證得到的最佳 threshold。"""
-#         self.pos_threshold = float(thr)
-#         # print(f"[CollapseGuard] pos_threshold -> {self.pos_threshold:.4f}")
-
-
-
-
 def prob_entropy_from_logits_binary(logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     1. 說明:
@@ -692,8 +505,6 @@ class CollapseGuard:
         self.pos_threshold = float(thr)
 
 
-
-
 # =========================================================
 # 類別先驗估計與動態 Threshold 搜尋
 # =========================================================
@@ -858,19 +669,6 @@ def train_one_fold(
                     print("[CollapseGuard] restored best weights.")
                 except Exception as e:
                     print(f"[CollapseGuard] restore error: {e}")
-
-        # guard = CollapseGuard(
-        #     pos_threshold=pos_thr,
-        #     ppr_warn_band=tuple(guard_cfg.get("ppr_warn_band", (0.05, 0.60))),
-        #     warn_patience=int(guard_cfg.get("warn_patience", 50)),
-        #     ppr_extreme_band=tuple(guard_cfg.get("ppr_extreme_band", (0.02, 0.98))),
-        #     extreme_patience=int(guard_cfg.get("extreme_patience", 100)),
-        #     cp_boost_factor=float(guard_cfg.get("cp_boost_factor", 1.25)),
-        #     lr_decay=float(guard_cfg.get("lr_decay", 0.5)),
-        #     max_conf_penalty=float(guard_cfg.get("max_conf_penalty", 0.20)),
-        #     on_trigger=_on_trigger,
-        #     smoothing=float(guard_cfg.get("smoothing", 0.2)),
-        # )
 
         guard = CollapseGuard(
             pos_threshold=pos_thr,
