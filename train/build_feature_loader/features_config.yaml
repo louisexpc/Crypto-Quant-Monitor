@@ -14,7 +14,7 @@ data:
 
 
 export:
-  out: data/precomputed/btcusdt_15m_features.parquet      # 輸出路徑 (.parquet 或 .csv)
+  out: data/precomputed/btcusdt_15m_features_v2.csv      # 輸出路徑 (.parquet 或 .csv)
 
 features:
   dropna: false                                            # 建完特徵後是否丟棄含 NaN 的列

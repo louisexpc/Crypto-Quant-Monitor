@@ -12,25 +12,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from dataset.time_dataset import SeqDataset
 from dataset.event_dataset import EventDataset
 
-
-
-# def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
-#     train_val_mask = fold["train_val_mask"]
-#     test_mask = fold["test_mask"]
-
-#     # 時間排序的訓練+驗證資料
-#     df_tv = df.loc[train_val_mask].sort_index()
-#     df_te = df.loc[test_mask].sort_index()
-
-#     split_ratio = cfg["cv"]["train_val_split"]
-#     split_idx = int(len(df_tv) * split_ratio)
-
-#     tr_idx = df_tv.index[:split_idx]
-#     va_idx = df_tv.index[split_idx:]
-#     te_idx = df_te.index
-
-#     return tr_idx, va_idx, te_idx
-
 def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
     """
     1. 說明:
@@ -482,7 +463,6 @@ def make_time_loaders_for_fold(df,
         feat_df = feat_df[~feat_df.index.duplicated(keep="last")]
 
         # 對齊時間網格並生成 label（保留 y_reg/y_cls 欄名）
-        # 參考 build_features_and_label 的做法
         # 對齊時間網格：以 precomputed 索引生成完整網格
         full_idx = pd.date_range(feat_df.index.min(), feat_df.index.max(), freq=str(cfg["data"]["freq"]), tz="UTC")
         # 檢查預算檔是否包含 OHLCV 欄位
@@ -514,9 +494,10 @@ def make_time_loaders_for_fold(df,
         y_series = y_series.loc[keep]
 
         # 時間區間篩選
-        start_date = pd.Timestamp(cfg["cv"]["start_date"]).tz_localize("UTC")
-        end_date   = pd.Timestamp(cfg["cv"]["end_date"]).tz_localize("UTC")
-        mask_range = (feat_df.index >= start_date) & (feat_df.index <= end_date)
+        cv_start = pd.Timestamp(cfg["cv"]["start_date"]).tz_localize("UTC")
+        cv_end   = pd.Timestamp(cfg["cv"]["end_date"]).tz_localize("UTC")
+        cv_end   = cv_end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+        mask_range = (feat_df.index >= cv_start) & (feat_df.index <= cv_end)
         feat_df = feat_df.loc[mask_range]
         y_series = y_series.loc[mask_range]
 
@@ -733,15 +714,27 @@ def make_event_loaders_for_fold(df_events: pd.DataFrame,
     train_align = align_times(tr_idx, idx_all, align_method)
     fit_pos = []
     # map times to integer positions
-    pos_map = pd.Series(np.arange(len(idx_all)), index=idx_all)
-    for at in train_align:
-        p = int(pos_map.get(at, -1))
-        if p <= 0:
-            continue
-        start = max(0, p - L)
-        fit_pos.extend(range(start, p))
-    fit_pos = np.unique(np.array(fit_pos, dtype=int))
-    fit_index = idx_all[fit_pos] if len(fit_pos) else train_align  # fallback: use align times
+    # pos_map = pd.Series(np.arange(len(idx_all)), index=idx_all)
+    # for at in train_align:
+    #     p = int(pos_map.get(at, -1))
+    #     if p <= 0:
+    #         continue
+    #     start = max(0, p - L)
+    #     fit_pos.extend(range(start, p))
+    # fit_pos = np.unique(np.array(fit_pos, dtype=int))
+    # fit_index = idx_all[fit_pos] if len(fit_pos) else train_align  # fallback: use align times
+
+    # vectorized build of fit positions: union over [p-L, p)
+    p_vec = idx_all.searchsorted(train_align, side="right") - 1  # [N_tr]
+    p_vec = p_vec[p_vec >= 0]
+    if len(p_vec):
+        rng = np.arange(L, dtype=np.int32)
+        fit_pos = (p_vec[:, None] - rng[None, :]).reshape(-1)
+        fit_pos = fit_pos[(fit_pos >= 0) & (fit_pos < len(idx_all))]
+        fit_pos = np.unique(fit_pos)
+        fit_index = idx_all[fit_pos]
+    else:
+        fit_index = train_align
 
     cols_to_scale = pick_cols_to_scale(feat_df.loc[fit_index, feat_cols], feat_cols)
 
