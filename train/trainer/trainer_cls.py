@@ -36,16 +36,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from train_utils.compute_export_metrices import save_fold_metrics, plot_test_eval
 from train_utils.metrics_cls import compute_cls_metrics  # 統一計算 acc/f1/f0.5/mcc 等
 
-
-# =========================================================
-# 分類專屬 Loss（CrossEntropy / Focal CrossEntropy）
-# =========================================================
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional
-
 # =========================================================
 # Loss：BCEWithLogits + Focal + Confidence Penalty（支援 [B], [B,1], [B,2]）
 # =========================================================
@@ -203,7 +193,7 @@ def build_classification_loss(cfg, class_weights):
     if use_focal:
         return BCEWithLogitsFocalLoss(gamma=float(cfg_cls_loss["focal_gamma"]),
                                       alpha=float(cfg_cls_loss["focal_alpha"]) or None,
-                                      conf_penalty = float(cfg_cls_loss["conf_penalty"]),
+                                      conf_penalty=float(cfg_cls_loss["conf_penalty"]),
                                       reduction=str(cfg_cls_loss["reduction"]),
                                       normalized= bool(cfg_cls_loss["normalized"])
                                     )

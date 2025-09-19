@@ -315,7 +315,6 @@ class EventDataset(Dataset):
             })
         return out
 
-
 def load_features_csv(
     path: str,
     *,
@@ -345,92 +344,3 @@ def load_features_csv(
     df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
     return df
-
-def load_features_csv(
-    path: str,
-    *,
-    time_col: str = "datetime",
-    assume_tz: str = "UTC",
-) -> pd.DataFrame:
-    """
-    1. 說明:
-        從 CSV 載入特徵表，並將時間欄轉為「UTC tz-aware」的 DatetimeIndex。
-        - 僅移除時間欄，保留其餘欄位；是否為數值由上游自行過濾。
-        - 會排序索引並去除重複時間列（保留最後一次出現）。
-    2. inputs:
-        - path: str
-        - time_col: str = "datetime"
-        - assume_tz: str = "UTC"
-    3. return:
-        - pd.DataFrame
-    """
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    df = pd.read_csv(path)
-    if time_col not in df.columns:
-        raise KeyError(f"CSV missing time_col='{time_col}'")
-    idx = _to_utc_index(pd.to_datetime(df[time_col], errors="coerce"), assume_tz=assume_tz)
-    df = df.drop(columns=[time_col])
-    df.index = idx
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
-
-
-# # ============================
-# # Builder via FeatureComputer
-# # ============================
-# def build_event_dataset_via_feature_computer(
-#     cfg: Dict,
-#     tbm_csv_path: str,
-#     *,
-#     seq_len: int = 144,
-#     keep_sides: Literal["both", "long", "short"] = "both",
-#     align_method: Literal["exact", "pad"] = "pad",
-#     device: Optional[str] = None,
-# ) -> EventDataset:
-#     """
-#     1. 說明:
-#         透過 IndicatorLibrary/FeatureComputer 動態計算 15m 特徵，再以 TBM CSV 組成 EventDataset。
-#         假設 FeatureComputer 內部已完成 anti-leak shift(1)。
-#     2. inputs:
-#         - cfg: Dict（需含 data.path / data.index_col / data.freq / features.plan）
-#         - tbm_csv_path: str
-#         - seq_len, keep_sides, align_method, device
-#     3. return:
-#         - EventDataset
-#     """
-#     from ..build_feature_loader.indicators import IndicatorLibrary, FeatureComputer
-
-#     raw_path = cfg["data"]["path"]
-#     index_col = cfg["data"]["index_col"]
-#     freq = cfg["data"]["freq"]
-
-#     # 載入原始 OHLCV
-#     if str(raw_path).endswith(".csv"):
-#         raw_df = pd.read_csv(raw_path)
-#     elif str(raw_path).endswith(".parquet"):
-#         raw_df = pd.read_parquet(raw_path)
-#     else:
-#         raise ValueError("Only .csv or .parquet is supported for data.path")
-
-#     lib = IndicatorLibrary(raw_df, freq_check=freq, prefer_time_col=index_col)
-
-#     # 不做磁碟快取的 FeatureComputer
-#     fc = FeatureComputer(lib)
-
-#     # 依 plan 計算特徵；假設內部已 shift(1)
-#     plan = cfg["features"]["plan"]
-#     feat_df = fc.compute(plan, cfg)
-
-#     # 組 Dataset
-#     ds = EventDataset(
-#         feat_df=feat_df,
-#         tbm_csv_path=tbm_csv_path,
-#         seq_len=seq_len,
-#         feature_cols=feat_df.columns.tolist(),
-#         keep_sides=keep_sides,
-#         align_method=align_method,
-#         device=device,
-#     )
-#     return ds
