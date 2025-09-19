@@ -65,9 +65,7 @@ class StrategyAnalyzer:
         if len(self.df) < 2:
             raise ValueError("DataFrame after trimming incomplete candle must contain at least 2 candles.")
 
-        # -------- 仍採用「最後一根 *已收線*」作為判斷基準 --------
-        self.last_candle = self.df.iloc[-1]
-        # --------------------------------------------------------------
+
 
         # 0905 Update:
         # 新增 volume_ema_window 參數，預設10
@@ -78,6 +76,10 @@ class StrategyAnalyzer:
         self.volume_ema_window = volume_ema_window
         self.df['volume_ema'] = self.df['volume'].ewm(span=self.volume_ema_window, adjust=False).mean()
 
+
+        # -------- 仍採用「最後一根 *已收線*」作為判斷基準 --------
+        self.last_candle = self.df.iloc[-1]
+        # --------------------------------------------------------------
 
     def _simulate_market_evolution(self):
         """
@@ -183,11 +185,14 @@ class StrategyAnalyzer:
             was_flipped = level.flipped_at is not None
             if not was_flipped:
                 continue
+            
+            # 0910 Update: 新增條件: 最後一根 K 線交易量必須高於其 EMA
+            was_tested_by_last_candle = (level.last_tested_at == self.last_candle.name) and (self.last_candle['volume'] >= self.last_candle['volume_ema'])
 
-            was_tested_by_last_candle = (level.last_tested_at == self.last_candle.name)
+      
+
             if not was_tested_by_last_candle:
                 continue
-            
             test_after_flip = level.last_tested_at > level.flipped_at
             if not test_after_flip:
                 continue

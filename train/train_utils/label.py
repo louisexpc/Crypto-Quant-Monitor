@@ -263,22 +263,31 @@ def triple_barrier_labels(
             L = df.at[t_open, 'low']
 
             if j > start_i:
-                # gap at open（下一根一開盤即越界）
-                if O >= pt_price:
-                    out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 1.0
-                    decided = True; break
-                if O <= sl_price:
-                    out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 0.0
-                    decided = True; break
+                if side == +1:  # 多單
+                    if O >= pt_price:
+                        out.at[eid,'t1']=t_open; out.at[eid,'label']=1.0; decided=True; break
+                    if O <= sl_price:
+                        out.at[eid,'t1']=t_open; out.at[eid,'label']=0.0; decided=True; break
+                else:  # 空單
+                    if O <= pt_price:  # 空單停利向下
+                        out.at[eid,'t1']=t_open; out.at[eid,'label']=1.0; decided=True; break
+                    if O >= sl_price:  # 空單停損向上
+                        out.at[eid,'t1']=t_open; out.at[eid,'label']=0.0; decided=True; break
 
-            hit_up = (H >= pt_price)
-            hit_dn = (L <= sl_price)
+            # === bar 內觸價（注意多空方向）===
+            if side == +1:
+                hit_pt = (H >= pt_price)
+                hit_sl = (L <= sl_price)
+            else:
+                hit_pt = (L <= pt_price)  # 空單停利
+                hit_sl = (H >= sl_price)  # 空單停損
 
-            if hit_up and hit_dn:
+            if hit_pt and hit_sl:
                 # ---- 下鑽低 TF（以 bar 起訖時間切片）----
+                # 命中上下軌 → 下鑽低TF
                 if low_timeframe_df is not None and not low_timeframe_df.empty:
                     low_slice = low_timeframe_df[(low_timeframe_df.index >= t_open) &
-                                                 (low_timeframe_df.index <  t_close)]
+                                                (low_timeframe_df.index <  t_close)]
                     if j == start_i:
                         low_slice = low_slice[low_slice.index >= t0]
 
@@ -286,36 +295,43 @@ def triple_barrier_labels(
                         for low_t, low_row in low_slice.iterrows():
                             low_O = low_row['open']; low_H = low_row['high']; low_L = low_row['low']
 
-                            # 低 TF gap
-                            if low_O >= pt_price:
-                                out.at[eid, 't1'] = low_t; out.at[eid, 'label'] = 1.0
-                                decided = True; break
-                            if low_O <= sl_price:
-                                out.at[eid, 't1'] = low_t; out.at[eid, 'label'] = 0.0
-                                decided = True; break
+                            # 低TF gap
+                            if side == +1:
+                                if low_O >= pt_price:
+                                    out.at[eid,'t1']=low_t; out.at[eid,'label']=1.0; decided=True; break
+                                if low_O <= sl_price:
+                                    out.at[eid,'t1']=low_t; out.at[eid,'label']=0.0; decided=True; break
+                            else:
+                                if low_O <= pt_price:  # 空單停利
+                                    out.at[eid,'t1']=low_t; out.at[eid,'label']=1.0; decided=True; break
+                                if low_O >= sl_price:  # 空單停損
+                                    out.at[eid,'t1']=low_t; out.at[eid,'label']=0.0; decided=True; break
 
-                            low_up = (low_H >= pt_price)
-                            low_dn = (low_L <= sl_price)
+                            # 低TF 內部觸價
+                            if side == +1:
+                                low_pt = (low_H >= pt_price)
+                                low_sl = (low_L <= sl_price)
+                            else:
+                                low_pt = (low_L <= pt_price)   # 修正點
+                                low_sl = (low_H >= sl_price)   # 修正點
 
-                            if low_up and low_dn:
-                                # 低 TF 亦雙觸發 → 直接套 ambiguous 規則
+                            if low_pt and low_sl:
                                 if ambiguous == "nan":
-                                    out.at[eid, 't1'] = low_t; out.at[eid, 'label'] = np.nan
+                                    out.at[eid,'t1']=low_t; out.at[eid,'label']=np.nan
                                 elif ambiguous == "fail":
-                                    out.at[eid, 't1'] = low_t; out.at[eid, 'label'] = 0.0
+                                    out.at[eid,'t1']=low_t; out.at[eid,'label']=0.0
                                 elif ambiguous == "skip_open_win":
-                                    dist_up = (pt_price - low_O) if low_O < pt_price else np.inf
-                                    dist_dn = (low_O - sl_price) if low_O > sl_price else np.inf
-                                    out.at[eid, 'label'] = 1.0 if dist_up < dist_dn else (0.0 if dist_dn < dist_up else np.nan)
-                                    out.at[eid, 't1'] = low_t
-                                decided = True; break
-                            elif low_up:
-                                out.at[eid, 't1'] = low_t; out.at[eid, 'label'] = 1.0
-                                decided = True; break
-                            elif low_dn:
-                                out.at[eid, 't1'] = low_t; out.at[eid, 'label'] = 0.0
-                                decided = True; break
+                                    dist_pt = abs(low_O - pt_price)
+                                    dist_sl = abs(low_O - sl_price)
+                                    out.at[eid,'label'] = 1.0 if dist_pt < dist_sl else (0.0 if dist_sl < dist_pt else np.nan)
+                                    out.at[eid,'t1'] = low_t
+                                decided=True; break
+                            elif low_pt:
+                                out.at[eid,'t1']=low_t; out.at[eid,'label']=1.0; decided=True; break
+                            elif low_sl:
+                                out.at[eid,'t1']=low_t; out.at[eid,'label']=0.0; decided=True; break
                         if decided: break
+
 
                 # 低 TF 無解 → 依 ambiguous 規則
                 if ambiguous == "nan":
@@ -323,24 +339,37 @@ def triple_barrier_labels(
                 elif ambiguous == "fail":
                     out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 0.0
                 elif ambiguous == "skip_open_win":
-                    dist_up = (pt_price - O) if O < pt_price else np.inf
-                    dist_dn = (O - sl_price) if O > sl_price else np.inf
-                    out.at[eid, 'label'] = 1.0 if dist_up < dist_dn else (0.0 if dist_dn < dist_up else np.nan)
+                    # 高TF ambiguous（把你原本的 dist_up/dist_dn 換掉）
+                    dist_pt = abs(O - pt_price)
+                    dist_sl = abs(O - sl_price)
+                    out.at[eid, 'label'] = 1.0 if dist_pt < dist_sl else (0.0 if dist_sl < dist_pt else np.nan)
                     out.at[eid, 't1'] = t_open
+
                 decided = True; break
 
-            elif hit_up:
+            elif hit_pt :
                 out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 1.0
+                # if side == -1:
+                #     # print(f"hit pt事件 :\nt0 = {t0}\nt1 = {t_open}\nopen: {row['entry_price']}\nlow : {L}\npt:{pt_price}")
+                #     pass
                 decided = True; break
 
-            elif hit_dn:
+            elif hit_sl:
                 out.at[eid, 't1'] = t_open; out.at[eid, 'label'] = 0.0
+                # if side == -1:
+                #     # print(f"hit sl事件 : \nt0 = {t0}\nt1 = {t_open}\nopen: {row['entry_price']}\nhigh : {H}\nsl:{sl_price}")
+                #     pass
                 decided = True; break
 
         if not decided:
             out.at[eid, 't1'] = idx[end_i]   # 最後檢查到的時間
             out.at[eid, 'label'] = np.nan    # 永續，不計到期
-
+        
+        # if side == -1:
+        #     print(f"空單結果: {eid}\nentry time=\t{t0}\nexit time=\t{out.at[eid, 't1']}\nO={O}\npt={pt_price}\nsl={sl_price}\nvol={sig}")
+        if out.at[eid, 't1'] == out.at[eid, 't0']:
+            print(f"事件 {eid} 的 t1 == t0\nt1: {out.at[eid, 't1']}\nt0: {out.at[eid, 't0']}\nStatus: hit_pt:{hit_pt} ; hit_sl:{hit_sl}\n觸發 low timeframe check:{hit_pt and hit_sl}")
+        
     return out[['t0','side','entry_price','t1','label','pt','sl','vol']]
 
 
@@ -361,6 +390,7 @@ if __name__ == "__main__":
         timeframe = "1h",
         volume_ema_window = 10,
     )
+   
     labels_df = triple_barrier_labels(
         df=df,
         low_timeframe_df=low_timeframe_df,

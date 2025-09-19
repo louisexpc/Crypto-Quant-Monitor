@@ -248,7 +248,7 @@ class backtestStrategy:
 
 if __name__ == "__main__":
 
-    df = pd.read_csv("mexc_swap_BTC-USDT-USDT_1h.csv")
+    df = pd.read_csv("/home/louisexpc/Crypto-Quant-Monitor/train/data/binanceusdm_swap_BTC-USDT-USDT_1h.csv")
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
     df = df.set_index("datetime").sort_index()
 
