@@ -2,7 +2,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict
 
 def _to_utc_index(idx, assume_tz: str = "UTC") -> pd.DatetimeIndex:
     idx = pd.DatetimeIndex(idx)
@@ -276,68 +276,43 @@ def create_labels_adaptive(df: pd.DataFrame,
     df["y_cls"] = y_cls
     return df
 
-
-def build_features_and_label(
-    df_base: pd.DataFrame,
-    feat_parquet_path: str | None = None,
-    feat_df: pd.DataFrame | None = None,
-    *,
-    cfg
-    ):
+def create_label(df_base: pd.DataFrame, cfg: Dict, return_what: str = "auto") -> pd.Series:
     """
-    對齊你的原版行為（UTC/網格/shift），但：
-    - regression：y 為連續報酬
-    - classification：y 為3值 (ret > cls_threshold)
+    Create a single label series based on cfg and return_what.
+
+    - For mode='event_tbm': aligns TBM CSV onto the 15m grid and returns 'y_cls'.
+    - For time-driven modes: computes either 'y_reg' or 'y_cls' according to task type
+      or explicitly via return_what in {'reg','cls'}.
+
+    Returns
+    -------
+    pd.Series
+        Named 'y_reg' or 'y_cls'. Index matches df_base after processing.
     """
-
-    # === 0) 時間設定 ===
-    start_date = pd.Timestamp(cfg["cv"]["start_date"]).tz_localize("UTC")
-    end_date   = pd.Timestamp(cfg["cv"]["end_date"]).tz_localize("UTC")
-    freq = cfg["data"]["freq"]
-
-    # === 1) 讀特徵 ===
-    if feat_df is None:
-        if not feat_parquet_path or not Path(feat_parquet_path).exists():
-            raise FileNotFoundError(f"特徵檔不存在：{feat_parquet_path}")
-        X = pd.read_parquet(feat_parquet_path)
-    else:
-        X = feat_df.copy()
-
-    # 安全：移除任何 label-like 欄位
-    label_like = {"label", "target", "y", "y_cls", "y_reg"}
-    bad = [c for c in X.columns if c.lower() in label_like]
-    if bad:
-        print(f"[SAFE] Dropping label-like columns from features: {bad}")
-        X = X.drop(columns=bad)
-
-    # === 2) 對齊索引/排序 ===
-    dfb = df_base.copy()
-    X.index   = _to_utc_index(X.index)
-    dfb.index = _to_utc_index(dfb.index)
-    X   = X.sort_index()
-    dfb = dfb.sort_index()
-    X   = X[~X.index.duplicated(keep="last")]
-    dfb = dfb[~dfb.index.duplicated(keep="last")]
-
-    # 3) 強制完整 freq 網格（依 cfg.data.freq，例如 "15min"）
-    full_idx = pd.date_range(dfb.index.min(), dfb.index.max(), freq=str(freq), tz="UTC")
-    dfb = dfb.reindex(full_idx)
-    X   = X.reindex(full_idx)
-        
-    # === 4) 產生 y（用 create_labels_adaptive 一次搞定；支援 ret_shift） ===
+    # Use the same logic as build_features_and_label but only return one series
     Lcfg = cfg["label"]
-    ret_shift = int(Lcfg["ret_shift"])
+    mode = str(Lcfg.get("mode", "vol")).lower()
+
+    if mode == "event_tbm":
+        df_lab = assign_tbm_labels_to_df(
+            df_15m=df_base,
+            tbm_csv_path=Lcfg["tbm_csv_path"],
+            keep_sides=Lcfg.get("keep_sides", "both"),
+            drop_nan_labels=Lcfg.get("drop_nan_labels", True),
+            align_method=Lcfg.get("align_method", "exact"),
+        )
+        s = df_lab["y_cls"].copy()
+        s.name = "y_cls"
+        return s
+
+    # time-driven
     task_type = str(cfg["task"]["type"]).lower()
-    mode      = str(Lcfg["mode"]).lower()
-    ret_type  = str(Lcfg["ret_type"]).lower()  # "logret" | "fractionally"
+    want = return_what.strip().lower() if isinstance(return_what, str) else "auto"
+    want_cls = (want == "cls") or (want == "auto" and task_type == "classification")
 
-    # 安全檢查
-    if not {"open","high","low","close","volume"}.issubset(dfb.columns):
-        raise KeyError("df_base 缺少 OHLCV 欄位")
-
-    # 呼叫一次產生 y_reg(=logret over ret_shift) 與 y_cls
-    df_lbl = create_labels_adaptive(
-        dfb,
+    # Reuse implementation from build_features_and_label to ensure parity
+    tmp = create_labels_adaptive(
+        df_base.copy(),
         mode=mode,
         flat_band_bps=float(Lcfg.get("flat_band_bps", 5.0)),
         roundtrip_cost_bps=float(Lcfg.get("roundtrip_cost_bps", 10.0)),
@@ -347,60 +322,16 @@ def build_features_and_label(
         q_min_obs=int(Lcfg.get("q_min_obs", 500)),
         triple_k=float(Lcfg.get("triple_k", 0.5)),
         triple_window=int(Lcfg.get("triple_window", 96)),
-        ret_shift=ret_shift,
-        ret_type=ret_type,
-        ffd_d=float(Lcfg["fracdiff"]["d"]) if ret_type == "fractionally" else 0.3,
-        ffd_thres=float(Lcfg["fracdiff"]["thres"]) if ret_type == "fractionally" else 1e-5,
-        
-        tbm_csv_path = Lcfg["tbm_csv_path"],
-        keep_sides = Lcfg["keep_sides"],
-        align_method = Lcfg["align_method"]
-
-        )
-
-    # === 5) 依任務挑 y（避免重算）===
-    task_type = str(cfg["task"]["type"]).lower()
-    if task_type == "classification":
-        y = df_lbl["y_cls"].rename("label")
+        ret_shift=int(Lcfg["ret_shift"]),
+        ret_type=str(Lcfg.get("ret_type", "logret")).lower(),
+        ffd_d=float(Lcfg.get("fracdiff", {}).get("d", 0.3)),
+        ffd_thres=float(Lcfg.get("fracdiff", {}).get("thres", 1e-5)),
+    )
+    if want_cls:
+        s = tmp["y_cls"].copy()
+        s.name = "y_cls"
+        return s
     else:
-        # regression：若要 simple return，就由 logret 轉換；否則直接用 logret
-        y = df_lbl["y_reg"].astype("float32").rename("target")
-
-    # === 6) 去掉未來 close 為 nan 或特徵不完整的時點 ===
-    valid_now = X.notna().all(axis=1)
-    
-    mode = str(cfg["label"]["mode"]).lower()
-    if mode == "event_tbm":
-        # 事件驅動：保留完整 15m 網格的 X；y 只在 t0 上有值，其餘 NaN
-        X = X[valid_now]
-        y = y.reindex(X.index)  # 不要用 y.notna() 去濾掉列
-    else:        
-        valid_lbl = y.notna()
-        keep = valid_now & valid_lbl
-        X, y = X[keep], y[keep]
-
-    # === 7) 篩選時間區間（最重要）===
-    mask_range = (X.index >= start_date) & (X.index <= end_date)
-    X = X.loc[mask_range]
-    y = y.loc[mask_range]
-
-    # === 8) 再次清理數值（NaN / inf） ===
-    X = X.replace([np.inf, -np.inf], np.nan).dropna()
-    y = y.loc[X.index]
-    y = y.replace([np.inf, -np.inf], np.nan).dropna()
-    X = X.loc[y.index]
-
-    # === 9) 最後過濾不合法的 label（分類限定）
-    if task_type == "classification":
-        # 轉回整數類別並過濾非法值
-        y = y.astype("int")
-        num_classes = int(cfg["model"]["num_classes"])
-        y = y[(y >= 0) & (y < num_classes)]
-        X = X.loc[y.index]
-    
-    X, y = X.align(y, join="inner", axis=0)
-    # --- 回傳前再做一次保險檢查 ---
-    bad2 = [c for c in X.columns if c.lower() in label_like]
-    assert not bad2, f"X 仍包含標籤欄位：{bad2}"
-    return X, y
-
+        s = tmp["y_reg"].copy()
+        s.name = "y_reg"
+        return s

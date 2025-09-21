@@ -5,7 +5,7 @@ train_core/
 ├─ build_feature_loader/
 │  ├─ build_features.py       # 特徵與標籤對齊、報酬計算
 │  ├─ dataloader.py           # SeqDataset、FoldGenerator、DataLoader
-│  └─ indicators.py           # 技術指標計算、快取與除錯
+│  └─ indicators.py           # 技術指標計算與除錯
 ├─ models/
 │  ├─ LSTM.py                 # LSTM_SE 模型
 │  ├─ Transformer.py          # TemporalTransformer 模型
@@ -34,8 +34,8 @@ train_core/
 | 檔案 | 功能概要 |
 |-----|---------|
 | `build_features.py` | 把 `Indicators` 產生的技術指標與原始 OHLCV 對齊並回傳 `X, y`。支援 `regression` 與 `classification`：<br> - 將時間轉成 UTC 並強制網格化<br> - `horizon` 未來報酬計算（`logret` 或 `simple`）<br> - 回歸回傳連續 `target`；分類依 `cls_threshold` 產生 0/1 `label`<br> - 清除 NaN / inf、限制時間範圍 |
-| `dataloader.py` | 提供訓練資料載入：<br> - `SeqDataset`：把 `DataFrame` → `[N,T,F]` 時序張量、對應標籤<br> - `FoldGenerator`：支持 `Anchored`、`Rolling`、`OddEven` 等時間窗切分，含 `embargo` 保護<br> - `make_loaders_for_fold`：依 fold 建立 `train/val/test` 的 `DataLoader`，可同時輸出 XGB 所需的 numpy |
-| `indicators.py` | 技術指標計算核心：<br> - 正規化 OHLCV（UTC、排序、去重、缺口警示）<br> - `PAPER_TOP8_PLAN` / `BEST20_PLAN` 預設特徵方案<br> - 自訂多項 `pandas_ta` 指標與原始欄位 builder<br> - 以「資料指紋 + 計畫指紋」進行 Parquet 快取<br> - 防洩漏：全部特徵 `shift(1)`<br> - 除錯：欄位重複、未知指標、缺欄位、頻率缺口等皆會拋錯或提示 |
+| `dataloader.py` | 提供訓練資料載入：<br> - `SeqDataset`：把 `DataFrame` → `[N,T,F]` 時序張量、對應標籤<br> - `FoldGenerator`：支持 `Anchored`、`Rolling`、`OddEven` 等時間窗切分，含 `embargo` 保護<br> - `make_time_loaders_for_fold`：time-driven 依 fold 建立 `train/val/test` 的 `DataLoader`（可同時輸出 XGB numpy）<br> - `make_event_loaders_for_fold`：event-driven（TBM）模式的事件序列載入 |
+| `indicators.py` | 技術指標計算核心：<br> - 正規化 OHLCV（UTC、排序、去重、缺口警示）<br> - `PAPER_TOP8_PLAN` / `BEST20_PLAN` 預設特徵方案<br> - 自訂多項 `pandas_ta` 指標與原始欄位 builder<br> - 防洩漏：全部特徵 `shift(1)`<br> - 除錯：欄位重複、未知指標、缺欄位、頻率缺口等皆會拋錯或提示 |
 
 ### models
 
@@ -90,7 +90,7 @@ train_core/
 
 2. **技術指標計算 (`Indicators`)**  
    - 規格化 OHLCV 後，依 `config.features.plan` 逐項指標計算。  
-   - 以資料指紋 + 計畫指紋決定快取檔名；已有快取直接讀取。  
+   - 直接計算所選特徵（不使用磁碟快取）。  
    - 所有特徵 `shift(1)` 防洩漏；欄位重複會拋錯。  
 
 3. **特徵與標籤建立 (`build_features_and_label`)**  
@@ -104,7 +104,7 @@ train_core/
    - `Anchored`：從起始時間開始累積資料，每個測試月前加 `embargo` 小時禁區。  
    - `Rolling`：固定訓練窗大小往前滑動。  
 
-5. **DataLoader (`make_loaders_for_fold`)**  
+5. **DataLoader (`make_time_loaders_for_fold` / `make_event_loaders_for_fold`)**  
    - 依 fold 時間 index 切出 `train/val/test`。  
    - `scaler` (Robust/Standard/MinMax) 僅 fit 在訓練集。  
    - `SeqDataset` 產生 `[batch, seq_len, features]`；標籤型別依任務決定。  
@@ -140,7 +140,7 @@ train_core/
 1. **入口 `main_train.py`**  
    - `load_cfg` → 讀取 `config.yaml`  
    - `set_seed`、`setup_cuda_acceleration` 初始化  
-   - `prepare_dataframe` → 產生 `df` (特徵+label) 與 `pt_bundle` (指標快取路徑等)  
+   - `prepare_dataframe` → 產生 `df` (特徵+label) 與 `pt_bundle` (欄位資訊等)  
    - `build_study` → Optuna Study (SQLite)  
    - `study.optimize` → 迴圈執行 `objective`  
 
@@ -149,7 +149,7 @@ train_core/
    - `get_enabled_feature_names` 解析目前啟用的特徵欄  
    - `make_folds` → 依 CV 參數產生折疊  
    - 逐 fold：  
-     - `make_loaders_for_fold` → DataLoader / XGB numpy  
+     - `make_time_loaders_for_fold` 或 `make_event_loaders_for_fold` → DataLoader / XGB numpy  
      - `build_model` → 建立 DL 或 XGB 模型  
      - `train_one_fold` → 執行訓練、驗證、測試；輸出指標與圖表  
      - `compute_trial_score` → 回傳該 fold 分數給 Optuna  
@@ -199,7 +199,7 @@ train_core/
 
 ## 補充說明
 
-* `Indicators` 產生的特徵會快取於 `config.features.cache_dir`（預設 `cache_features`），避免重複計算。  
+* `Indicators` 產生的特徵不再寫入磁碟快取；每次直接由計畫動態計算。  
 * 若要增添新指標，只需在 `Indicators._builders` 中註冊對應函式，並於 `config.yaml` 的 `features.plan` 啟用即可。  
 * `regression_to_class` 區塊可將回歸輸出轉成訊號（例如多空判斷），支援以 F-beta 最優門檻或固定門檻。  
 * `dump_best_yaml` 會將搜尋空間替換為實際值，方便後續直接載入最佳設定重現結果。  

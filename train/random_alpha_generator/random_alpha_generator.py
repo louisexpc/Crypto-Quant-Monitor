@@ -7,8 +7,9 @@ import pandas as pd
 import numpy as np
 import random
 import copy
+import os
 from typing import Any, List, Tuple
-from node import Node, Leaf, OpNode
+from .node import Node, Leaf, OpNode
 import json, time
 import talib
 from pprint import pprint,pformat
@@ -146,7 +147,6 @@ def calc_sharpe(signal, returns)-> float:
 # ================== 儲存工具 =======================
 # --- 序列化 ---
 def node_to_dict(node):
-    from node import Leaf, OpNode
     if isinstance(node, Leaf):
         return {"type": "Leaf", "value": node.value}
     elif isinstance(node, OpNode):
@@ -166,7 +166,6 @@ def node_to_dict(node):
 
 # --- 反序列化 ---
 def node_from_dict(d):
-    from node import Leaf, OpNode
     t = d["type"]
     if t == "Leaf":
         return Leaf(d["value"])
@@ -352,7 +351,6 @@ class Individual:
         Returns:
         - 是否為純數值常數葉節點
         """
-        from node import Leaf
         return isinstance(node, Leaf) and not isinstance(node.value, str)
     
     def _is_field_leaf(self, node:Node) -> bool:
@@ -363,7 +361,6 @@ class Individual:
         Returns:
         - 是否為欄位葉節點
         """
-        from node import Leaf
         return isinstance(node, Leaf) and isinstance(node.value, str)
     
     def _canonical_leaf(self,node:Node) -> dict[str, Any]:
@@ -374,7 +371,6 @@ class Individual:
         Returns:
         - dict 表示
         """
-        from node import Leaf
         assert isinstance(node, Leaf)
         if isinstance(node.value, str):
             # 欄位名 Leaf：直接用字串
@@ -973,9 +969,86 @@ class GeneticAlphaSolver:
 
         return best
 
-# ================== 使用示例 ==================
 
-if __name__ == "__main__":
+alphas = [
+    # Alpha 1: -1 * correlation(volume, close, N)---成交量与收盘价在N日内的背离程度
+    OpNode('*',
+        Leaf(-1),
+        OpNode('correlation',
+            Leaf('volume'),
+            Leaf('close')
+        )
+    ),
+    # Alpha 2: -1 * correlation(delta(volume, 1), delta(close,1), N)---成交量变动与收盘价日内变动在N日内的背离程度
+    OpNode('*',
+        Leaf(-1),
+        OpNode('correlation',
+            OpNode('delta', Leaf('volume'), Leaf(1)),
+            OpNode('delta', Leaf('close'), Leaf(1))
+        )
+    ),
+    # Alpha 3: -1 * correlation(rank(delta(volume), 1)), rank(delta(close,1)), N)
+    OpNode('*',
+        Leaf(-1),
+        OpNode('correlation',
+            OpNode('rank', OpNode('delta', Leaf('volume'), Leaf(1))),
+            OpNode('rank', OpNode('delta', Leaf('close'), Leaf(1)))
+        )
+    ),
+    # Alpha 4: correlation(close,open,N)
+    OpNode('correlation',
+        Leaf('close'),
+        Leaf('open')
+    ),
+    # Alpha 5: (high + low)/2 - close
+    OpNode('-',
+        OpNode('/',
+            OpNode('+', Leaf('high'), Leaf('low')),
+            Leaf(2)
+        ),
+        Leaf('close')
+    ),
+
+    # Alpha 6: (2 * close - low - high) / ( high - low + 0.0001)
+    OpNode('/',
+        OpNode('-',
+            OpNode('*', Leaf(2), Leaf('close')),
+            OpNode('+', Leaf('low'), Leaf('high'))
+        ),
+        OpNode('+',
+            OpNode('-',
+                Leaf('high'),
+                Leaf('low')
+            ),
+            Leaf(0.0001)
+        )
+    ),
+]
+    
+# ================== 使用示例 ==================
+def main(
+        data_path: str = '../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv',
+        start_date: str = "2025-04-30 23:00:00+08:00",
+        alphas: list[OpNode] | None = None,
+        # generators
+        population_size: int = 150,
+        generations: int = 100,
+        fitness_type: str = 'ic',  # 可選 'ic' 或 'sharpe'
+        depth: int = 5,
+        point_mutation_rate: float = 0.4,
+        crossover_rate: float = 0.7,
+        tournament_size: int = 5,
+        early_stopping_generations: int = 20,
+        operator_set: list[str] | None = None,
+        terminal_set: list[str] | None = None,
+        ic_threshold: float = 0.02,
+        sharpe_threshold: float = 0.9,
+        # multiprocessing
+        n_jobs: int = 30,  # 使用進程數量
+        mp_start_method: str | None = 'spawn',    # ← 跨平台穩定；Linux 可不填或用 'fork'
+        save_folder: str = "",
+        ):
+    
     # 生成測試數據
     # np.random.seed(42)
     # dates = pd.date_range('2020-01-01', periods=200, freq='D')
@@ -990,8 +1063,8 @@ if __name__ == "__main__":
     # print(f"可能核心數量 : {os.cpu_count()}")
     
     # """前處理"""
-    data = pd.read_csv('../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv', parse_dates=['datetime'], index_col='datetime')
-    data = data[data.index <="2025-04-30 23:00:00+08:00"]
+    data = pd.read_csv(data_path, parse_dates=['datetime'], index_col='datetime')
+    data = data[data.index <= start_date]
     print(f"Data Range: {data.index.min()} to {data.index.max()}, Total Rows: {len(data)}")
     returns = data['close'].pct_change().shift(-1)
 
@@ -1006,64 +1079,14 @@ if __name__ == "__main__":
         data[f"adx_{n}"] = talib.ADX(data['high'], data['low'], data['close'], timeperiod=n)
         data[f"willr_{n}"] = talib.WILLR(data['high'], data['low'], data['close'], timeperiod=n)
     feature_cols = data.columns.tolist()
-    feature_cols.remove('timestamp')  # 移除目標變數
+    if 'timestamp' in feature_cols:
+        feature_cols.remove('timestamp')  # 移除目標變數
+    terminals = terminal_set if terminal_set is not None else feature_cols
     print("Feature columns:", feature_cols)
 
     """定義一些已知的 alpha 公式樹（可選）"""
-    alphas = [
-        # Alpha 1: -1 * correlation(volume, close, N)---成交量与收盘价在N日内的背离程度
-        OpNode('*',
-            Leaf(-1),
-            OpNode('correlation',
-                Leaf('volume'),
-                Leaf('close')
-            )
-        ),
-        # Alpha 2: -1 * correlation(delta(volume, 1), delta(close,1), N)---成交量变动与收盘价日内变动在N日内的背离程度
-        OpNode('*',
-            Leaf(-1),
-            OpNode('correlation',
-                OpNode('delta', Leaf('volume'), Leaf(1)),
-                OpNode('delta', Leaf('close'), Leaf(1))
-            )
-        ),
-        # Alpha 3: -1 * correlation(rank(delta(volume), 1)), rank(delta(close,1)), N)
-        OpNode('*',
-            Leaf(-1),
-            OpNode('correlation',
-                OpNode('rank', OpNode('delta', Leaf('volume'), Leaf(1))),
-                OpNode('rank', OpNode('delta', Leaf('close'), Leaf(1)))
-            )
-        ),
-        # Alpha 4: correlation(close,open,N)
-        OpNode('correlation',
-            Leaf('close'),
-            Leaf('open')
-        ),
-        # Alpha 5: (high + low)/2 - close
-        OpNode('-',
-            OpNode('/',
-                OpNode('+', Leaf('high'), Leaf('low')),
-                Leaf(2)
-            ),
-            Leaf('close')
-        ),
-
-        # Alpha 6: (2 * close - low - high) / ( high - low + 0.0001)
-        OpNode('/',
-            OpNode('-',
-                OpNode('*', Leaf(2), Leaf('close')),
-                OpNode('+', Leaf('low'), Leaf('high'))
-            ),
-            OpNode('+',
-                OpNode('-',
-                    Leaf('high'),
-                    Leaf('low')
-                ),
-                Leaf(0.0001)
-            )
-        ),
-    ]
+    alphas_to_use = alphas if alphas is not None else globals().get('alphas', [])
+    
     """Signature Test"""
     # test_ind = Individual((
     #     OpNode('*',
@@ -1139,38 +1162,52 @@ if __name__ == "__main__":
 
     
     # # # 執行遺傳演算法
-    for i,ind in enumerate(alphas):
+    os.makedirs(save_folder, exist_ok=True)
+
+    for i, ind in enumerate(alphas_to_use):
         test_individual = Individual(ind)
         print("Alpha Formula:", test_individual.show())
 
-        solver = GeneticAlphaSolver(
-            df=data, 
-            returns=returns, 
-            population_size=150, 
-            generations=100,
-            fitness_type='ic',  # 可選 'ic' 或 'sharpe'
+        solver_kwargs = dict(
+            df=data,
+            returns=returns,
+            population_size=population_size,
+            generations=generations,
+            fitness_type=fitness_type,  # 可選 'ic' 或 'sharpe'
             population=[test_individual],  # 初始種群:只能放一個
-            depth=5,
-            point_mutation_rate=0.4,
-            terminal_set=feature_cols,  # 使用擴展後的特徵集
-            early_stopping_generations=20,
+            depth=depth,
+            point_mutation_rate=point_mutation_rate,
+            crossover_rate=crossover_rate,
+            tournament_size=tournament_size,
+            terminal_set=terminals,  # 使用擴展後的特徵集
+            early_stopping_generations=early_stopping_generations,
             # NEW multiprocessing
-            n_jobs=30,  # 使用進程數量
-            mp_start_method='spawn'    # ← 跨平台穩定；Linux 可不填或用 'fork'
+            n_jobs=n_jobs,
+            mp_start_method=mp_start_method,    # ← 跨平台穩定；Linux 可不填或用 'fork'
         )
-        
+        if operator_set is not None:
+            solver_kwargs["operator_set"] = operator_set
+
+        solver = GeneticAlphaSolver(**solver_kwargs)
+
         best_alpha = solver.evolve()
         print(f"\n最佳Alpha {best_alpha.show()} - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
 
-        if abs(best_alpha.ic) >= 0.02 and best_alpha.sharpe >= 0.9:
+        if abs(best_alpha.ic) >= ic_threshold and best_alpha.sharpe >= sharpe_threshold:
             # 儲存最佳Alpha
-            save_alpha(best_alpha, f"best_evolved_alpha_from_predefined_{i}.json")
+            save_path = os.path.join(save_folder, f"best_evolved_alpha_from_predefined_{i}.json")
+            save_alpha(best_alpha, save_path)
 
-    # # 儲存最佳Alpha
-    # save_alpha(best_alpha, "best_evolved_alpha.json")
-    # # 載入最佳Alpha
-    # loaded_alpha = load_alpha("best_evolved_alpha.json")
-    # print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")
+    # 儲存最佳Alpha    
+    alpha_path = os.path.join(save_folder, "best_evolved_alpha.json")
+    save_alpha(best_alpha, alpha_path)
+    # 載入最佳Alpha
+    loaded_alpha = load_alpha(alpha_path)
+    print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")
 
     """HOW TO USE"""
     # return_features  = loaded_alpha.tree.eval(your_dataframe)
+
+if __name__ == "__main__":
+    main(data_path="data/ohlcv_2023/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
+         save_folder="utils/feature_selections/gp_alpha/results")

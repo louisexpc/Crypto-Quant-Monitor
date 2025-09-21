@@ -3,7 +3,7 @@ import os, sys, re
 import optuna
 import numpy as np
 from pathlib import Path
-
+import copy, datetime, yaml
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from build_feature_loader.dataloader import FoldGenerator
 
@@ -75,60 +75,56 @@ def suggest_cat(trial: optuna.Trial, name: str, vals):
 # ======================================================================
 def suggest_rolling_and_cv(trial: optuna.Trial, cfg: dict) -> dict:
     """讓 Optuna 針對序列/切分做取樣；對於 list 皆採樣，單值則原樣。"""
+    cv_cfg = cfg["cv"]
+    cv_mode = cv_cfg["type"]
 
     # 1) 序列長度
     cfg["sequence"]["seq_len"] = suggest_int(trial, "sequence.seq_len", cfg["sequence"]["seq_len"])
 
-    # 2) stride（若在 YAML 寫成 list 也能調；否則維持原值）
+    # 2) stride
     if "stride" in cfg["sequence"]:
         cfg["sequence"]["stride"] = suggest_int(trial, "sequence.stride", cfg["sequence"]["stride"])
 
-    # 3) stride_anchor（通常固定 0；但給 list 也可調）
-    if "stride_anchor" in cfg["sequence"]:
-        cfg["sequence"]["stride_anchor"] = suggest_int(trial, "sequence.stride_anchor", cfg["sequence"]["stride_anchor"])
 
-    # 4) Rolling 訓練窗（月數）
-    cfg["cv"]["train_months"] = suggest_int(trial, "cv.train_months", cfg["cv"]["train_months"])
+    if cv_mode == "Purged_kfold":
+        cv_cfg["n_splits"] = suggest_int(trial, "cv.n_splits", cv_cfg["n_splits"])
+    
+    elif cv_mode == "Rolling":
+        # 4) Rolling 訓練窗（月數）
+        cv_cfg["train_months"] = suggest_int(trial, "cv.train_months", cfg["cv"]["train_months"])
 
-    # 5) 測試頻率（可為固定 or 多選）
-    test_freq = cfg["cv"]["test_freq"]
-    cfg["cv"]["test_freq"] = suggest_cat(trial, "cv.test_freq", test_freq) if isinstance(test_freq, list) else test_freq
-
-    # 6) embargo（可為單值或 [low,high]）
-    cfg["cv"]["embargo_hours"] = suggest_int(trial, "cv.embargo_hours", cfg["cv"]["embargo_hours"])
-
-    # 7) train/val split（可為單值或 [low,high]）
-    cfg["cv"]["train_val_split"] = suggest_float(trial, "cv.train_val_split", cfg["cv"]["train_val_split"])
-
-    # 8) label.ret_shift（若你想用 list 搜尋）
-    if "label" in cfg and "ret_shift" in cfg["label"]:
-        cfg["label"]["ret_shift"] = suggest_int(trial, "label.ret_shift", cfg["label"]["ret_shift"])
+        # 5) 測試頻率（可為固定 or 多選）
+        test_freq = cfg["cv"]["test_freq"]
+        cv_cfg["test_freq"] = suggest_cat(trial, "cv.test_freq", test_freq) if isinstance(test_freq, list) else test_freq
+    else:
+        raise KeyError("no such mode")
 
     return cfg
 
 
 
 def make_folds(df, cfg):
-    """依 cfg.cv.type 產生 folds。"""
-    cv_type = cfg["cv"]["type"]
-    start_month = cfg["cv"]["start_date"] 
-    fold_g = FoldGenerator(dt_index=df.index, mode=cv_type, start_month=start_month)
+    """依 cfg.cv.type 產生 folds。"""    
+    cfg_cv = cfg["cv"]
+    cv_type = cfg_cv["type"]
+    fold_g = FoldGenerator(dt_index=df.index, 
+                           mode=cv_type, 
+                           start_month=cfg_cv["start_date"],
+                           end_month=cfg_cv["end_date"])
+    
 
-    if cv_type == "OddEven":
-        return fold_g.make_two_month_folds()
-
-    if cv_type == "Anchored":
-        return fold_g.make_anchored_folds(
-            embargo_hours=cfg["cv"].get("embargo_hours", 24),
-            min_train_days=cfg["cv"].get("min_train_days", 30),
-            test_freq=cfg["cv"].get("test_freq", "M")
+    if cv_type == "Purged_kfold":
+        return fold_g.make_purged_kfold(
+            n_splits=cfg_cv["n_splits"],
+            embargo_hours=cfg_cv["embargo_hours"],
+            min_train_days=cfg_cv["min_train_days"]
         )
 
     if cv_type == "Rolling":
         return fold_g.make_rolling_folds(
-            cfg["cv"]["train_months"],
-            cfg["cv"]["embargo_hours"],
-            test_freq=cfg["cv"].get("test_freq", "M")
+            train_window=cfg_cv["train_months"],
+            embargo_hours=cfg_cv["embargo_hours"],
+            test_freq=cfg_cv["test_freq"]
         )
 
     raise ValueError(f"Unknown fold type: {cv_type}")
@@ -194,20 +190,114 @@ def suggest_model_hparams(trial: optuna.Trial, cfg: dict) -> dict:
 
 
 # ======================================================================
-# Section D. 特徵池
+# Section D. 紀錄該trialyaml
 # ======================================================================
 
-def get_enabled_feature_names(cfg: dict, df_columns: list[str], target_col: str | None = None) -> list[str]:
-    if target_col is None:
-        target_col = "label" if str(cfg["task"]["type"]).lower() == "classification" else "target"
-    blacklist = {target_col, "label", "target", "y", "y_cls", "y_reg"}
-    return [c for c in df_columns if c not in blacklist]
 
+def set_by_dotpath(d, dotpath, value):
+    """把 value 寫到 d['a']['b']['c']；dotpath='a.b.c'。會自動建子dict。"""
+    keys = dotpath.split(".")
+    cur = d
+    for k in keys[:-1]:
+        if k not in cur or not isinstance(cur[k], dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
 
+def save_trial_config(base_cfg: dict,
+                      trial_params: dict,
+                      trial_dir: str,
+                      keymap: dict | None = None,
+                      extra_meta: dict | None = None,
+                      filename: str = "config.used.yaml"):
+    """
+    base_cfg:     已載入的原始 YAML（dict）
+    trial_params: 這次 trial 的參數（Optuna 的 trial.params 或你整理後的 dict）
+    trial_dir:    要存放的資料夾（會自動建立）
+    keymap:       若 trial 的參數名 != dot path，提供 mapping；若已是 dot path 可不給
+    extra_meta:   額外要寫進 YAML 的資訊（會放在頂層 _meta 區塊）
+    """
+    os.makedirs(trial_dir, exist_ok=True)
 
+    # 1) deepcopy 原始 cfg
+    cfg_used = copy.deepcopy(base_cfg)
+
+    # 2) 覆寫這次 trial 的參數
+    for k, v in trial_params.items():
+        dotkey = keymap.get(k, k) if keymap else k  # 若沒 keymap，假設 k 已是 dot path
+        set_by_dotpath(cfg_used, dotkey, v)
+
+    # 3) 附註 meta（含完整 trial_params 以利追蹤）
+    meta = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "trial_params": trial_params,
+    }
+    if extra_meta:
+        meta.update(extra_meta)
+    cfg_used["_meta"] = meta
+
+    # 4) 存成 YAML（把 list 的搜尋區間留在未被覆寫的鍵上沒關係）
+    out_path = os.path.join(trial_dir, filename)
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg_used, f, allow_unicode=True, sort_keys=False)
+    return out_path
 
 # ======================================================================
-# Section E. 安全組 tag、重新命名 trial 目錄
+# Section E. Trial 得分計算（依 primary_metric / direction）
+# ======================================================================
+def compute_trial_score(result: dict, cfg: dict) -> float:
+    """
+    回傳單一 fold 的分數（由 caller 負責做平均）。
+    - 分類 primary_metric（常見）：threshold_macro_f05 / macro_f1 / acc（通常 direction='maximize'）
+    - 回歸 primary_metric：mixed（minimize）、pearson（maximize）、val_loss（minimize）
+    """
+    primary = str(cfg["objective"].get("primary_metric", "threshold_macro_f05")).lower()
+    direction = str(cfg["objective"].get("direction", "maximize")).lower()
+    task_type = get_task_type(cfg)
+    if result is None:
+        return -1e9  # 或 0.0，依你的 direction
+
+    if task_type == "classification":
+        if primary == "threshold_macro_f05":
+            # 需要兩類；trainer 已在二分類時寫入 threshold_metrics
+            score = result.get("threshold_metrics", {}).get("f_05_macro", None)
+            if score is None:
+                # 沒有 threshold 版就 fallback macro_f1
+                score = result.get("test_metrics", {}).get("test_macro_f1", 0.0)
+        elif primary == "macro_f1":
+            score = result.get("test_metrics", {}).get("test_macro_f1", 0.0)
+        elif primary == "mcc":
+            score = result.get("test_metrics", {}).get("test_mcc", 0.0)
+        else:
+            raise ValueError(f"[objective] Unsupported primary_metric for classification: {primary}")
+
+        return float(score) if direction == "maximize" else float(-score)
+
+    else:
+        # regression
+        if primary == "mixed":
+            # α·EMA-MSE + β·(1−Pearson)（越小越好）
+            score = result.get("best_val_mixed", None)
+            if score is None:
+                # 後備：用測試 rmse
+                score = result.get("test_metrics_reg", {}).get("rmse", np.inf)
+            return float(score) if direction == "minimize" else float(-score)
+
+        elif primary == "pearson":
+            score = result.get("best_val_pearson", None)
+            if score is None:
+                score = result.get("test_metrics_reg", {}).get("pearson", 0.0)
+            return float(score) if direction == "maximize" else float(-score)
+
+        elif primary in ["val_loss", "loss"]:
+            score = result.get("test_metrics_reg", {}).get("test_loss", np.inf)
+            return float(score) if direction == "minimize" else float(-score)
+
+        else:
+            raise ValueError(f"[objective] Unsupported primary_metric for regression: {primary}")
+
+# ======================================================================
+# Section F. 安全組 tag、重新命名 trial 目錄
 # ======================================================================
 
 def _format_score_tag(name: str, val, digits: int = 4, signed: bool = True) -> str:
