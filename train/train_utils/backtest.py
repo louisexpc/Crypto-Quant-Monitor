@@ -38,13 +38,13 @@ class BacktestExecutor:
         self.price = self.olhcv_df['close']
         self.predictions_df = predictions_df
 
-        self.long_entry,self.long_exit, self.short_entry, self.short_exit = self._init_long_short_signals()
+        self.long_entry, self.long_exit, self.short_entry, self.short_exit = self._init_long_short_signals()
 
         self.init_cash = init_cash
         self.fees = fees
         self.slippage = slippage
     
-    def _init_long_short_signals(self) -> Tuple[pd.Series,  pd.Series, pd.Series, pd.Series]:
+    def _init_long_short_signals(self) -> Tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
         """
         Initialize long and short entry/exit signals based on predictions DataFrame.
         Returns:
@@ -105,7 +105,7 @@ class BacktestExecutor:
         if short_entry_count != short_exit_count:
             print(f"[Warning] Mismatched short entry/exit signals: {short_entry_count} entries vs {short_exit_count} exits.")
 
-        return long_entry,long_exit, short_entry, short_exit
+        return long_entry, long_exit, short_entry, short_exit
 
     def run(self, save_results:bool = False) ->Tuple[float, float, float, float]:
         """
@@ -135,7 +135,7 @@ class BacktestExecutor:
             exits   = pd.Series(False, index=self.price.index),
             short_entries = self.short_entry.astype(bool),
             short_exits   = self.short_exit.astype(bool),
-            direction = Direction.ShortOnly,             # 關鍵：允許做空
+            direction = Direction.ShortOnly,             # # Key: allows short selling
             init_cash=self.init_cash,
             fees=self.fees,
             slippage=self.slippage,
@@ -152,7 +152,7 @@ class BacktestExecutor:
             short_pf.trades.records_readable.to_csv("short_trade.csv", index=False)
             short_pf.orders.records_readable.to_csv("short_order.csv", index=False)
             print(f"[Info] Long and Short trade/order details saved to current folder.")
-        return long_pf.stats()['Total Return [%]'], long_pf.stats()['Sharpe Ratio'],short_pf.stats()['Total Return [%]'], short_pf.stats()['Sharpe Ratio']
+        return self.long_status['Total Return [%]'], self.long_status['Sharpe Ratio'], self.short_status['Total Return [%]'], self.short_status['Sharpe Ratio']
 
     def get_short_status(self) -> pd.Series:
         """Get the statistics of the short strategy."""
