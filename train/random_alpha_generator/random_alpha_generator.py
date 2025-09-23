@@ -9,7 +9,7 @@ import random
 import copy
 import os
 from typing import Any, List, Tuple
-from .node import Node, Leaf, OpNode
+from node import Node, Leaf, OpNode
 import json, time
 import talib
 from pprint import pprint,pformat
@@ -422,6 +422,7 @@ class Individual:
         out = {
             "type": "OpNode",
             "op": op,
+            "op_class": node.node_class,
             "arity": ar,
             "left": left_d,
             "right": right_d
@@ -633,6 +634,32 @@ class GeneticAlphaSolver:
         """Update: 改為 dict 比較"""
         dict1 = ind1.node_to_canonical_dict(ind1.tree)
         dict2 = ind2.node_to_canonical_dict(ind2.tree)
+        return self._compare_dicts(dict1, dict2)
+
+    def _compare_dicts(self,d1, d2, ignore_keys=None):
+        if ignore_keys is None:
+            ignore_keys = {"value","op"}  # 預設忽略 value 欄位
+
+        if isinstance(d1, dict) and isinstance(d2, dict):
+            # 先比 key 集合，排除要忽略的 key
+            keys1 = set(d1.keys()) - ignore_keys
+            keys2 = set(d2.keys()) - ignore_keys
+            if keys1 != keys2:
+                return False
+            # 遞迴檢查每個 key
+            for k in keys1:
+                if not self._compare_dicts(d1[k], d2[k], ignore_keys):
+                    return False
+            return True
+        elif isinstance(d1, list) and isinstance(d2, list):
+            if len(d1) != len(d2):
+                return False
+            return all(self._compare_dicts(x, y, ignore_keys) for x, y in zip(d1, d2))
+        else:
+            # leaf node -> 只有在不是忽略欄位時才要比對值
+            return d1 == d2
+
+
 
     def _identical_structure(self, node1:Node, node2:Node, mode :str = 'relaxed')-> bool:
         """檢查兩個子樹是否結構相同: 
@@ -1209,5 +1236,33 @@ def main(
     # return_features  = loaded_alpha.tree.eval(your_dataframe)
 
 if __name__ == "__main__":
-    main(data_path="data/ohlcv_2023/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
-         save_folder="utils/feature_selections/gp_alpha/results")
+    # main(data_path="data/ohlcv_2023/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
+    #      save_folder="utils/feature_selections/gp_alpha/results")
+    test1 = Individual(
+        OpNode('*',
+            Leaf(-1),
+            OpNode('correlation',
+                Leaf('low'),
+                Leaf('close')
+            )
+        )
+    )
+    test2 = Individual(
+        OpNode('+',
+            Leaf(-1),
+            OpNode('correlation',
+                Leaf('volume'),
+                Leaf('high')
+            )
+        )
+    )
+    from pprint import pprint, pformat
+    print(pformat(test1.node_to_canonical_dict(test1.tree), indent=2, width=50))
+    print(pformat(test2.node_to_canonical_dict(test2.tree), indent=2, width=50))
+    solver = GeneticAlphaSolver(
+            df = pd.DataFrame(),
+            returns = pd.Series(),
+            n_jobs=1
+        )
+    print(solver._identical_structure_update(test1, test2))
+    
