@@ -1,207 +1,226 @@
-# Train Core
-## 專案目錄與檔案說明
+# Train
+
+## 流程
 ```
-train_core/
-├─ build_feature_loader/
-│  ├─ build_features.py       # 特徵與標籤對齊、報酬計算
-│  ├─ dataloader.py           # SeqDataset、FoldGenerator、DataLoader
-│  └─ indicators.py           # 技術指標計算與除錯
-├─ models/
-│  ├─ LSTM.py                 # LSTM_SE 模型
-│  ├─ Transformer.py          # TemporalTransformer 模型
-│  ├─ fastCNN.py              # AdaptiveKernelCNN
-│  ├─ hybird.py               # CNN+Transformer 雙模態融合
-│  ├─ model_factory.py        # 模型生成工廠
-│  └─ xgb_model.py            # XGBoost wrapper
-├─ objective/
-│  ├─ objective.py            # Optuna 主目標函式與 trial 執行
-│  └─ objective_utils.py      # 超參搜尋、fold 生成、特徵選取
-├─ trainer/
-│  ├─ trainer_base.py         # 公用工具、AMP、optimizer 建立
-│  ├─ trainer_cls.py          # 分類訓練流程
-│  ├─ trainer_reg.py          # 回歸訓練流程
-│  └─ xgb_trainer.py          # XGBoost 訓練流程
-├─ utils/
-│  ├─ compute_export_metrices.py # 度量計算、圖表輸出、best YAML 匯出
-│  ├─ init_train.py              # 隨機種子、CUDA/TF32 初始化
-│  └─ regression_utils.py        # 回歸損失與指標
-├─ main_train.py              # 整體入口：讀取 YAML、準備資料、執行 Optuna
-└─ config.yaml                # 預設設定檔（資料路徑、模型、CV、特徵等）
+Precomputed features (CSV/Parquet) + TBM labels
+        │  (config.data.path, config.label)
+        ▼
+train/main_train.py.load_cfg        # 載入 YAML、設定亂數種子、建立輸出位置
+        ▼
+Optuna objective( trial, cfg, df )  # objective.objective
+        │
+        ├─ make_folds()             # objective_utils.make_folds → FoldGenerator
+        ├─ make_*_loaders_for_fold  # build_feature_loader.dataloader
+        │      │
+        │      ├─ select_plan_columns()  # 根據 features.plan 過濾欄位
+        │      ├─ create_label()         # build_features.create_label / TBM 對齊
+        │      └─ SeqDataset/EventDataset
+        │
+        ├─ build_model()            # models.model_factory
+        ├─ train_one_fold()         # trainer_cls / trainer_reg
+        └─ compute_trial_score()    # objective_utils
+        ▼
+Optuna Trial Summary               # save_cv_summary, dump_best_yaml
+        ▼
+Post infer / TBM concat (可選)     # objective.export_tbm_predictions_for_trial
 ```
 
-### build_feature_loader
+## 1. 啟動入口 (train/main_train.py)
+- `load_cfg` 讀取 YAML (`train/config.yaml`) 並以 UTF-8 載入整份訓練設定。
+- `set_seed` 與 `setup_cuda_acceleration` 固定亂數、開啟 TF32/AMP 等 GPU 加速選項。
+- `prepare_dataframe` 只負責讀取預算特徵檔，建立時間索引 (UTC)；實際特徵/標籤組裝在每個 fold 內處理。
+- `build_study` 以 SQLite 儲存 Optuna Study，對應 `cfg.search` 的 sampler、pruner、超參限制。
+- `study.optimize` 呼叫 `objective`：
+  - 設定輸出資料夾 `runs/<project_name>/trial_xxx/` (多 GPU 會分 `gpu*/trial_xxx`)。
+  - 每個 trial 會覆寫 `cfg.seed = base_seed + trial.number`，確保可重現。
+  - 完成後呼叫 `dump_best_yaml` 匯出最佳設定、超參與特徵組合。
 
-| 檔案 | 功能概要 |
-|-----|---------|
-| `build_features.py` | 把 `Indicators` 產生的技術指標與原始 OHLCV 對齊並回傳 `X, y`。支援 `regression` 與 `classification`：<br> - 將時間轉成 UTC 並強制網格化<br> - `horizon` 未來報酬計算（`logret` 或 `simple`）<br> - 回歸回傳連續 `target`；分類依 `cls_threshold` 產生 0/1 `label`<br> - 清除 NaN / inf、限制時間範圍 |
-| `dataloader.py` | 提供訓練資料載入：<br> - `SeqDataset`：把 `DataFrame` → `[N,T,F]` 時序張量、對應標籤<br> - `FoldGenerator`：支持 `Anchored`、`Rolling`、`OddEven` 等時間窗切分，含 `embargo` 保護<br> - `make_time_loaders_for_fold`：time-driven 依 fold 建立 `train/val/test` 的 `DataLoader`（可同時輸出 XGB numpy）<br> - `make_event_loaders_for_fold`：event-driven（TBM）模式的事件序列載入 |
-| `indicators.py` | 技術指標計算核心：<br> - 正規化 OHLCV（UTC、排序、去重、缺口警示）<br> - `PAPER_TOP8_PLAN` / `BEST20_PLAN` 預設特徵方案<br> - 自訂多項 `pandas_ta` 指標與原始欄位 builder<br> - 防洩漏：全部特徵 `shift(1)`<br> - 除錯：欄位重複、未知指標、缺欄位、頻率缺口等皆會拋錯或提示 |
+## 2. 資料與 DataLoader 管線
+### 2.1 預算特徵檔需求 (`config.data`)
+- `path` 指向含有 **完整 15 分鐘資料網格** 的 CSV 或 Parquet。檔案需包含：
+  - 時間欄位 `datetime` 或 `timestamp` (秒或毫秒)。
+  - 基礎 OHLCV 欄位 (`open`, `high`, `low`, `close`, `volume`)。
+  - 其他自訂特徵欄位（與 `features.plan` 預期相符）。
+- `freq` 決定重建網格的頻率 (例 `"15min"`)；若資料有缺洞會透過 reindex 產生 NaN，缺值會在後續清理時被過濾。
+- 如果配置 `data.micro.enabled`，請確保帶有 `m_-k_feature` 類欄位；會在 `min_trade_feat` 清單中選取。
 
-### models
+### 2.2 特徵篩選 (`select_plan_columns`)
+- 依 `features.plan.features` 只保留啟用的指標：
+  - 各指標名稱對應 `train/build_feature_loader/indicators.py` 中的 builder 定義。
+  - 特徵表中若不存在對應欄位會被忽略；若所有欄位都不存在則報錯。
+- OHLCV 是否保留由 `OPEN/HIGH/...` 這些條目控制。
+- `features.min_trade_feat` 對 1 分鐘展開欄位（以 `m_` 前綴）做額外挑選。
 
-| 檔案 | 模型摘要 |
-|-----|---------|
-| `LSTM.py` | `LSTM_SE`：LSTM + Squeeze-and-Excitation + mean/max pooling + MLP 頭；輸出 `[B]` 回歸或 `[B,C]` 分類 |
-| `Transformer.py` | `TemporalTransformer`：<br> - Sin-Cos 位置編碼<br> - Pre-Norm Transformer block + DropPath<br> - 可選 pooling (`cls/mean/last/attn`)<br> - 支援 causal mask、防止看未來 |
-| `fastCNN.py` | `AdaptiveKernelCNN`：多 kernel 1D convolution + 注意力加權 + 殘差，對 OHLCV 等快特徵進行特徵萃取 |
-| `hybird.py` | `CNNTransformerBilinearModel`：<br> - `AdaptiveKernelCNN` 處理快窗特徵<br> - `TemporalTransformer` 處理慢窗特徵<br> - `FactorizedBilinear` 低秩雙線性交叉融合 + 兩個輔助頭 (deep supervision) |
-| `model_factory.py` | 依 `config.yaml` 的 `model.name` 建立對應模型 (`LSTM_SE` / `TemporalTransformer` / `XGBRegressorModel`) |
-| `xgb_model.py` | 封裝 XGBoost：`from_cfg` 讀 YAML -> `build()` 產生 `xgboost.XGBRegressor`，含 `early_stopping_rounds` 等參數 |
+### 2.3 標籤生成 (`build_features.create_label`)
+- 時間驅動 (classification/regression)：
+  - `label.mode` 可選 `vol`、`bps`、`quantile`、`triple` 等，每種模式會依 `label.ret_shift`、`ret_type`（`logret` 或 `fractionally`）生成 `y_reg` 或 `y_cls`。
+  - `label.fracdiff` 控制分數差分目標 (`ret_type=fractionally`)。
+  - 門檻相關參數 (`k_vol`, `flat_band_bps`, `roundtrip_cost_bps`...) 影響三分類切割。
+- 事件驅動 (`mode=event_tbm`)：
+  - `assign_tbm_labels_to_df` 讀 `label.tbm_csv_path`，依 `keep_sides` 選擇 long/short，並以 `align_method` (`exact` 或 `pad`) 對齊到 15m 網格，產生二元標籤 `y_cls`。
+  - 若 `keep_sides=both`，要求同一時間戳不得同時存在雙邊訊號。
 
-### objective
+### 2.4 時間驅動 DataLoader (`make_time_loaders_for_fold`)
+- 從預算特徵檔重建完整網格後：
+  1. 依 `features.plan` 過濾欄位並轉成 `float32`。
+  2. 呼叫 `create_label` 產生 `y_reg` 或 `y_cls`，移除包含 NaN/Inf 的列。
+  3. 使用 `cv.start_date` `cv.end_date` 篩選訓練期間。
+  4. 利用 `FoldGenerator` 提供的布林遮罩或時間戳切分 train/val/test。
+  5. 以 `sequence.scaler` 與 `pick_cols_to_scale` 選取需標準化的欄位：
+     - 若 scaler 支援 timesafe (`rolling`, `ewm` 等)，在完整資料上做 `transform_full`。
+     - 其他 sklearn 類 scaler 則於 train split 擬合後套用。
+  6. 建立 `SeqDataset`：
+     - 使用滑動視窗長度 `sequence.seq_len`、`stride`/`stride_anchor` 控制窗口移動。
+     - `preload_to_gpu=true` 時，資料會預先搬到 GPU；否則停在 CPU 並在 DataLoader 中透過 `pin_memory` 加速。
+  7. 回傳三個 `DataLoader` 與 XGBoost 用的 numpy bundle (`info['XGB']`)。
 
-| 檔案 | 用途 |
-|----|----|
-| `objective.py` | Optuna trial 主入口：<br> - 複製 `base_cfg` 並隨機建議超參（learning rate、grad_clip 等）<br> - 呼叫 `suggest_model_hparams`、`suggest_rolling_and_cv`、特徵抽樣等<br> - 依 `make_folds` 建立所有 fold，透過 `trainer` 逐 fold 訓練<br> - `compute_trial_score` 根據 `primary_metric`（回歸/分類不同）計算分數<br> - 保存每個 trial 的 config 與結果 |
-| `objective_utils.py` | 支援函式：<br> - `suggest_*` 系列為 Optuna 提供搜尋空間 (float/int/categorical)<br> - `make_folds` 建立 `OddEven`/`Anchored`/`Rolling` 折疊<br> - `map_feature_to_columns` & `get_enabled_feature_names`：從 YAML 特徵計畫映射成實際欄位，驗證欄位存在<br> - 模型超參數設定 (`suggest_model_hparams`) |
+### 2.5 事件驅動 DataLoader (`make_event_loaders_for_fold`)
+- 適用於 TBM / 事件序列任務：
+  - 先以 `select_plan_columns` 選特徵欄，再依 `sequence.scaler` 對整張特徵表做時間安全縮放。
+  - 將每個 fold 的 train/val/test 時段對齊到底層網格 (`align_times`)；只會保留可產生完整視窗 (`seq_len`) 的事件。
+  - `EventDataset` 讀 `tbm_csv_path`，計算 `(N,L,F)` 張量與標籤；支援 `keep_sides`、`drop_incomplete`、裝置預載。
+  - DataLoader 不啟用 `pin_memory`（資料已在目標裝置）。
+  - `stats` 會列出事件總數、被濾除原因，以便檢查資料覆蓋率。
 
-### trainer
+### 2.6 交叉驗證折疊 (`objective_utils.make_folds`)
+- `FoldGenerator` 會將索引正規化為 UTC，依 `cv.start_date`、`end_date` 限定可用時間：
+  - `type=Purged_kfold`：均分月份，對測試區塊套 `embargo_hours`，確保訓練集不含測試鄰近樣本。
+  - `type=Rolling`：以 rolling window 方式構建 train/test，支援測試頻率 (`test_freq`) 與禁運期。
+- 每個 fold 存有：
+  - `train_val_mask`、`test_mask`（布林向量或時間集合）。
+  - `train_val_times`、`test_times`（事件驅動回落時使用）。
+  - `test_month` 等 metadata 會在 log 中顯示。
 
-| 檔案 | 描述 |
-|-----|-----|
-| `trainer_base.py` | 公用訓練工具：<br> - 取得任務型別、AMP dtype、optimizer、scheduler<br> - class weight/最佳 threshold/溫度校準等分類工具<br> - `get_trainer` 對應 `classification` 或 `regression` |
-| `trainer_cls.py` | 分類訓練迴圈：<br> - 支援 CE / Focal Loss、class weight、自動 threshold/溫度校準<br> - early stopping、最佳模型 state 儲存、驗證/測試度量輸出 |
-| `trainer_reg.py` | 回歸訓練迴圈：<br> - 支援 `EMAMSE_PearsonLoss`、MSE、Huber 等<br> - (可選) 若模型為 `XGBRegressorModel` 則改走 `_train_one_fold_xgb`<br> - 計算 `mixed` objective、Pearson、RMSE 等指標<br> - early stopping、結果與圖表輸出 |
-| `xgb_trainer.py` | XGBoost 專用訓練流程：<br> - 支援 GPU handoff (CuPy)<br> - 早停 (`es_step` / `es_patience` / `es_min_delta`)<br> - 儲存每輪 RMSE & Pearson，最後依驗證 RMSE 選最佳輪 |
+## 3. 模型訓練與評估
+### 3.1 模型建構 (`models/model_factory.build_model`)
+- 根據 `model.name` 建立對應神經網路或 XGBoost 模型：
+  - `LSTM_SE`、`LSTM_Temporal`：序列式 LSTM，支援 SE 模組、雙向等選項。
+  - `TemporalTransformer`：含 sin-cos 位置編碼、Pre-Norm block、可選 `pooling` (`attn`, `cls`, `mean`, `last`)。
+  - `TwoStreamHybrid`：同時處理 15m 特徵與 1m 展開特徵，最後以 Bilinear 融合。
+  - `xgb` 相關名稱會回傳 `XGBRegressorModel` 包裝器。
+- `suggest_model_hparams` 依 Optuna trial 調整 `d_model`、`n_layers`、`mlp_ratio` 等超參。
 
-### utils
+### 3.2 訓練流程 (`trainer_base` + `trainer_cls`/`trainer_reg`)
+- `get_trainer` 依任務型別選擇分類或回歸訓練器。
+- 共同特性：
+  - Optimizer 使用 AdamW (fused 版可用時自動啟用)。
+  - `build_warmup_scheduler` 僅於前 `train.warmup_epochs` 內進行暖身。
+  - AMP 依 `train.amp`、`amp_dtype` 決定混合精度 dtype；loss 調整使用 `GradScaler`。
+- 分類 (`trainer_cls`):
+  - 損失函數：交叉熵 (含 label smoothing) 或 `BCEWithLogitsFocalLoss` (含 focal、confidence penalty)。
+  - 類別權重：`infer_class_weights` 使用訓練集頻率計算並正規化。
+  - Collapse guard：可監控正類占比、熵，必要時觸發 LR 衰減或調整懲罰。
+  - 溫度校準：`fit_temperature_ce` 對驗證 logits 做後校準。
+  - 門檻搜尋：根據 `train.threshold_mode` (`auto_auc` 或 `auto_fbeta`) 掃描閾值；亦可固定門檻。
+  - 評估：`compute_cls_metrics` 輸出 ACC/F1/F0.5/MCC、PR/ROC 曲線與混淆矩陣。
+- 回歸 (`trainer_reg`):
+  - 損失支援 `emamse_pearson`（結合 EMA、MSE、皮爾森）、Huber、MSE。
+  - 會輸出 RMSE/MAE/皮爾森/Spearman 等統計，並可執行門檻掃描將回歸轉分類訊號。
 
-| 檔案 | 功能 |
-|-----|------|
-| `init_train.py` | 設定隨機種子、啟用 CUDA TF32、設定 flash attention/matmul 精度等 |
-| `compute_export_metrices.py` | 計算分類/回歸指標、畫 ROC/PR/混淆矩陣、回歸分析圖、`dump_best_yaml` 輸出最佳 trial 設定 |
-| `regression_utils.py` | 回歸損失 (`EMAMSE_PearsonLoss`) 與常用度量、回歸→二分類門檻搜尋 (`find_best_threshold_for_regression`) |
+### 3.3 評估與匯出 (`train_utils.compute_export_metrices`)
+- 於每個 fold：
+  - `save_fold_metrics` 將訓練、驗證、測試指標與圖表存入 `trial_xxx/fold_k/`。
+  - `plot_test_eval` 繪製 PR/ROC/混淆矩陣（分類）或殘差圖（回歸）。
+- 於整體 trial：
+  - `save_cv_summary` 聚合所有 fold 指標（平均值、標準差），輸出 JSON/Markdown 摘要。
+  - `compute_trial_score` 依 `objective.primary_metric`（例 `test_mcc`, `pearson`）計算 Optuna 分數。
 
-### 其他
+## 4. Trial 產出與後處理
+- `objective` 在 trial 結束時：
+  - 將 `fold_scores` 取平均，並把實際 seed 寫回 `cfg['seed']`。
+  - 以主指標在資料夾名稱加上分數標籤（例 `_mcc+0.312`）。
+  - 將完整設定輸出為 `trial_config_<metric>=<score>.yaml`，方便重現。
+- `dump_best_yaml`（在主流程完成後）寫出：
+  - `runs/<project>/best/best_config.yaml`
+  - `runs/<project>/best/best_params.yaml`
+  - `runs/<project>/best/selected_features.txt`
+- `post_infer.tbm_concat.enabled=true` 時：
+  - `export_tbm_predictions_for_trial` 會蒐集各 fold 最佳模型，對指定時間窗的 TBM 事件生成預測：
+    - `*_prob` 欄位提供平均機率與機率閾值。
+    - `*_vote` 欄位提供多數決結果與票數統計。
+  - 產出 CSV (`tbm_with_<column>_<date>.csv`) 與 debug 日誌。
 
-| 檔案 | 描述 |
-|-----|-----|
-| `main_train.py` | 主要入口：<br> 1. 讀取 YAML (`load_cfg`)<br> 2. `prepare_dataframe`：讀 OHLCV → `Indicators` 計算技術指標 → `build_features_and_label` 產生 `X, y`<br> 3. `build_study`：建立 Optuna Study（sqlite DB）<br> 4. `study.optimize`：呼叫 `objective` 逐 trial 搜尋<br> 5. 最佳結果輸出、`dump_best_yaml` |
-| `config.yaml` | 預設設定檔，包含：<br> - `data`：原始 OHLCV 檔路徑、頻率、欄位<br> - `cv`：跨月/rolling 等 cross-validation 參數<br> - `model`：模型種類與超參<br> - `features`：指標計畫與開關<br> - `train`、`loss`、`objective`、`sequence` 等細節 |
-
----
-
-## 資料處理 Pipeline
-
-1. **讀取原始 OHLCV**  
-   `prepare_dataframe` 以 `config.data.path` 指向的 CSV/Parquet 讀資料。  
-   - 允許 `datetime` 或 `timestamp` 欄位；全部轉 UTC `DatetimeIndex`。  
-   - 檢查重複、排序並可提醒缺 K 線。  
-
-2. **技術指標計算 (`Indicators`)**  
-   - 規格化 OHLCV 後，依 `config.features.plan` 逐項指標計算。  
-   - 直接計算所選特徵（不使用磁碟快取）。  
-   - 所有特徵 `shift(1)` 防洩漏；欄位重複會拋錯。  
-
-3. **特徵與標籤建立 (`build_features_and_label`)**  
-   - 轉換時區、強制完整網格，確保特徵與 OHLCV 對齊。  
-   - 計算未來 `horizon` 步的 `logret` 或 `simple` 報酬。  
-   - `regression`：連續 `target`; `classification`：`target` > `cls_threshold` → `label` 0/1。  
-   - 清除無效時間點、NaN/inf、依 `start_date` ~ `end_date` 範圍過濾。  
-
-4. **Fold 生成 (`FoldGenerator`)**  
-   - 支援 `OddEven`：奇數月訓練、偶數月測試。  
-   - `Anchored`：從起始時間開始累積資料，每個測試月前加 `embargo` 小時禁區。  
-   - `Rolling`：固定訓練窗大小往前滑動。  
-
-5. **DataLoader (`make_time_loaders_for_fold` / `make_event_loaders_for_fold`)**  
-   - 依 fold 時間 index 切出 `train/val/test`。  
-   - `scaler` (Robust/Standard/MinMax) 僅 fit 在訓練集。  
-   - `SeqDataset` 產生 `[batch, seq_len, features]`；標籤型別依任務決定。  
-   - 可同時產生 XGB 需要的 numpy 陣列。  
-
----
-
-## 指標產生與排錯
-
-* `Indicators._normalize_ohlcv`：  
-  - 不存在時間欄時拋錯。  
-  - 缺 OHLCV 欄位或時區錯誤會提出。  
-  - 若 `freq_check` 設定則印出缺口警告。
-
-* `Indicators.compute`：  
-  - `plan` 會先經 `_prune_plan` 移除未啟用指標。  
-  - `Unknown indicator` 會拋 `ValueError`。  
-  - 指標欄名重複時拋錯，避免 features 覆蓋。  
-  - 指標計算後統一 `float32`，NaN/inf 會被清除。  
-
-* `objective_utils.map_feature_to_columns`：  
-  - 輸入 YAML 中 `name/kwargs`，自動推測實際欄位名稱。  
-  - 欄位不存在時拋錯，避免 Optuna 選到不存在的特徵。  
-
-* `train` / `loss`：  
-  - 若模型輸出維度與 `num_classes` 不符或 XGB 設定缺值，會即時報錯。  
-  - `trainer_cls`、`trainer_reg` 均在第一個 batch 印出 debug shape，以利排查。  
-
----
-
-## Pipeline 執行流程
-
-1. **入口 `main_train.py`**  
-   - `load_cfg` → 讀取 `config.yaml`  
-   - `set_seed`、`setup_cuda_acceleration` 初始化  
-   - `prepare_dataframe` → 產生 `df` (特徵+label) 與 `pt_bundle` (欄位資訊等)  
-   - `build_study` → Optuna Study (SQLite)  
-   - `study.optimize` → 迴圈執行 `objective`  
-
-2. **在 `objective` 中的每次 trial**  
-   - 隨機建議：序列長度、embargo、learning rate、模型隱層大小等  
-   - `get_enabled_feature_names` 解析目前啟用的特徵欄  
-   - `make_folds` → 依 CV 參數產生折疊  
-   - 逐 fold：  
-     - `make_time_loaders_for_fold` 或 `make_event_loaders_for_fold` → DataLoader / XGB numpy  
-     - `build_model` → 建立 DL 或 XGB 模型  
-     - `train_one_fold` → 執行訓練、驗證、測試；輸出指標與圖表  
-     - `compute_trial_score` → 回傳該 fold 分數給 Optuna  
-   - 平均所有 fold 分數返回給 Optuna  
-   - 記錄 trial 詳細設定、選到的特徵等  
-
-3. **完成搜尋後**  
-   - 印出 `best_trial.params`、最佳分數  
-   - `dump_best_yaml`：輸出 `best_params.yaml`、`best_config.yaml`、`selected_features.txt`  
-
----
-
-## 排錯 & 調試建議
-
-| 情況 | 解法 |
-|-----|-----|
-| **缺少欄位/時間欄錯誤** | 確認原始 OHLCV 資料含 `timestamp` 或 `datetime`，且欄位名與 `config.data.columns` 相符。 |
-| **freq 缺口警告** | `Indicators` 只提醒不補值；若缺口過大請自行填補或調整資料。 |
-| **Unknown indicator** | 檢查 `config.features.plan` 中的 `name` 是否有對應 builder；必要時在 `Indicators` 補入建構函式。 |
-| **特徵欄名重複** | 代表計畫中同名指標重複或 builder 產生相同欄位；需修改 plan 或自訂命名。 |
-| **模型輸出維度不符** | `trainer_cls`、`trainer_reg` 初始 batch 會檢查 `out_dim` 與 `num_classes`，必要時調整 `model.head` 或 `num_classes`。 |
-| **Optuna trial 被 pruned** | 受 `MedianPruner` 控制；可關閉 `enable_prune` 或增加 `pruner_warmup_folds`。 |
-| **XGBoost GPU 不可用** | `xgb_trainer` 會自動判斷 `device`；若無 CuPy 會退回 CPU。請確保 CUDA 驅動與依賴安裝完整。 |
-
----
-
-## 快速開始（範例流程）
-
-1. **準備資料**：將 1H 交易所 OHLCV CSV 放置於 `config.yaml` 中 `data.path` 指定位置，欄位需包含 `timestamp` 或 `datetime` 與 OHLCV。  
-2. **調整 `config.yaml`**：  
-   - 調整 `cv` 參數、想測試的 `model`、啟用的 `features.plan` 指標等。  
-   - 若只想跑單 trial，可將 `search.n_trials` 設為 1。  
-3. **執行**：  
+## 5. 操作指南
+1. **準備資料**
+   - 建立預算特徵檔：確保欄位包含 `datetime`/`timestamp` 與基本 OHLCV，以及配置中啟用的特徵名稱。
+   - 事件任務需額外準備 TBM 標籤 CSV (`t0`,`side`,`label` 以及可選 `t1`,`entry_price`)。
+2. **調整 `train/config.yaml`**
+   - `project_name`：決定輸出路徑與 study 名稱。
+   - `data.path`、`freq`、`columns`：對應檔案欄位。
+   - `cv`：設定起訖日期、拆分策略、禁運期、fold 數量或 rolling 視窗。
+   - `sequence`：視窗長度、stride、scaler（若使用 rolling/ewm scaler，資料需連續）。
+   - `train` / `loss`：學習率、batch size、梯度裁剪、loss 選項、門檻搜尋模式。
+   - `model`：選擇模型與超參空間；可透過 list 指定 Optuna 搜尋範圍。
+   - `label`：定義標籤模式、horizon、ret_type 或 TBM 對齊方式。
+   - `features.plan`：啟用或停用預算特徵；必要時同步更新預算檔。
+3. **啟動訓練**
    ```bash
-   python train_core/main_train.py  # 預設會讀 train_core/config.yaml
-   ```  
-4. **查看結果**：  
-   - `runs/<project_name>/` 下有 `study.db` 與各 `trial_*` 目錄。  
-   - 最佳結果於 `runs/<project_name>/best/`：`best_params.yaml`, `best_config.yaml`, `selected_features.txt` 等。  
+   python train/main_train.py
+   ```
+   - 單機多卡：設定 `search.multi_gpu.enabled` 與 `gpu_ids`，再執行相同指令。
+4. **監控進度**
+   - 主進程會列印當前 trial 編號、fold 分數、CV 平均等資訊。
+   - `runs/<project_name>/trial_xxx/fold_k/` 可隨時查看中間結果、評估圖表。
+5. **查看成果**
+   - `runs/<project_name>/best/`：最佳 trial 配置、特徵清單。
+   - `study.db`：Optuna Study 檔，可用 `optuna dashboard` 或 `optuna studies` 分析。
+   - 若啟用 post infer：檢查 `trial_xxx/tbm_with_*.csv` 與 `post_infer_debug.txt`。
 
----
+## 6. 常見調整與建議
+- **增減特徵**：更新 `features.plan` 後，確保預算檔已有對應欄位；無需改動 DataLoader。
+- **改變標籤策略**：
+  - 時間驅動：調整 `label.mode`、`ret_shift`、`ret_type` 等即可。
+  - 事件驅動：TBM CSV 需維持 `t0` 與 `side`；若同一時間有雙邊訊號，請先於資料前處理去重或使用 `keep_sides`。
+- **調整序列長度/stride**：在 `sequence.seq_len/stride` 使用 list 讓 Optuna 幫忙搜尋；`stride_anchor` 可鎖定窗口起點。
+- **混合模型**：`also_XGB=true` 會為每個 fold 生成 numpy bundle，允許在 objective 中平行訓練 XGBoost。
+- **閾值與後處理**：`train.threshold_mode`、`threshold_fbeta` 決定二分類輸出的評估標準；若實務上需固定門檻可設 `mode=fixed`。
+- **資源管理**：
+  - 大量事件任務建議將 `sequence.preload_to_gpu` 設為 `false`，避免顯存不足。
+  - 透過 `train.batch_size`、`grad_accum_steps` 調整計算負載。
 
-## 依賴
-見 train_requirements.txt
+## 7. 輸出資料夾結構範例
+```
+runs/<project_name>/
+├─ study.db
+├─ best/
+│  ├─ best_config.yaml
+│  ├─ best_params.yaml
+│  └─ selected_features.txt
+├─ trial_000_mcc+0.312/
+│  ├─ trial_config_test_mcc=0.312.yaml
+│  ├─ fold_0/
+│  │  ├─ train_metrics.json
+│  │  ├─ val_metrics.json
+│  │  ├─ pr_curve.png
+│  │  ├─ roc_curve.png
+│  │  └─ confusion_matrix.png
+│  ├─ fold_1/
+│  ├─ ...
+│  ├─ cv_summary.json
+│  ├─ post_infer_debug.txt
+│  └─ tbm_with_pred_20230101_20250822.csv
+└─ trial_001_...
+```
 
----
+## 8. 模組對照表
+| 模組 | 角色 | 重點內容 |
+| ----- | ----- | ----- |
+| `train/main_train.py` | 入口；建立 Optuna study | `load_cfg`、`prepare_dataframe`、`run_single`/`run_multi` |
+| `objective/objective.py` | Trial 主流程 | 超參建議、fold 迴圈、訓練、分數與後處理 |
+| `objective/objective_utils.py` | Optuna 輔助 | `suggest_*`、`make_folds`、`compute_trial_score` |
+| `build_feature_loader/dataloader.py` | DataLoader 工具 | 特徵/標籤生成、scaler、SeqDataset/EventDataset 組裝 |
+| `build_feature_loader/build_features.py` | 標籤邏輯 | 時間驅動與事件驅動標籤計算、TBM 對齊 |
+| `dataset/SeqDataset` `dataset/EventDataset` | 資料集物件 | 時序視窗化、事件向量化 |
+| `models/model_factory.py` | 模型工廠 | LSTM/Transformer/TwoStream/XGB 組態 |
+| `trainer/trainer_base.py` | 訓練共用 | Optimizer、AMP、類別權重、溫度校準 |
+| `trainer/trainer_cls.py` | 分類訓練 | Focal loss、collapse guard、門檻搜尋、指標輸出 |
+| `trainer/trainer_reg.py` | 回歸訓練 | 混合損失、殘差圖、Pearson/Spearman |
+| `train_utils/compute_export_metrices.py` | 評估匯出 | PR/ROC/Confusion matrix、CV 摘要、TBM 匯出支援 |
 
-## 補充說明
+## 9. 故障排除提示
+- 缺少欄位：確認預算檔包含 YAML 指定的時間欄與 OHLCV；若特徵欄名不同，調整 `features.plan` 或重新命名。
+- 標籤為空：時間驅動請檢查 `ret_shift` 是否超出資料範圍；事件任務請確認 `tbm_csv_path`、`keep_sides`、`align_method` 設定正確。
+- Fold 沒有樣本：縮小 `cv.start_date/end_date` 範圍或調整 `embargo_hours`、`min_train_days`。
+- 類別完全傾斜：可啟用 `train.dist_align_weight`、`loss.cls.focal_alpha` 或調整 TBM 標籤策略。
+- Post infer 失敗：檢查 `post_infer_debug.txt`，常見原因為 TBM CSV 路徑錯誤或日期範圍超出特徵資料。
 
-* `Indicators` 產生的特徵不再寫入磁碟快取；每次直接由計畫動態計算。  
-* 若要增添新指標，只需在 `Indicators._builders` 中註冊對應函式，並於 `config.yaml` 的 `features.plan` 啟用即可。  
-* `regression_to_class` 區塊可將回歸輸出轉成訊號（例如多空判斷），支援以 F-beta 最優門檻或固定門檻。  
-* `dump_best_yaml` 會將搜尋空間替換為實際值，方便後續直接載入最佳設定重現結果。  
-
----
