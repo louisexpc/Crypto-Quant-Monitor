@@ -10,13 +10,12 @@ from torch import amp
 import sys, os
 
 # 專案內部匯入
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from build_feature_loader.dataloader import (
+from train.build_feature_loader.dataloader import (
     select_plan_columns,
     split_fold_to_indices,
 )
-from build_feature_loader.scalar import _get_scaler, ColumnSubsetScaler, pick_cols_to_scale
-from dataset.event_dataset import EventDataset
+from train.build_feature_loader.scalars import _get_scaler, ColumnSubsetScaler, pick_cols_to_scale
+from train.dataset.event_dataset import EventDataset
 
 
 def _to_utc_index(idx: pd.Index | pd.Series, assume_tz: str = "UTC") -> pd.DatetimeIndex:

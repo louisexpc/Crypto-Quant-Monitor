@@ -11,18 +11,17 @@ from .xgb_trainer import _train_one_fold_xgb
 
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # 回歸度量/損失/圖表
-from train_utils.regression_utils import build_regression_loss
+from train_old.train_utils.regression_utils import build_regression_loss
 
-from train_utils.compute_export_metrices import (
+from train_old.train_utils.compute_export_metrices import (
     save_fold_metrics, plot_regression_eval, 
     plot_test_eval
 )
-from train_utils.metrics_reg import compute_regression_metrics, mixed_objective  # ★ 用這個
-from train_utils.metrics_cls import compute_cls_metrics               # ★ 回歸→分類要用
+from train_old.train_utils.metrics_reg import compute_regression_metrics, mixed_objective  # ★ 用這個
+from train_old.train_utils.metrics_cls import compute_cls_metrics               # ★ 回歸→分類要用
 
-from models.xgb_model import XGBRegressorModel
+from train_old.models.xgb_model import XGBRegressorModel
 
 def train_one_fold(
     model,

@@ -180,6 +180,7 @@ def create_labels_adaptive(df: pd.DataFrame,
     """
 
     df = df.copy()
+    mode = str(mode).lower()
 
     if mode == "event_tbm":
         if not tbm_csv_path:

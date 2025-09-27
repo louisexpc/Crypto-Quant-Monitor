@@ -17,13 +17,13 @@ from .objective_utils import (
     compute_trial_score
 )
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # --- Trainer / Data / Model ---
-from trainer.trainer_base import get_trainer
-from build_feature_loader.dataloader import make_time_loaders_for_fold, make_event_loaders_for_fold
-from models.model_factory import build_model
-from train_utils.init_train import set_seed, setup_cuda_acceleration
-from train_utils.compute_export_metrices import save_cv_summary
+from train.trainer.trainer_base import get_trainer
+from train.data.dataloaders.time_loader import make_time_loaders_for_fold
+from train.data.dataloaders.event_loader import make_event_loaders_for_fold
+from train.models.model_factory import build_model
+from train.train_utils.init_train import set_seed, setup_cuda_acceleration
+from train.train_utils.compute_export_metrices import save_cv_summary
 
 
 

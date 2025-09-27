@@ -31,10 +31,9 @@ from .trainer_base import (
     infer_class_weights, fit_temperature_ce, find_best_threshold_by_auc
 )
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # 匯出/視覺化/度量
-from train_utils.compute_export_metrices import save_fold_metrics, plot_test_eval
-from train_utils.metrics_cls import compute_cls_metrics  # 統一計算 acc/f1/f0.5/mcc 等
+from train_old.train_utils.compute_export_metrices import save_fold_metrics, plot_test_eval
+from train_old.train_utils.metrics_cls import compute_cls_metrics  # 統一計算 acc/f1/f0.5/mcc 等
 
 # =========================================================
 # Loss：BCEWithLogits + Focal + Confidence Penalty（支援 [B], [B,1], [B,2]）

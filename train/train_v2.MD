@@ -300,49 +300,118 @@ flowchart TD
 
 若要進一步客製化（例如整合新的縮放器、替換損失函式、添加 callback），建議依據上述檔案位置擴充對應模組，並在 `config.yaml` 加入可調旗標，以便透過 Optuna 搜尋或環境變數控制。
 
-
+```
 train/
-├── core/                         # “只能被依賴、不可向下依賴”的超薄核心
-│   ├── config_loader.py          # 讀/驗 YAML + schema 鎖定
-│   ├── context.py                # RunContext (cfg、paths、seed 等不可變物件)
-│   └── orchestrator.py           # CLI/頂層流程（只做導線，不做業務）
+├─ core/                                   # 入口與全域脈絡（不依賴其他子層）
+│  ├─ orchestrator.py                      # CLI/主流程：cfg → pipeline
+│  ├─ config_loader.py                     # 讀/驗證 YAML；預設值展開
+│  ├─ context.py                           # RunContext / 路徑、seed、標誌
+│  └─ __init__.py
 │
-├── data/                         # 單一“真相源頭”：特徵、標籤、CV 分割與縮放
-│   ├── feature_store.py          # 預算特徵與標籤的集中快取（一次建好，處處使用）
-│   ├── folds.py                  # Rolling/Purged/Embargo/CPCV 的 fold 規格
-│   ├── scalers.py                # 時序安全 scaler 工廠
-│   └── dataloaders/
-│       ├── base.py               # 共用切片/對齊/XGB pack
-│       ├── time_loader.py        # 時間驅動 DataLoader
-│       └── event_loader.py       # 事件驅動 DataLoader（TBM）
+├─ data/                                   # 只處理資料面：讀檔/索引/切分/縮放
+│  ├─ feature_store.py                     # FeatureStore：一次載入、多處重用（可預算時間標籤）
+│  ├─ folds.py                             # Rolling/Purged/Anchored + Embargo
+│  ├─ scalers.py                           # time-safe scaler 工廠（全都 shift(1)）
+│  ├─ column_plan.py                       # 依 YAML features.plan 篩欄
+│  ├─ dataloaders/                         # 批次化與取樣；不做業務邏輯
+│  │  ├─ base.py                           # 共用：切 index、fit/transform、XGB pack
+│  │  ├─ time_loader.py                    # 時間驅動 loader（SeqDataset）
+│  │  ├─ event_loader.py                   # 事件驅動 loader（EventDataset + TBM 對齊）
+│  │  └─ __init__.py
+│  └─ __init__.py
 │
-├── models/                       # 只負責“構建網路”；無 I/O、無 CV、無訓練程式碼
-│   ├── registry.py               # name -> builder 的登錄表
-│   ├── LSTM.py
-│   ├── Transformer.py
-│   ├── two_stream_model.py
-│   └── xgb_model.py
+├─ dataset/                                # 資料→張量的型別定義；不關心 batch
+│  ├─ time_dataset.py                      # SeqDataset：[N,T,F]、stride/anchor
+│  ├─ event_dataset.py                     # EventDataset：[N,L,F]、drop 統計
+│  └─ __init__.py
 │
-├── training/                     # “一個 fold 的訓練怎麼跑”
-│   ├── trainers/
-│   │   ├── classification.py     # 單 fold 訓練；回傳 FoldResult
-│   │   ├── regression.py
-│   │   └── xgb.py
-│   ├── metrics/                  # 純函式，無狀態
-│   └── hooks.py                  # threshold grid / 溫度校準 / collapse guard
+├─ models/                                 # 純模型與建構器；不可依賴 data/training
+│  ├─ registry.py                          # @register(name) / get / list_models
+│  ├─ model_factory.py                     # 別名→懶載入→registry 取 builder
+│  ├─ LSTM.py                              # LSTM_SE / LSTM_Temporal + builder
+│  ├─ transformer_model.py                 # TemporalTransformer + builder
+│  ├─ two_stream_model.py                  # 1m LSTM × 15m Transformer 融合 + builder
+│  ├─ xgb_model.py                         # XGBRegressor builder
+│  └─ __init__.py                          # 極簡，無側效應匯入
 │
-├── evaluation/                   # “把結果說人話”（圖表/JSON/CSV）
-│   ├── reporters/
-│   │   ├── classification_reporter.py
-│   │   └── regression_reporter.py
-│   └── exporters/
-│       ├── best_yaml.py
-│       └── tbm_exporter.py
+├─ training/                               # 單 fold 訓練邏輯與 hooks；回傳 FoldResult
+│  ├─ trainers/
+│  │  ├─ classification.py                 # BCE/CE/Focal + 門檻/溫度校準
+│  │  ├─ regression.py                     # MSE/Huber/混合目標
+│  │  └─ xgb.py                            # XGBoost 單 fold 訓練
+│  ├─ hooks.py                             # collapse guard / best-threshold / temp scaling
+│  ├─ metrics/
+│  │  ├─ metrics_cls.py                    # ACC/F1/Fβ/MCC/PR-AUC/ROC-AUC
+│  │  └─ metrics_reg.py                    # RMSE/MAE/Pearson/Spearman
+│  └─ __init__.py
 │
-├── pipeline/                     # 管試驗，不管“怎麼訓練”
-│   ├── trial_runner.py           # Loop folds、串 trainer + reporter
-│   └── search/
-│       ├── objective.py          # Optuna 的薄包裝
-│       └── space.py              # suggest_* 與搜尋空間定義
+├─ evaluation/                             # 只吃 FoldResult，產圖/匯出；不反向依賴
+│  ├─ reporters/
+│  │  ├─ classification_reporter.py        # ROC/PR/ConfMat + JSON 摘要
+│  │  └─ regression_reporter.py            # 散點/殘差/相關係數 + JSON 摘要
+│  ├─ exporters/
+│  │  ├─ best_yaml.py                      # 匯出最佳 YAML/params/feature list
+│  │  └─ tbm_exporter.py                   # 推論併回 TBM（fold-vote/mean-prob）
+│  └─ __init__.py
 │
-└── post_infer/                   # 可選後處理掛鉤（TBM 併回等）
+├─ pipeline/                               # 外層管線/搜尋膠水層
+│  ├─ trial_runner.py                      # 迭代 folds → trainer → reporter/exporter
+│  ├─ search/
+│  │  ├─ objective.py                      # Optuna objective（薄薄一層）
+│  │  └─ space.py                          # suggest_* / 搜尋空間定義
+│  └─ __init__.py
+│
+├─ post_infer/                             # 可選插件：產線後處理鉤子
+│  ├─ README.md
+│  └─ __init__.py
+│
+├─ export_model/                           # 部署導出暫存（ONNX/torchscript/簽名等）
+│  ├─ README.md
+│  └─ __init__.py
+│
+└─ __init__.py                             # 保持 package 化；不做側效應匯入
+
+```
+資料流（從 input 到預測）
+
+用文字把契約說清楚，後續文件也照這個描述：
+
+載入：FeatureStore.from_cfg(cfg)
+
+讀 .parquet/.csv → UTC index → 排序/去重 →（時間任務）create_label 一次。
+
+[out] features: DataFrame(index=UTC)、labels: Series|None。
+
+特徵計畫：select_plan_columns(features, cfg)
+
+[out] feat_cols: list[str]（TwoStream 要用 m_ 前綴切 minute/base）。
+
+交叉驗證：make_folds(features.index, cfg)
+
+[out] 多個 FoldSpec(train/val/test idx)，含 embargo。
+
+建 Loader：
+
+時間任務：build_time_loaders(fs, feat_cols, labels, fold, cfg)
+
+事件任務：build_event_loaders(fs, feat_cols, tbm_csv, fold, cfg)
+
+行為：
+
+僅對 train split 擬合 scaler，val/test 只 transform。
+
+SeqDataset / EventDataset 產生 [N,T,F] or [N,L,F]；
+
+DataLoader 配置 num_workers/pin_memory/persistent_workers，WSL+CUDA 建議 num_workers=2~4、pin_memory=True、persistent_workers=True（fit GPU/CPU）。
+
+建模：build_model(cfg, n_features=len(feat_cols), columns=feat_cols)
+
+TwoStreamHybrid 會用 columns 的 prefix 自動切 minute/base；TemporalTransformer 直接吃 [B,T,F]。
+
+訓練：train_one_fold(model, loaders, cfg, device, fold_id, export_dir)
+
+AMP、梯度裁剪、warmup，門檻搜尋（PR-AUC 最大）、溫度校準（CE 最小）。
+
+[out] FoldResult(metrics, artifacts, best_ckpt_path)。
+
+評估/匯出：reporters 畫圖、exporters 輸出最佳 YAML、（選配）TBM 推論併回。

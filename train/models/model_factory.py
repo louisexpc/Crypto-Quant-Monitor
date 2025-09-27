@@ -1,90 +1,55 @@
 # model_factory.py
-from typing import Dict
-from .LSTM import LSTM_SE, LSTM_Temporal
-from .Transformer import TemporalTransformer
-from .two_stream_model import TwoStreamHybrid
+from __future__ import annotations
+from importlib import import_module
+from train.models.registry import get as _get_builder, list_models as _list_models
 
-def build_model(cfg: Dict, n_features: int, columns:list[str]):
+def _ensure_registry_loaded(name: str) -> None:
     """
-    根據 cfg["model"]["name"] 建立模型。
-    支援的模型：
-      - "LSTMHead"
-      - "LSTM_SE"
-      - "TemporalTransformer"
+    1. 說明: 依模型名懶載入目標模組，讓 @register(...) 生效
+    2. inputs:
+       - name: str, cfg["model"]["name"]
+    3. return:
+       - None
     """
-    
-    mcfg = cfg["model"]
-    name = mcfg['name']
-    num_classes = cfg["model"]["num_classes"]
+    mapping = {
+        "LSTM_SE": "train.models.LSTM",
+        "LSTM_Temporal": "train.models.LSTM",
+        "TemporalTransformer": "train.models.transformer_model",  # ← 新檔名
+        "TwoStreamHybrid": "train.models.two_stream_model",
+        "xgb": "train.models.xgb_model",
+    }
+    mod = mapping.get(name)
+    if mod:
+        try:
+            import_module(mod)
+        except Exception:
+            # 保守：即便 import 失敗，仍讓後續報錯顯示可用名單
+            pass
 
-    
-    if name == "LSTM_SE":
-        return LSTM_SE(
-            input_dim     = n_features,
-            hidden_size   = mcfg["hidden_size"],
-            n_layers      = mcfg.get("n_layers", 2),
-            dropout       = mcfg.get("dropout", 0.1),
-            bidirectional = mcfg.get("bidirectional", False),
-            num_classes   = num_classes,
+def build_model(cfg, n_features, columns):
+    """
+    1. 說明: 根據 cfg.model.name 建立模型。先查註冊表；找不到就清楚報錯。
+    2. inputs:
+       - cfg: dict, 設定（含 cfg["model"]）
+       - n_features: int, 特徵數
+       - columns: list[str], 欄位名稱
+    3. return:
+       - object: 已建好的模型（nn.Module 或 XGBRegressor）
+    """
+    name = cfg["model"]["name"]
+
+    # 先嘗試懶載入對應子模組，觸發 @register
+    _ensure_registry_loaded(name)
+
+    # 優先用 registry
+    try:
+        builder = _get_builder(name)
+        return builder(cfg, n_features, columns)
+    except KeyError:
+        # 清楚提示：目前有效的名稱有哪些
+        available = sorted(_list_models().keys())
+        raise ValueError(
+            f"Model '{name}' not registered. "
+            f"Available: {available}. "
+            f"可能原因：1) 名稱拼錯或大小寫不同；2) 未 import 對應模組（請檢查 mapping）。"
         )
-    
-    elif name in {"LSTM_Temporal", "LSTM_Attn"}:
-        return LSTM_Temporal(
-            input_dim     = n_features,
-            hidden_size   = mcfg["hidden_size"],
-            n_layers      = mcfg["n_layers"],
-            dropout       = mcfg["dropout"],
-            bidirectional = mcfg["bidirectional"],
-            num_classes   = num_classes,
-            use_se        = mcfg["use_se"],
-            se_ratio      = mcfg["se_ratio"],
-            pooling       = mcfg["pooling"],
-            return_alpha  = mcfg["return_alpha"],
-        )
-    
-
-    elif name.lower() == "temporaltransformer":
-        return TemporalTransformer(
-            input_dim      = n_features,
-            num_classes    = num_classes,
-            d_model        = int(mcfg.get("d_model", mcfg.get("hidden_size", 128))),  # 後備到 hidden_size
-            n_heads        = int(mcfg.get("n_heads", 4)),
-            num_layers     = int(mcfg.get("n_layers", 3)),
-            mlp_ratio      = float(mcfg.get("mlp_ratio", 4.0)),
-            dropout        = float(mcfg.get("dropout", 0.1)),
-            attn_dropout   = float(mcfg.get("attn_dropout", 0.0)),
-            pooling        = str(mcfg.get("pooling", "attn")),       # ← 預設 attn，比 mean 更穩
-        )
-    
-    elif name.lower() in {"twostreamhybrid", "two_stream_hybrid"}:
-        return TwoStreamHybrid(
-            num_classes     = num_classes,
-            # minute stream
-            minute_steps    = int(mcfg.get("minute_steps", 15)),
-            minute_hidden   = int(mcfg.get("minute_hidden", 64)),
-            minute_layers   = int(mcfg.get("minute_layers", 1)),
-            minute_dropout  = float(mcfg.get("minute_dropout", 0.0)),
-
-            # backbone (沿用你 TemporalTransformer 的參數命名)
-            d_model       = int(mcfg.get("d_model", 128)),
-            n_heads       = int(mcfg.get("n_heads", 4)),
-            num_layers    = int(mcfg.get("n_layers", 2)),
-            mlp_ratio     = float(mcfg.get("mlp_ratio", 4.0)),
-            dropout       = float(mcfg.get("dropout", 0.1)),
-            attn_dropout  = float(mcfg.get("attn_dropout", 0.0)),
-            pooling       = str(mcfg.get("pooling", "attn")),
-            use_causal    = bool(mcfg.get("use_causal", True)),
-
-            columns      = columns,
-            minute_prefixes = "m_"
-        )
-    
-    if name in {"xgb", "xgboost", "xgb_reg", "xgbregressor"}:
-        from models.xgb_model import XGBRegressorModel
-        return XGBRegressorModel.from_cfg(cfg)
-    
-
-    else:
-        raise ValueError(f"Unknown model name: {name}")
-
-

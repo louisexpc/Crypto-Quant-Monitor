@@ -4,8 +4,7 @@ import optuna
 import numpy as np
 from pathlib import Path
 import copy, datetime, yaml
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from build_feature_loader.dataloader import FoldGenerator
+from train.build_feature_loader.dataloader import FoldGenerator
 
 # ======================================================================
 # Section A. 小工具

@@ -4,8 +4,7 @@ import torch.nn.functional as F
 from torch import amp
 from sklearn.metrics import roc_curve
 import os, sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from train_utils.init_train import setup_cuda_acceleration
+from train_old.train_utils.init_train import setup_cuda_acceleration
 setup_cuda_acceleration()
 
 # -----------------------------

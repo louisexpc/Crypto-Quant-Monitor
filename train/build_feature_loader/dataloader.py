@@ -4,13 +4,11 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from typing import Literal, Optional, List, Dict
 
-from .scalar import pick_cols_to_scale, _get_scaler, ColumnSubsetScaler
+from .scalars import pick_cols_to_scale, _get_scaler, ColumnSubsetScaler
 from .build_features import create_label
 
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from dataset.time_dataset import SeqDataset
-from dataset.event_dataset import EventDataset
+from train.dataset.time_dataset import SeqDataset
+from train.dataset.event_dataset import EventDataset
 
 def split_fold_to_indices(df: pd.DataFrame, fold: Dict, cfg: Dict):
     """

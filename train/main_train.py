@@ -18,16 +18,19 @@ import pandas as pd
 import yaml
 import os
 import multiprocessing as mp 
+from train.objective.objective import objective
+from train.train_utils.compute_export_metrices import dump_best_yaml
+from train.train_utils.init_train import setup_cuda_acceleration, set_seed
+from train.data.feature_store import FeatureStore  
 
-# ---- Objective ----
-from objective.objective import objective
 
-# ---- Exports / Reporting（與 trainer.py 同源）----
-from train_utils.compute_export_metrices import dump_best_yaml
-
-# ---- Runtime features ----
-from train_utils.init_train import setup_cuda_acceleration, set_seed
-
+__all__ = [
+    "load_cfg",
+    "prepare_dataframe",
+    "build_study",
+    "run_single",
+    "run_multi",
+]
 
 # ======================================================================
 # Section A. 基本工具
@@ -40,38 +43,50 @@ def load_cfg(path: str) -> dict:
 # ======================================================================
 # Section B. 準備資料（原始 OHLCV -> Indicators -> Features -> df[X]+label）
 # ======================================================================
+# def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
+#     """
+#     Precomputed-only: use features.precomputed.path to provide the time index
+#     for fold generation. No runtime feature computation.
+#     """
+#     pre_path = cfg["data"]["path"]
+#     if not pre_path:
+#         raise ValueError("請在 config.features.precomputed.path 指定預先計算的特徵檔 (.csv 或 .parquet)")
+#     p = str(pre_path)
+#     if p.endswith(".csv"):
+#         dfp = pd.read_csv(p)
+#     elif p.endswith(".parquet"):
+#         dfp = pd.read_parquet(p)
+#     else:
+#         raise ValueError("features.precomputed.path 只支援 .csv 或 .parquet")
+
+#     # infer index from datetime/timestamp or existing DatetimeIndex
+#     if isinstance(dfp.index, pd.DatetimeIndex):
+#         idx = dfp.index
+#     elif "datetime" in dfp.columns:
+#         idx = pd.to_datetime(dfp["datetime"], errors="coerce", utc=True)
+#     elif "timestamp" in dfp.columns:
+#         ts = pd.to_numeric(dfp["timestamp"], errors="coerce").astype("Int64")
+#         unit = "ms" if (ts.dropna().iloc[0] if len(ts.dropna()) else 0) > 1_000_000_000_000 else "s"
+#         idx = pd.to_datetime(ts, unit=unit, utc=True)
+#     else:
+#         raise ValueError("預算特徵檔需包含 'datetime' 或 'timestamp' 欄位，或已是 DatetimeIndex")
+
+#     df = pd.DataFrame(index=pd.DatetimeIndex(idx).sort_values())
+#     df = df[~df.index.duplicated(keep="last")]
+#     return df, None
+
 def prepare_dataframe(cfg: dict) -> tuple[pd.DataFrame, dict | None]:
     """
-    Precomputed-only: use features.precomputed.path to provide the time index
-    for fold generation. No runtime feature computation.
+    Precomputed-only: use data.path to provide the time index for fold generation.
+    另外建立 FeatureStore，放到 pt_bundle 交給 objective 使用。
     """
-    pre_path = cfg["data"]["path"]
-    if not pre_path:
-        raise ValueError("請在 config.features.precomputed.path 指定預先計算的特徵檔 (.csv 或 .parquet)")
-    p = str(pre_path)
-    if p.endswith(".csv"):
-        dfp = pd.read_csv(p)
-    elif p.endswith(".parquet"):
-        dfp = pd.read_parquet(p)
-    else:
-        raise ValueError("features.precomputed.path 只支援 .csv 或 .parquet")
+    # 建立 FeatureStore（會完成讀檔與 UTC index）
+    fs = FeatureStore.from_cfg(cfg, compute_time_labels=True)
 
-    # infer index from datetime/timestamp or existing DatetimeIndex
-    if isinstance(dfp.index, pd.DatetimeIndex):
-        idx = dfp.index
-    elif "datetime" in dfp.columns:
-        idx = pd.to_datetime(dfp["datetime"], errors="coerce", utc=True)
-    elif "timestamp" in dfp.columns:
-        ts = pd.to_numeric(dfp["timestamp"], errors="coerce").astype("Int64")
-        unit = "ms" if (ts.dropna().iloc[0] if len(ts.dropna()) else 0) > 1_000_000_000_000 else "s"
-        idx = pd.to_datetime(ts, unit=unit, utc=True)
-    else:
-        raise ValueError("預算特徵檔需包含 'datetime' 或 'timestamp' 欄位，或已是 DatetimeIndex")
-
-    df = pd.DataFrame(index=pd.DatetimeIndex(idx).sort_values())
+    # 沿用舊行為：只取 index 骨架給 make_folds 用
+    df = pd.DataFrame(index=fs.get_frame().index)
     df = df[~df.index.duplicated(keep="last")]
-    return df, None
-
+    return df, {"feature_store": fs}
 
 # ======================================================================
 # Section C. 建立 Study（Optuna）
