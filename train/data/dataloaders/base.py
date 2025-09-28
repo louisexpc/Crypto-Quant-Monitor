@@ -47,7 +47,10 @@ def load_precomputed_features(*, path: Optional[str] = None, pre_feat_df: Option
     df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
     # 再保險一次：全統一 UTC tz-aware
-    df.index = ensure_utc_index(df.index)
+    df.index = ensure_utc_index(df.index)    
+    # 最後只保留feature 把 "time" 跟原始 "ohlcv" 丟掉 (如果有要ohlcv在precomputed會有 _L1: shift(-1)版本的 )
+    drop_cols = [col for col in ("datetime","timestamp","open","high","low","close",'volume') if col in df.columns]
+    df = df.drop(columns=drop_cols)    
     return df
 
 

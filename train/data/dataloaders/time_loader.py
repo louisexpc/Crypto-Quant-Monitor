@@ -36,7 +36,7 @@ def make_time_loaders_for_fold(
     ref_index = pd.DatetimeIndex(df.index)
 
     # 1) 取得特徵與標籤來源
-    feat_df = load_precomputed_features(path=cfg["data"]["path"])
+    feat_df = load_precomputed_features(path=cfg["data"]["path"]).astype(np.float32)
     feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
 
     freq = (cfg.get("data", {}) or {}).get("freq")

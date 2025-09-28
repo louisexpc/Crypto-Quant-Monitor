@@ -728,6 +728,10 @@ class FeatureComputer:
                 cols.append(s)
         return cols
 
+    def passthrough_columns(self, cfg: Dict[str, Any] | None) -> List[str]:
+        """公開存取白名單分鐘欄位名稱。"""
+        return self._passthrough_columns(cfg)
+
     @staticmethod
     def _finalize(parts: List[pd.DataFrame], cfg: Dict[str, Any] | None) -> pd.DataFrame:
         """
@@ -764,11 +768,14 @@ class FeatureComputer:
             parts.append(self._build_one(name, kwargs))
 
         # 直通分鐘特徵（白名單）— 同步 shift(1)
-        passthrough_cols = self._passthrough_columns(cfg)
+        passthrough_cols = self.passthrough_columns(cfg)
         if passthrough_cols:
-            mdf = self.lib.df.loc[:, passthrough_cols].copy().shift(1)
-            for c in mdf.columns:
-                mdf[c] = pd.to_numeric(mdf[c], errors="coerce").astype("float32")
+            mdf = (
+                self.lib.df.loc[:, passthrough_cols]
+                .apply(pd.to_numeric, errors="coerce")
+                .astype("float32")
+                .shift(1)
+            )
             parts.append(mdf)
 
         return self._finalize(parts, cfg)
@@ -828,7 +835,7 @@ class FeatureComputer:
 # =========================
 def main():
     # 1. load cfg & data
-    cfg_path = r"train/build_feature_loader/features_config.yaml"
+    cfg_path = r"train/data/features/features_config.yaml"
     with open(cfg_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -840,6 +847,7 @@ def main():
     df_raw = pd.read_csv(data_cfg["path"])
     lib = IndicatorLibrary(df_raw=df_raw, freq_check=data_cfg["freq"], prefer_time_col=data_cfg["index_col"])
     fc = FeatureComputer(lib)
+    passthrough_cols = fc.passthrough_columns(cfg)
     X = fc.compute(plan, cfg)
 
     # 3. Assemble final dataframe: time columns + OHLCV + features + 1-min info
@@ -858,16 +866,21 @@ def main():
     ohlcv_df = lib.df.loc[idx, ohlcv_cols].astype("float32")
 
     # all 1-min columns (prefix m_) — 也 shift(1) 以保證「所有訓練可用特徵」都不洩漏
-    minute_cols = [c for c in lib.df.columns if str(c).startswith(DEFAULT_MINUTE_PREFIXES)]
-    if minute_cols:
-        mdf = lib.df.loc[idx, minute_cols].copy().shift(1)
-        for c in mdf.columns:
-            mdf[c] = pd.to_numeric(mdf[c], errors="coerce").astype("float32")
+    if passthrough_cols:
+        minute_df = (
+            lib.df.loc[idx, passthrough_cols]
+            .apply(pd.to_numeric, errors="coerce")
+            .astype("float32")
+            .shift(1)
+        )
     else:
-        mdf = pd.DataFrame(index=idx)
+        minute_df = pd.DataFrame(index=idx)
+
+    # 避免重複欄位：將白名單分鐘特徵僅保留一次
+    X = X.drop(columns=passthrough_cols, errors="ignore")
 
     # combine
-    out = pd.concat([time_df, ohlcv_df, X, mdf], axis=1)
+    out = pd.concat([time_df, ohlcv_df, X, minute_df], axis=1)
 
     # Optional: quick validation of expected vs. actual feature columns
     try:

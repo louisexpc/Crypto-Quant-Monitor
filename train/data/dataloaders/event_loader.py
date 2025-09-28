@@ -32,17 +32,8 @@ def make_event_loaders_for_fold(
     tr_idx, va_idx, te_idx = split_fold_to_indices(df_events, fold, cfg)
 
     # 2) 讀特徵 + 過濾欄位
-    feat_df = load_precomputed_features(path=cfg["data"]["path"])
-    if feat_cols:
-        feat_cols = [c for c in feat_cols if c in feat_df.columns]
-        if not feat_cols:
-            raise ValueError("指定的 feat_cols 與特徵表不相交")
-        feat_df = feat_df.loc[:, feat_cols].astype(np.float32)
-    else:
-        feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
-        if not feat_cols:
-            raise ValueError("預算特徵表缺少數值欄位")
-        feat_df = feat_df.loc[:, feat_cols].astype(np.float32)
+    feat_df = load_precomputed_features(path=cfg["data"]["path"]).astype(np.float32)
+    feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
 
     # 3) 計算 fit_index（train 事件左窗 union）
     L = int(cfg["sequence"]["seq_len"])

@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import amp
 from typing import Dict
-
+from collections import Counter
 from train.training.trainers.utils import (
     amp_dtype,
     build_optimizer,
@@ -157,8 +157,8 @@ def train_one_fold(
             warmup_steps=int(guard_cfg.get("warmup_steps", steps_per_epoch * 2)),
             entropy_hi=float(guard_cfg.get("entropy_hi", 0.60)),
             cooldown_steps=int(guard_cfg.get("cooldown_steps", max(steps_per_epoch, 200))),
-            verbose=bool(guard_cfg.get("verbose", False)),
-)
+            verbose=bool(guard_cfg.get("verbose", False))
+            )
     else:
         best_state_holder = {"state": None}
 
@@ -438,9 +438,22 @@ def train_one_fold(
             f"mcc={m_te.get('mcc', 0.0):.3f}"
         )
 
+
+
+    # 1) 做出 loss 的歷史序列（collapse_mask 會拿這個用）
+    val_loss_history = [float(h.get("val_loss", np.nan)) for h in history if "val_loss" in h]
+    train_loss_history = [float(h.get("train_loss", np.nan)) for h in history if "train_loss" in h]
+
+    # 2) 標籤分佈（collapse_mask 算 pos_ratio 用）
+    lc_tr = dict(Counter(y_tr.tolist()))  # 最後一個 epoch 的 train 走完整個資料集，分佈即為全訓練集
+    lc_va = dict(Counter(y_va.tolist()))  # 驗證集同理
+    label_counts = {"train": lc_tr, "val": lc_va}
+
     # ---- 組合回傳 ----
     result = {
         "history": history,
+        "val_loss_history": val_loss_history,
+        "label_counts": label_counts, 
         "best_epoch": best_epoch,
         "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
         "val_metrics": {

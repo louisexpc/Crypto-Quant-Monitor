@@ -14,96 +14,51 @@ from train.data.column_plan import select_plan_columns
 from train.data.folds import split_fold_to_indices
 from train.data.scalers import _get_scaler, ColumnSubsetScaler, pick_cols_to_scale
 from train.data.dataset.event_dataset import EventDataset
+from train.data.dataloaders.base import load_precomputed_features, align_times, ensure_utc_index
 
-
-def _to_utc_index(idx: pd.Index | pd.Series, assume_tz: str = "UTC") -> pd.DatetimeIndex:
+def collapse_mask(result: dict) -> bool:
     """
     1. 說明:
-        將任意時間索引/序列正規化為 tz-aware 的 UTC DatetimeIndex。
-        - naive → 先以 assume_tz localize，再轉 UTC
-        - 已帶時區 → 直接轉 UTC
+        避免 train 壞的模型參與投票
+        規則1: val_loss_f > val_loss_0
+        規則2: pos_ratio > 0.8 或 < 0.2
     2. inputs:
-        - idx: pd.Index | pd.Series
-        - assume_tz: str = "UTC"
+        - result: 訓練摘要（需含 val_loss_history 或 label_counts）
     3. return:
-        - pd.DatetimeIndex (tz='UTC')
+        - bool: True=剔除
     """
-    di = pd.DatetimeIndex(idx)
-    if di.tz is None:
-        di = di.tz_localize(assume_tz)
-    return di.tz_convert("UTC")
+    vh = result.get("val_loss_history") or (result.get("val_history", {}) or {}).get("loss")
+    debug_prefix = "[collapse_mask]"
+    if isinstance(vh, (list, tuple)) and len(vh) >= 2:
+        try:
+            vh_f = float(vh[0])
+            vh_l = float(vh[-1])
+            vh_best = min(float(x) for x in vh if x is not None)
+        except Exception:
+            vh_f = vh_l = vh_best = float("nan")
+        if vh_l > vh_f:
+            print(f"{debug_prefix} drop by val_loss trend: first={vh_f:.6f}, last={vh_l:.6f}, best={vh_best:.6f}")
+            return True
+        else:
+            print(f"{debug_prefix} keep by val_loss trend: first={vh_f:.6f}, last={vh_l:.6f}, best={vh_best:.6f}")
 
+    lc = (result.get("label_counts", {}) or {})
+    counts = lc.get("val") or lc.get("train") or {}
+    try:
+        n0 = int(counts.get(0, counts.get("0", 0)))
+        n1 = int(counts.get(1, counts.get("1", 0)))
+        tot = n0 + n1
+        if tot > 0:
+            pos_ratio = n1 / float(tot)
+            if pos_ratio > 0.8 or pos_ratio < 0.2:
+                print(f"{debug_prefix} drop by pos_ratio={pos_ratio:.4f} (n0={n0}, n1={n1})")
+                return True
+            else:
+                print(f"{debug_prefix} keep by pos_ratio={pos_ratio:.4f} (n0={n0}, n1={n1})")
+    except Exception:
+        pass
 
-def _load_precomputed_features(pre_path: str) -> pd.DataFrame:
-    """
-    1. 說明:
-        載入預算特徵（csv/parquet），建立 UTC DatetimeIndex（來自 'datetime' 或 'timestamp' 欄），
-        排序並去重（保留最後一次）。
-    2. inputs:
-        - pre_path: str  路徑（.csv 或 .parquet）
-    3. return:
-        - pd.DataFrame  (index=UTC DatetimeIndex)
-    """
-    if pre_path.endswith(".csv"):
-        df = pd.read_csv(pre_path)
-    elif pre_path.endswith(".parquet"):
-        df = pd.read_parquet(pre_path)
-    else:
-        raise ValueError("features.precomputed.path 只支援 .csv 或 .parquet")
-
-    # 設定索引：datetime / timestamp / 已有 DatetimeIndex
-    if "datetime" in df.columns:
-        idx = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
-        df = df.drop(columns=["datetime"])
-        df.index = idx
-    elif "timestamp" in df.columns:
-        ts = pd.to_numeric(df["timestamp"], errors="coerce")
-        ts_nonan = ts.dropna()
-        if len(ts_nonan) == 0:
-            raise ValueError("timestamp 欄全為 NaN")
-        q = float(ts_nonan.quantile(0.5))
-        unit = "ms" if q > 1_000_000_000_000 else "s"
-        idx = pd.to_datetime(ts, unit=unit, utc=True)
-        df = df.drop(columns=["timestamp"])
-        df.index = idx
-    elif isinstance(df.index, pd.DatetimeIndex):
-        df.index = _to_utc_index(df.index)
-    else:
-        raise TypeError("預算特徵檔需包含 'datetime' 或 'timestamp' 欄位，或已是 DatetimeIndex")
-
-    df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    return df
-
-
-def _align_times(t0_index: pd.DatetimeIndex, idx_all: pd.DatetimeIndex, method: str) -> pd.DatetimeIndex:
-    """
-    1. 說明:
-        將一組時間 t0 對齊到 idx_all（固定網格）的時間點。
-        - exact: t0 必須在網格上
-        - pad  : 對齊到 t0 前一根（floor）
-    2. inputs:
-        - t0_index: pd.DatetimeIndex
-        - idx_all: pd.DatetimeIndex（網格，需為 UTC）
-        - method: str in {"exact","pad"}
-    3. return:
-        - pd.DatetimeIndex（對齊到 idx_all 的時間）
-    """
-    method = str(method).lower()
-    t0u = _to_utc_index(t0_index, assume_tz="UTC")
-    if method == "exact":
-        pos = idx_all.get_indexer(t0u)
-        valid = pos >= 0
-        pos = pos[valid]
-        return idx_all[pos]
-    elif method == "pad":
-        pos = idx_all.searchsorted(t0u, side="right") - 1
-        valid = pos >= 0
-        pos = pos[valid]
-        return idx_all[pos]
-    else:
-        raise ValueError("align_method must be 'exact' or 'pad'")
-
+    return False
 
 # ---------------- main export ----------------
 def export_tbm_predictions_for_trial(
@@ -163,10 +118,8 @@ def export_tbm_predictions_for_trial(
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     # ---- features ----
-    feat_df = _load_precomputed_features(str(cfg["data"]["path"]))
-    feat_cols = select_plan_columns(feat_df, cfg)
-    feat_cols = [c for c in feat_cols if c in feat_df.columns]
-    feat_df = feat_df.loc[:, feat_cols].astype(np.float32)
+    feat_df = load_precomputed_features(path=str(cfg["data"]["path"])).astype(np.float32)
+    feat_cols = [c for c in feat_df.columns]
     idx_all = pd.DatetimeIndex(feat_df.index)  # UTC, sorted
 
     # ---- TBM (完整表，保留為輸出底稿) ----
@@ -178,8 +131,7 @@ def export_tbm_predictions_for_trial(
     if "__rid" not in tbm_all.columns:
         tbm_all["__rid"] = np.arange(len(tbm_all), dtype=np.int64)
 
-    assume_tz = str(cfg.get("data", {}).get("assume_tz", "UTC"))
-    t0u_all = _to_utc_index(tbm_all["t0"], assume_tz=assume_tz)
+    t0u_all = ensure_utc_index(tbm_all["t0"])
 
     # ---- side / date 遮罩 → 僅供推論的子集（不改 tbm_all！）----
     keep_sides = str(cfg["label"].get("keep_sides", "both")).lower()
@@ -212,11 +164,11 @@ def export_tbm_predictions_for_trial(
 
     # ---- 對齊時間（僅為推論候選）----
     align_method = str(cfg.get("label", {}).get("align_method", "pad")).lower()
-    allowed_align = _align_times(t0u_sel, idx_all, align_method)
+    allowed_align = align_times(t0u_sel, idx_all, align_method)
 
     # === 準備 rid 索引（靜態，不會被消耗） ===
     tbm_sel = tbm_sel.copy()
-    tbm_sel["t0u"] = _to_utc_index(tbm_sel["t0"], assume_tz=assume_tz)
+    tbm_sel["t0u"] = ensure_utc_index(tbm_sel["t0"])
     events_order = tbm_sel.sort_values(["t0u", "__rid"])
 
     # key: t0_utc -> value: 依 __rid 順序的 rid 列表（保持穩定對應）
@@ -233,6 +185,25 @@ def export_tbm_predictions_for_trial(
     per_fold_prob: Dict[int, Dict[int, float]] = {}  # fold_idx -> {rid: p1}
     thr_per_fold: Dict[int, float] = {}              # 修正：以 fold_idx 為 key 收集門檻，避免錯位
 
+    # --- 品質閘：用 collapse_mask 剔除壞掉的 fold ---
+    _kept, _dropped = [], []
+    for i, (m, fdict, res) in enumerate(fold_models):
+        try:
+            if collapse_mask(res):
+                _dropped.append({"fold_idx": i})
+                continue
+        except Exception as e:
+            # 資料缺欄等異常：保守起見留著，並提示
+            print(f"[export][warn] collapse_mask failed on fold {i}: {e}; keep it.")
+        _kept.append((m, fdict, res))
+
+    if not _kept:
+        raise RuntimeError("[export] 所有 fold 皆被 collapse_mask 剔除，停止匯出。")
+    if _dropped:
+        print(f"[export] drop {len(_dropped)} fold(s) by collapse_mask: {_dropped}")
+
+    fold_models = _kept
+
     for fold_idx, (model, fold_d, result) in enumerate(fold_models):
         # 每個 fold 自己的 t0 配對指標（不互相影響）
         rid_counter = defaultdict(int)  # key: t0_utc -> 已分配次數（當作 rid_lists_by_t0 的索引）
@@ -240,7 +211,7 @@ def export_tbm_predictions_for_trial(
         # 1) split：決定 scaler 擬合窗口（train）
         df_idx = pd.DataFrame(index=pd.DatetimeIndex(df_index))
         tr_idx, va_idx, te_idx = split_fold_to_indices(df_idx, fold_d, cfg)
-        train_align = _align_times(tr_idx, idx_all, align_method)
+        train_align = align_times(tr_idx, idx_all, align_method)
 
         fit_pos: List[int] = []
         for at in train_align:
@@ -324,7 +295,7 @@ def export_tbm_predictions_for_trial(
                     if key_t0 is None:
                         # 保險：若 Dataset 無 t0_utc，嘗試 ev.t0 或 ev.time
                         key_t0 = getattr(ev, "t0", getattr(ev, "time", None))
-                        key_t0 = _to_utc_index(pd.Index([key_t0]))[0]
+                        key_t0 = ensure_utc_index(pd.Index([key_t0]))[0]
 
                     # A 方案：每 fold 自己的計數器，不消耗共享列表
                     i = rid_counter[key_t0]                 # 這個 t0 已經分配到第幾個重複事件

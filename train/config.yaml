@@ -5,12 +5,12 @@
 # 1. ---basic---
 seed: 42
 device: cuda
-project_name: BTC_ewma_up3_dn3_lookback108_long
+project_name: BTC_test_2
 also_XGB: false
 
 # 2. ---Data---
 data:
-  path: data/precomputed/btcusdt_15m_features.parquet  # precomputed feat data: include flat 1-min and FNG
+  path: data/precomputed/btcusdt_15m_features_v2.parquet   # precomputed feat data: include flat 1-min and FNG
   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
   freq: "15min"                    # 供缺口提醒（不會自動補齊）
   columns:
@@ -35,14 +35,14 @@ cv:
   # train_months: [2,3,4,5,6]
 
   type: Purged_kfold  
-  n_splits: 5
-  embargo_hours: 72
-  min_train_days: 30
+  n_splits: 5        # 分成幾個 Purged_kfold  
+  embargo_hours: 72  # test 跟 train 的間隔
+  min_train_days: 30 
 
 # 4. ---sequence (往前看多久)---
 sequence:
-  seq_len: [36, 72, 144, 288, 432]  # , 216, 288
-  stride: [1, 2, 4, 12, 24]
+  seq_len: [36, 72, 144]  # , 216, 288
+  stride: [1, 2, 4, 12]
   scaler: standard  # [standard / robust / minmax / rolling / ewm / robust_rolling / none]
   stride_anchor: 0
   min_frac: 0.2
@@ -57,7 +57,7 @@ train:
   lr: [1e-5, 3e-4]
   weight_decay: [1e-6, 3e-4]
   batch_size: 256
-  epochs: 300
+  epochs: 50
   grad_clip: [0.3, 3.0]
 
   early_stopping_patience: 20
@@ -71,8 +71,8 @@ train:
   val_delay: 0
 
   # cls
-  # ---- 動態門檻（預設 auto_auc=Youden J；改成 auto_fbeta 則掃 Fβ）----
-  threshold_mode: auto_fbeta          # [auto_auc | auto_fbeta | fixed]
+  # ---- 動態門檻（預設 auto_fbeta 則掃 Fβ）----
+  threshold_mode: auto_fbeta          # [auto_fbeta | fixed]
   threshold_fbeta: 0.5                # 只在 auto_fbeta 時使用
   threshold_grid_points: 201          # 門檻掃描點數（越大越細）
   threshold: null                     # fixed 模式才會用到；動態請設 null 或移除
@@ -111,21 +111,21 @@ loss:
     normalized: true  # 只用於mean
 
 # 3. collaplase guard
-# guard:
-#   enabled: true
-#   pos_threshold: 0.5         # 若 threshold_mode=fixed 可省略，會自動讀 train.threshold
-#   ppr_warn_band: [0.55, 0.90]
-#   warn_patience: 60
-#   ppr_extreme_band: [0.02, 0.98]
-#   extreme_patience: 100
-#   cp_boost_factor: 1.0
-#   lr_decay: 0.8
-#   max_conf_penalty: 0.02
-#   smoothing: 0.2             # EMA 平滑（0 表示不用）
-#   restore_on_trigger: true   # 觸發時回滾最佳權重
+guard:
+  enabled: false
+  pos_threshold: 0.5         # 若 threshold_mode=fixed 可省略，會自動讀 train.threshold
+  ppr_warn_band: [0.55, 0.90]
+  warn_patience: 60
+  ppr_extreme_band: [0.02, 0.98]
+  extreme_patience: 100
+  cp_boost_factor: 1.0
+  lr_decay: 0.8
+  max_conf_penalty: 0.02
+  smoothing: 0.2             # EMA 平滑（0 表示不用）
+  restore_on_trigger: true   # 觸發時回滾最佳權重
 
 guard:
-  enabled: true  
+  enabled: false  
   pos_threshold: 0.5  # 先用 0.5 起手；每個 epoch 驗證後 trainer 會呼叫 guard.set_pos_threshold(...)  
   smoothing: 0.95     # EMA 平滑（越大越穩）— 少量 batch 場景建議 0.9~0.99
   warmup_steps: 9     # 若每 epoch ≈3 步，可設 3*3=9；你的情況可用 6~12 區間  
@@ -186,8 +186,8 @@ search:
 # =========================
 model:
   name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
-  d_model: [64, 80, 96]
-  n_heads: [2, 4]
+  d_model: [32, 64, 72, 96]
+  n_heads: [2, 4, 8]
   n_layers: [1, 2, 3]
   mlp_ratio: 2.0
   dropout: [0.1, 0.25] 
@@ -233,81 +233,3 @@ post_infer:
     output_column: "pred"          # 追加到 TBM CSV 的欄位名
     csv_path_override: null        # 若不為空，覆蓋 cfg.label.tbm_csv_path
 
-
-# =========================
-# F. Selected Features
-# =========================
-features:
-  plan:
-    features:
-      # ===================== Group: ohlcv（原始） =====================
-      - { name: OPEN,   kwargs: {}, enabled: false }     # 開盤價（原始特徵）
-      - { name: HIGH,   kwargs: {}, enabled: false }     # 最高價（原始特徵）
-      - { name: LOW,    kwargs: {}, enabled: false }     # 最低價（原始特徵）
-      - { name: CLOSE,  kwargs: {}, enabled: false }     # 收盤價（原始特徵）
-      - { name: VOLUME, kwargs: {}, enabled: true }     # 成交量（原始特徵）
-
-      # ===================== Group: volume（原始成交量與量能指標） =====================      
-      - { name: PVO,    kwargs: { fast: 12, slow: 26, signal: 9 }, enabled: false } # 量的 MACD（量能動能）
-      - { name: PVR,    kwargs: {}, enabled: false  }                                # 價量比率（price-volume ratio）
-      - { name: BOP,    kwargs: {}, enabled: false  }                                # 買方/賣方力量（Body 對區間）
-
-      # ===================== Group: trend（趨勢/均線/去趨勢） =====================
-      - { name: SLOPE,     kwargs: { length: 5 }, enabled: true }              # 收盤價線性回歸斜率（近端趨勢）
-      - { name: TTM_TRND,  kwargs: { length: 6 }, enabled: true }              # TTM 趨勢過濾
-      - { name: DPO,       kwargs: { length: 20 }, enabled: true }             # 去趨勢震盪器（移除長期趨勢）
-      - { name: AMATE_LR,  kwargs: { fast: 8, slow: 21, mamode: 2 }, enabled: false }  # AMAT 長週期線（趨勢通道）
-
-      # —— 均線/動能（只輸出 sign：-1/0/1）——
-      - { name: SMA,  kwargs: { length: 50, sign: true }, enabled: false }       # 簡單均線；sign=收盤相對 SMA 的方向
-      - { name: EMA,  kwargs: { length: 21, sign: true }, enabled: false }       # 指數均線；較敏感；sign 同上
-      - { name: TEMA, kwargs: { length: 30, sign: true }, enabled: false }       # 三重 EMA；更平滑、延遲更低；sign 同上
-      - { name: MACD, kwargs: { fast: 12, slow: 26, signal: 9, sign: false }, enabled: false } # MACD 動能；sign=主線相對訊號線
-
-      # ===================== Group: momentum / oscillator（動能/震盪） =====================
-      - { name: RSI,   kwargs: { length: 14 }, enabled: true }                 # 相對強弱（超買超賣）
-      - { name: RSI,   kwargs: { length: 30 }, enabled: true }                 # 較長期 RSI
-      - { name: MOM,   kwargs: { length: 30 }, enabled: true  }                 # 價格動量
-      - { name: STOCH, kwargs: { k: 30,  d: 3, smooth_k: 3 }, enabled: false }  # 隨機指標 %K/%D（短期）
-      - { name: STOCH, kwargs: { k: 200, d: 3, smooth_k: 3 }, enabled: false }  # 隨機指標（更長期）
-      - { name: KDJ,   kwargs: { k: 9, d: 3, smooth_k: 3 }, enabled: false }    # KDJ 的 J 線（放大動能）
-      - { name: RVI,   kwargs: { length: 14 }, enabled: false }                 # 相對活力指標
-      - { name: WILLR, kwargs: { length: 14 }, enabled: false }                 # 威廉指標（區間位置）
-      - { name: UO,    kwargs: { fast: 7, medium: 14, slow: 28 }, enabled: false } # 統一動量（多尺度結合）
-      - { name: CCI,   kwargs: { length: 14, c: 0.015 }, enabled: true }       # 商品通道（偏離均值）
-      - { name: ZS,    kwargs: { length: 30 }, enabled: true }                 # 滾動 Z 分數（標準化偏離）
-
-      # ===================== Group: volatility（波動/區間） =====================
-      - { name: TRUERANGE, kwargs: {}, enabled: true  }                         # 單期真實區間（HL 與跳空）
-      - { name: ATR,       kwargs: { length: 14, pct: true }, enabled: true  }   # 平均真實波動；pct=相對收盤比例
-      - { name: RANGE,     kwargs: { window: 24, pct: true }, enabled: true }   # HL 區間的滾動均值；pct=相對收盤
-      - { name: MASSI,     kwargs: { fast: 9, slow: 25 }, enabled: false }      # Mass Index（高低擴張）
-      - { name: BBP,       kwargs: { length: 5, std: 2.0 }, enabled: true }    # 布林通道百分位位置
-      - { name: EWMRET,    kwargs: { halflife: [6,12,48] }, enabled: true }     # logret 的 EWM 均值/標準差（波動/漂移）
-
-      # ===================== Group: price_volume（價量交互） =====================
-      - { name: PXVOL, kwargs: {}, enabled: true }                              # 方向強度、logret×量變、方向×量
-
-      # ===================== Group: returns（報酬） =====================
-      - { name: LOGRET, kwargs: { lags: [1,2,3,5,10], pct: true }, enabled: true } # 多期簡單報酬（%），含短中期
-
-      # ===================== Group: time（時間週期） =====================
-      - { name: TIME_CYC, kwargs: { tz: "Asia/Taipei", daily: true, weekly: true }, enabled: false } # 日內/週期 sin/cos
-
-      # ===================== Group: funding rate（資金費率） =====================
-      - { name: FOUND, kwargs: {}, enabled: false }                                 # 每 8 小時資金費率，可作為散戶情緒 proxy
-      # ===================== Group: fast signal（15分鐘子訊號） =====================
-      - { name: M15_DIR, kwargs: {}, enabled: false }                               # 三段 m15 漲跌 (01/12/23) → 類似細粒度動能
-      - { name: M15_VOL, kwargs: {}, enabled: false }     
-
-      # ===================== Group: Sentiment index（15分鐘子訊號） =====================
-      - { name: FNG_IDX, kwargs: {}, enabled: true }    
-
-  min_trade_feat:
-    - "imbalance"
-    - "buy_ratio"
-    - "buy_count_ratio"
-    - "price_mean"
-    - "price_vwap"
-    - "price_max"
-    - "trend_slope"
