@@ -3,10 +3,27 @@ from __future__ import annotations
 from pathlib import Path
 from importlib import import_module
 from typing import Callable
+import inspect
 from .config_loader import load_cfg
 from .context import set_seed
 
-def run(cfg_path: str | Path, entry: Callable[[str], None]) -> None:
+def _accepts_cfg(callback: Callable[..., None]) -> bool:
+    try:
+        sig = inspect.signature(callback)
+    except (TypeError, ValueError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "cfg" and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return True
+    return False
+
+
+def run(cfg_path: str | Path, entry: Callable[..., None]) -> None:
     """
     1. 說明: 薄 orchestrator：載入設定、設 seed，轉呼舊入口
     2. inputs:
@@ -16,7 +33,11 @@ def run(cfg_path: str | Path, entry: Callable[[str], None]) -> None:
     """
     cfg = load_cfg(cfg_path)
     set_seed(int(cfg.get("seed", 42)), deterministic=cfg.get("deterministic", True))
-    entry(str(cfg_path))
+    cfg_path_str = str(cfg_path)
+    if _accepts_cfg(entry):
+        entry(cfg_path_str, cfg=cfg)
+    else:
+        entry(cfg_path_str)
 
 if __name__ == "__main__":
     # 簡易 CLI：python -m train.core.orchestrator train/config.yaml

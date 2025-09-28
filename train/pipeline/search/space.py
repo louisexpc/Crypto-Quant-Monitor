@@ -1,10 +1,10 @@
-# objective_utils.py
+# train/pipeline/search/space.py
 import os, sys, re
 import optuna
 import numpy as np
 from pathlib import Path
 import copy, datetime, yaml
-from train.build_feature_loader.dataloader import FoldGenerator
+from train.data.folds import FoldGenerator
 
 # ======================================================================
 # Section A. 小工具
@@ -70,9 +70,9 @@ def suggest_cat(trial: optuna.Trial, name: str, vals):
 
 
 # ======================================================================
-# Section B. CV 與序列超參數（Rolling / Anchored / OddEven）
+# Section B. CV 與序列超參數
 # ======================================================================
-def suggest_rolling_and_cv(trial: optuna.Trial, cfg: dict) -> dict:
+def suggest_sequence_and_cv(trial: optuna.Trial, cfg: dict) -> dict:
     """讓 Optuna 針對序列/切分做取樣；對於 list 皆採樣，單值則原樣。"""
     cv_cfg = cfg["cv"]
     cv_mode = cv_cfg["type"]
@@ -191,8 +191,6 @@ def suggest_model_hparams(trial: optuna.Trial, cfg: dict) -> dict:
 # ======================================================================
 # Section D. 紀錄該trialyaml
 # ======================================================================
-
-
 def set_by_dotpath(d, dotpath, value):
     """把 value 寫到 d['a']['b']['c']；dotpath='a.b.c'。會自動建子dict。"""
     keys = dotpath.split(".")

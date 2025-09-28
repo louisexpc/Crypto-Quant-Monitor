@@ -1,15 +1,18 @@
-# xgb_trainer.py
+# train/training/trainers/xgb.py
 import cupy as cp
 import xgboost as xgb
+from train.training.metrics.metrics_reg import compute_regression_metrics
+from train.evaluation.utils import (
+    compute_mixed_objective_np,
+    plot_regression_eval,
+    plot_regression_threshold_sweep,
+    save_fold_metrics,
+)
+
 
 def _train_one_fold_xgb(model_wrapper, cfg, fold_id, export_dir):
     import numpy as np
     from pathlib import Path
-    from train_old.train_utils.regression_utils import compute_regression_metrics
-    from train_old.train_utils.compute_export_metrices import (
-        compute_mixed_objective_np,  # ← 與 trainer_reg.py 對齊
-        plot_regression_eval, plot_regression_threshold_sweep, save_fold_metrics
-    )
 
     export_dir = Path(export_dir); export_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,4 +171,3 @@ def _train_one_fold_xgb(model_wrapper, cfg, fold_id, export_dir):
     save_fold_metrics(history, save_dir=export_dir, prefix=f"fold_{fold_id}_")
     # save_result(fold_id=fold_id, export_dir=export_dir, result=result)
     return model, result
-

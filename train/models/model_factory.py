@@ -14,7 +14,7 @@ def _ensure_registry_loaded(name: str) -> None:
     mapping = {
         "LSTM_SE": "train.models.LSTM",
         "LSTM_Temporal": "train.models.LSTM",
-        "TemporalTransformer": "train.models.transformer_model",  # ← 新檔名
+        "TemporalTransformer": "train.models.transformer_model",
         "TwoStreamHybrid": "train.models.two_stream_model",
         "xgb": "train.models.xgb_model",
     }

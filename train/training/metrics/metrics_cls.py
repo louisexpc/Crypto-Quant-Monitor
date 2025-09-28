@@ -20,28 +20,6 @@ def fbeta_macro(y_true, y_pred, beta: float) -> float:
     f_k = (1.0 + b2) * (p_k * r_k) / (b2 * p_k + r_k + _EPS)
     return float(np.mean(f_k))
 
-# def compute_cls_metrics(y_true, y_pred) -> dict:
-#     y_true = np.asarray(y_true)
-#     y_pred = np.asarray(y_pred)
-
-#     acc = float(accuracy_score(y_true, y_pred))
-#     p_macro, r_macro, f1_macro, _ = precision_recall_fscore_support(
-#         y_true, y_pred, average="macro", zero_division=0
-#     )
-#     # MCC（支援 binary / multiclass）
-#     try:
-#         mcc = float(matthews_corrcoef(y_true, y_pred))
-#     except Exception:
-#         mcc = 0.0
-
-#     return {
-#         "acc":             acc,
-#         "macro_precision": float(p_macro),
-#         "macro_recall":    float(r_macro),
-#         "macro_f1":        float(f1_macro),
-#         "f_05_macro":      fbeta_macro(y_true, y_pred, beta=0.5),
-#         "mcc":             mcc,
-#     }
 
 def compute_cls_metrics(y_true, y_pred) -> dict:
     y_true = np.asarray(y_true)

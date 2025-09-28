@@ -1,27 +1,22 @@
-# trainer_reg.py
+# train/training/trainers/regression.py
 import numpy as np
 import torch
 import torch.nn as nn
 from torch import amp
 from sklearn.metrics import fbeta_score
-from .trainer_base import (
-    amp_dtype, build_optimizer, build_warmup_scheduler, build_grad_scaler
+
+from train.training.trainers.utils import (
+    amp_dtype,
+    build_optimizer,
+    build_warmup_scheduler,
+    build_grad_scaler,
 )
-from .xgb_trainer import _train_one_fold_xgb
-
-import os
-import sys
-# 回歸度量/損失/圖表
-from train_old.train_utils.regression_utils import build_regression_loss
-
-from train_old.train_utils.compute_export_metrices import (
-    save_fold_metrics, plot_regression_eval, 
-    plot_test_eval
-)
-from train_old.train_utils.metrics_reg import compute_regression_metrics, mixed_objective  # ★ 用這個
-from train_old.train_utils.metrics_cls import compute_cls_metrics               # ★ 回歸→分類要用
-
-from train_old.models.xgb_model import XGBRegressorModel
+from train.training.trainers.xgb import _train_one_fold_xgb
+from train.training.losses.reg import build_regression_loss
+from train.training.metrics.metrics_reg import compute_regression_metrics
+from train.training.metrics.metrics_cls import compute_cls_metrics
+from train.training.metrics.metrics_reg import mixed_objective
+from train.models.xgb_model import XGBRegressorModel
 
 def train_one_fold(
     model,
@@ -32,7 +27,29 @@ def train_one_fold(
     device: str = None,
     fold_id: int | None = None,
     export_dir: str | None = None
-):
+):    
+    """
+    1. 說明:
+        回歸任務的單一 fold 訓練/驗證/測試流程。
+        - 訓練：支援 AMP、warmup、梯度裁剪；損失可選 MSE/Huber 或 EMA-MSE+Pearson 混合。
+        - 驗證：計算 RMSE/MAE/MSE/Pearson/Spearman 與自訂 mixed objective（Optuna 可用）。
+        - 早停：依 primary metric（mixed/pearson/spearman/val_loss）決定最佳權重。
+        - 測試：載回最佳權重後輸出完整回歸指標與圖表。
+        - 選配：Reg→3-class（±t 對稱帶）做成分類指標與可視化。
+        - 特例：若 model 是 `XGBRegressorModel`，改走 XGBoost 的 numpy 流程。
+
+    2. inputs:
+        - model (nn.Module | XGBRegressorModel): 回歸模型，forward(X)->[B,1] 或 [B]。
+        - train_loader/val_loader/test_loader: 三段 DataLoader。
+        - cfg (dict): 設定（包含 train/ loss.reg/ objective/ regression_to_class 等鍵）。
+        - device (str|None): 'cuda' 或 'cpu'（預設 'cuda'，且本檔 assert 需要 CUDA）。
+        - fold_id (int|None): 當前 fold id（用於列印與匯出命名）。
+        - export_dir (str|None): 圖表與歷史指標的輸出目錄。
+
+    3. return:
+        - model (nn.Module): 載回最佳權重後的模型。
+        - result (dict): 指標/歷史/最佳 epoch 與（選配）Reg→3-class 結果。
+    """
     
     # === XGB 分支：直接改走 numpy 訓練，略過整個 torch 流程 ===
     if XGBRegressorModel is not None and isinstance(model, XGBRegressorModel):
@@ -329,16 +346,6 @@ def train_one_fold(
         y_pred_te_cls = tri_from(y_pred_te, thr_pred)
         m_te_cls      = compute_cls_metrics(y_true_te_cls, y_pred_te_cls)
 
-        # --- 畫圖（暫以 one-hot 機率；要 soft-binning 再加強）---
-        y_prob_te_3 = np.eye(3, dtype=float)[y_pred_te_cls]
-        plot_test_eval(
-            y_true=y_true_te_cls, y_pred=y_pred_te_cls, y_prob=y_prob_te_3,
-            class_names=cfg["model"].get("class_names", ["down","flat","up"]),
-            save_dir=os.path.join(export_dir, "cls_results_3c"),
-            prefix=f"fold_{fold_id}_",
-            threshold=None
-        )
-
         # --- 回寫結果 ---
         result["regression_to_class_3c"] = {
             "method": method,
@@ -359,12 +366,16 @@ def train_one_fold(
                 "y_te": y_te.tolist(),
                 "y_pred_te": y_pred_te.tolist(),
             }
+        result["regression_to_class_3c"]["eval_payload"] = {
+            "y_true": y_true_te_cls,
+            "y_pred": y_pred_te_cls,
+            "y_prob": np.eye(3, dtype=float)[y_pred_te_cls],
+            "class_names": cfg["model"].get("class_names", ["down", "flat", "up"]),
+        }
 
-    # 繪圖 / 匯出
-    plot_regression_eval(
-        y_true=y_te, y_pred=y_pred_te,
-        save_dir=export_dir, prefix=f"fold_{fold_id}_"
-    )
-    save_fold_metrics(history, save_dir=export_dir, prefix=f"fold_{fold_id}_")
+    result["eval_payload"] = {
+        "y_true": y_te,
+        "y_pred": y_pred_te,
+    }
     # save_result(fold_id=fold_id, export_dir=export_dir, result=result)
     return model, result

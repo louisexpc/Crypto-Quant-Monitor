@@ -1,9 +1,7 @@
+# train/training/losses/reg.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
 
-# === 回歸損失與工具 ===
 class EMAMSE_PearsonLoss(nn.Module):
     """
     total_loss = alpha * EMA(MSE) + beta * (1 - PearsonCorr)
@@ -43,22 +41,6 @@ class EMAMSE_PearsonLoss(nn.Module):
 
         return self.alpha * ema_mse + self.beta * (1.0 - corr)
 
-
-
-
-
-def compute_regression_metrics(y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=np.float64)  # ★
-    y_pred = np.asarray(y_pred, dtype=np.float64)  # ★
-    mse  = float(np.mean((y_true - y_pred) ** 2))
-    mae  = float(np.mean(np.abs(y_true - y_pred)))
-    rmse = float(np.sqrt(mse))
-    r = np.corrcoef(y_true, y_pred)[0, 1]
-    if not np.isfinite(r):
-        r = 0.0
-    return {"mse": mse, "mae": mae, "rmse": rmse, "pearson": r}
-
-
 def build_regression_loss(cfg):
     cfg_reg_loss = cfg["loss"]["reg"]
     name = cfg_reg_loss["name"]
@@ -75,38 +57,4 @@ def build_regression_loss(cfg):
     return EMAMSE_PearsonLoss(alpha=a, beta=b, ema_decay=d, eps=eps)
 
 
-def get_task_type(cfg):
-    # 兼容不同配置鍵
-    if "task" in cfg and "type" in cfg["task"]:
-        return cfg["task"]["type"].lower()
-    if "target" in cfg and "type" in cfg["target"]:
-        return cfg["target"]["type"].lower()
-    # fallback：照舊用 num_classes 判斷
-    nc = int(cfg["model"].get("num_classes", 1))
-    return "classification" if nc >= 2 else "regression"
 
-
-# === 回歸 → 分類（選配） ===
-from sklearn.metrics import fbeta_score
-
-def binarize_regression(y, threshold=0.0):
-    # y >= threshold → 1； 否則 0
-    y = np.asarray(y).reshape(-1)
-    return (y >= float(threshold)).astype(int)
-
-def find_best_threshold_for_regression(y_true_reg, y_pred_reg, fbeta=0.5, grid_points=101, true_threshold=0.0):
-    """
-    將回歸的 y 轉成 0/1（以 true_threshold），並對 y_pred 門檻掃描，選 F_beta 最高的門檻。
-    回傳: best_thresh, best_fbeta
-    """
-    y_true_bin = binarize_regression(y_true_reg, threshold=true_threshold)
-    # 掃描 y_pred 的分位數作為候選門檻（亦可改成線性區間）
-    qs = np.linspace(0, 1, int(grid_points))
-    cand = np.quantile(y_pred_reg, qs)
-    best_t, best_f = 0.0, -1.0
-    for t in cand:
-        yhat = (y_pred_reg >= t).astype(int)
-        f = fbeta_score(y_true_bin, yhat, beta=fbeta, zero_division=0)
-        if f > best_f:
-            best_f, best_t = f, float(t)
-    return best_t, best_f

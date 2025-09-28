@@ -6,9 +6,9 @@ import torch.nn as nn
 
 # 優先用新的 transformer_model；若專案仍保留舊檔名 Transformer.py，則回退兼容
 try:
-    from train.models.Transformer import TemporalTransformer
+    from train.models.transformer_model import TemporalTransformer
 except Exception:  # pragma: no cover
-    from .Transformer import TemporalTransformer  # 兼容舊路徑
+    from .transformer_model import TemporalTransformer  # 兼容舊路徑
 
 from train.models.registry import register
 

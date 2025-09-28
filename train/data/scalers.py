@@ -1,5 +1,4 @@
 # scalar.py
-
 """
 提供特徵縮放工具：
 - ColumnSubsetScaler：只縮放指定欄位（sklearn 類型）
@@ -150,3 +149,11 @@ def _get_scaler(scaler_kind: str, *, window: int = 96, min_frac: float = 0.2):
         return None
     else:
         raise ValueError(f"Unknown scaler kind: {scaler_kind}")
+
+
+
+
+
+
+
+

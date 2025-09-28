@@ -45,12 +45,6 @@ def _spearman_np(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         return float("nan")
     return float((r1c * r2c).sum() / denom)
 
-
-
-
-
-
-
 def compute_regression_metrics(y_true, y_pred) -> dict:
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)

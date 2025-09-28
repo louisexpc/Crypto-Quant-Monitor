@@ -15,5 +15,5 @@ runs_old
 runs
 feature_selections
 
-utils
+/utils
 *.json

@@ -101,7 +101,7 @@ flowchart TD
 ### Root 層級
 - **main_train.py**
   - `load_cfg(path) -> dict`：讀取 YAML。常與 `cfg = load_cfg("train/config.yaml")` 搭配。
-  - `prepare_dataframe(cfg) -> (pd.DataFrame, dict|None)`：驗證 `cfg.data.path`，回傳索引用 df；若缺時間欄位會直接 raise。
+  - `prepare_dataframe(cfg) -> pd.DataFrame`：驗證 `cfg.data.path`，回傳索引用 df；若缺時間欄位會直接 raise。
   - `build_study(cfg, run_dir, parallel=False)`：建立 Optuna Study。可在 notebook 中呼叫以重用現有 `run_dir`。
   - `run_single(cfg_path, worker_tag=None)` / `run_multi(cfg_path)`：訓練主入口。CLI 常用 `python train/main_train.py`。
 
@@ -125,10 +125,10 @@ flowchart TD
     ```
 
 - **dataloader.py**
-  - `select_plan_columns(feat_df, cfg) -> list[str]`：讀取 `features.plan` 過濾特徵欄位。
+  - `select_plan_columns(feat_df, cfg) -> list[str]`：回傳預算特徵表中的所有數值欄位（保留原順序）。
   - `FoldGenerator(dt_index, mode, start_month, end_month, ...)`：生成 Rolling 或 Purged k-fold 的時間遮罩，並附 embargo。
-  - `make_time_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB, pre_feat_df)`：建立時間驅動的 `SeqDataset` DataLoader 與 XGB numpy 包。
-  - `make_event_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB, pre_feat_df)`：建立事件驅動的 `EventDataset` DataLoader。
+  - `make_time_loaders_for_fold(df, feat_cols, target_col, fold, cfg, also_XGB)`：建立時間驅動的 `SeqDataset` DataLoader 與 XGB numpy 包。
+  - `make_event_loaders_for_fold(df, feat_cols, fold, cfg, also_XGB)`：建立事件驅動的 `EventDataset` DataLoader。
   - `split_fold_to_indices(df, fold, cfg)`：回傳 train/val/test DatetimeIndex。
   - **使用**：Optuna trial 內會自動呼叫；若需手動驗證資料，可在 notebook 直接載入。
 
@@ -172,7 +172,7 @@ flowchart TD
 
 ### objective/
 - **objective.py**
-  - `objective(trial, base_cfg, df, run_dir, pt_bundle)`：Optuna trial 主函式，負責：
+  - `objective(trial, base_cfg, df, run_dir)`：Optuna trial 主函式，負責：
     1. 建議 learning rate、grad clip、threshold 等超參。
     2. 依 `cfg.label.mode` 選擇時間或事件 DataLoader。
     3. 建構模型並調用 `train_one_fold`，將結果記錄於 trial 目錄。
@@ -281,7 +281,7 @@ flowchart TD
    ```
 
 5. **調整特徵或標籤**
-   - 修改 `features.plan` 或 `features.min_trade_feat` 後，確保預算檔已有對應欄位。
+   - 直接調整預算特徵檔（CSV/Parquet）的欄位內容即可；pipeline 會自動使用所有數值欄位。
    - 調整 `label.mode`, `ret_shift`, `ret_type`, `fracdiff`，或替換為 `event_tbm` 模式。
 
 6. **XGBoost 同步訓練**
@@ -291,7 +291,7 @@ flowchart TD
 ---
 
 ## 常見擴充建議
-- **新增自訂指標**：在 `build_feature_loader/indicators.py` 登錄 builder，並於 YAML `features.plan` 啟用。
+- **新增自訂指標**：在 `build_feature_loader/indicators.py` 登錄 builder，產生的新欄位寫入預算檔即可被 pipeline 自動使用。
 - **自訂模型**：擴充 `models/` 下的檔案，並在 `model_factory.build_model` 加入新分支，Optuna 即可納入搜尋。
 - **調整後處理**：在 `train_utils/compute_export_metrices.py` 新增報表函式，或在 `post_infer/` 建立自訂腳本並於 `objective` 完成後呼叫。
 - **離線資料檢查**：可單獨引入 `FoldGenerator` 與 `make_time_loaders_for_fold` 在 notebook 中檢視 fold/特徵內容，避免 trial 期間才發現問題。
@@ -309,10 +309,9 @@ train/
 │  └─ __init__.py
 │
 ├─ data/                                   # 只處理資料面：讀檔/索引/切分/縮放
-│  ├─ feature_store.py                     # FeatureStore：一次載入、多處重用（可預算時間標籤）
 │  ├─ folds.py                             # Rolling/Purged/Anchored + Embargo
 │  ├─ scalers.py                           # time-safe scaler 工廠（全都 shift(1)）
-│  ├─ column_plan.py                       # 依 YAML features.plan 篩欄
+│  ├─ column_plan.py                       # 選擇預算特徵表中的數值欄位
 │  ├─ dataloaders/                         # 批次化與取樣；不做業務邏輯
 │  │  ├─ base.py                           # 共用：切 index、fit/transform、XGB pack
 │  │  ├─ time_loader.py                    # 時間驅動 loader（SeqDataset）
@@ -376,7 +375,7 @@ train/
 
 用文字把契約說清楚，後續文件也照這個描述：
 
-載入：FeatureStore.from_cfg(cfg)
+載入：load_precomputed_features(cfg["data"]["path"])
 
 讀 .parquet/.csv → UTC index → 排序/去重 →（時間任務）create_label 一次。
 

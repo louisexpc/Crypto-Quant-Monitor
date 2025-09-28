@@ -2,7 +2,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from train_old.models.registry import register
+from train.models.registry import register
 
 
 class LSTM_SE(nn.Module):
