@@ -36,6 +36,8 @@ from train.training.trainers.utils import (
 from train.training.metrics.metrics_cls import compute_cls_metrics
 from train.training.losses.cls import build_classification_loss
 from train.training.hooks import CollapseGuard, fit_temperature_ce
+from train.models.xgb_model import XGBClassifierModel
+from train.training.trainers.xgb import _train_one_fold_xgb
 
 # =========================================================
 # 主訓練流程（單一 fold）
@@ -68,6 +70,9 @@ def train_one_fold(
     3. return:
         model (nn.Module), result (dict)
     """
+    if XGBClassifierModel is not None and isinstance(model, XGBClassifierModel):
+        return _train_one_fold_xgb(model, cfg, fold_id, export_dir)
+
     if len(train_loader) == 0:
         print("[ERROR][trainer_cls] empty train loader")
         return None, None
