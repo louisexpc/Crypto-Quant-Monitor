@@ -970,7 +970,7 @@ class GeneticAlphaSolver:
         return best
 
 
-alphas = [
+ALPHAS = [
     # Alpha 1: -1 * correlation(volume, close, N)---成交量与收盘价在N日内的背离程度
     OpNode('*',
         Leaf(-1),
@@ -979,12 +979,197 @@ alphas = [
             Leaf('close')
         )
     ),
+    # Alpha 2: (-1 * correlation(rank(delta(log(volume), 2)), rank(((close - open) / open)), 6)) 
+    OpNode('*',
+        Leaf(-1),
+        OpNode(
+            "correlation",
+            OpNode(
+                "rank", 
+                OpNode(
+                    "delta", 
+                    OpNode(
+                        "log", 
+                        Leaf("volume")
+                    ), 
+                    Leaf(2)
+                )
+            ),
+            OpNode("rank", 
+                   OpNode("/", 
+                        OpNode(
+                            "-", 
+                            Leaf("close"), 
+                            Leaf("open")
+                        ), 
+                Leaf("open"))
+            )
+        )
+    ),
+    # Alpha#3: (-1 * correlation(rank(open), rank(volume), 10)) 
+    OpNode('*',
+        Leaf(-1),
+        OpNode(
+            "correlation",
+            OpNode("rank", Leaf("open")),
+            OpNode("rank", Leaf("volume"))
+        )
+    ),
     # Alpha 2: -1 * correlation(delta(volume, 1), delta(close,1), N)---成交量变动与收盘价日内变动在N日内的背离程度
     OpNode('*',
         Leaf(-1),
         OpNode('correlation',
             OpNode('delta', Leaf('volume'), Leaf(1)),
             OpNode('delta', Leaf('close'), Leaf(1))
+        )
+    ),
+    # Alpha#6: (-1 * correlation(open, volume, 10)) 
+    OpNode('*',
+        Leaf(-1),
+        OpNode(
+            "correlation",
+            Leaf("open"),
+            Leaf("volume")
+        )
+    ),
+    # Alpha#14: ((-1 * rank(delta(returns, 3))) * correlation(open, volume, 10)) 
+    OpNode('*',
+        OpNode('*',
+            Leaf(-1),
+            OpNode(
+                "rank",
+                OpNode(
+                    "delta",
+                    Leaf("returns"),
+                    Leaf(3)
+                )
+            )
+        ),
+        OpNode(
+            "correlation",
+            Leaf("open"),
+            Leaf("volume")
+        )
+    ),
+    # Alpha#16: (-1 * rank(covariance(rank(high), rank(volume), 5))) 
+    OpNode('*',
+        Leaf(-1),
+        OpNode(
+            "rank",
+            OpNode(
+                "covariance",
+                OpNode("rank", Leaf("high")),
+                OpNode("rank", Leaf("volume"))
+            )
+        )
+    ),
+    # Alpha#20: (((-1 * rank((open - delay(high, 1)))) * rank((open - delay(close, 1)))) * rank((open -delay(low, 1))))
+    OpNode('*',
+        OpNode('*',
+            OpNode('*',
+                Leaf(-1),
+                OpNode(
+                    "rank",
+                    OpNode(
+                        "-",
+                        Leaf("open"),
+                        OpNode(
+                            "delay",
+                            Leaf("high"),
+                            Leaf(1)
+                        )
+                    )
+                )
+            ),
+            OpNode(
+                "rank",
+                OpNode(
+                    "-",
+                    Leaf("open"),
+                    OpNode(
+                        "delay",
+                        Leaf("close"),
+                        Leaf(1)
+                    )
+                )
+            )
+        ),
+        OpNode(
+            "rank",
+            OpNode(
+                "-",
+                Leaf("open"),
+                OpNode(
+                    "delay",
+                    Leaf("low"),
+                    Leaf(1)
+                )
+            )
+        )
+    ), 
+    # Alpha#37: (rank(correlation(delay((open - close), 1), close, 200)) + rank((open - close)))
+    OpNode('+',
+        OpNode(
+            "rank",
+            OpNode(
+                "correlation",
+                OpNode(
+                    "delay",
+                    OpNode(
+                        "-",
+                        Leaf("open"),
+                        Leaf("close")
+                    ),
+                    Leaf(1)
+                ),
+                Leaf("close")
+            )
+        ),
+        OpNode(
+            "rank",
+            OpNode(
+                "-",
+                Leaf("open"),
+                Leaf("close")
+            )
+        )
+    ),
+    # Alpha#44: (-1 * correlation(high, rank(volume), 5)) 
+    OpNode('*',
+        Leaf(-1),
+        OpNode(
+            "correlation",
+            Leaf("high"),
+            OpNode("rank", Leaf("volume"))
+        )
+    ),
+    # Alpha#53: (-1 * delta((((close - low) - (high - close)) / (close - low)), 9)) 
+    OpNode('*',
+        Leaf(-1),
+        OpNode(
+            "delta",
+            OpNode(
+                "/",
+                OpNode(
+                    "-",
+                    OpNode(
+                        "-",
+                        Leaf("close"),
+                        Leaf("low")
+                    ),
+                    OpNode(
+                        "-",
+                        Leaf("high"),
+                        Leaf("close")
+                    )
+                ),
+                OpNode(
+                    "-",
+                    Leaf("close"),
+                    Leaf("low")
+                )
+            ),
+            Leaf(9)
         )
     ),
     # Alpha 3: -1 * correlation(rank(delta(volume), 1)), rank(delta(close,1)), N)
@@ -1023,6 +1208,7 @@ alphas = [
             Leaf(0.0001)
         )
     ),
+
 ]
     
 # ================== 使用示例 ==================
@@ -1042,7 +1228,7 @@ def main(
         operator_set: list[str] | None = None,
         terminal_set: list[str] | None = None,
         ic_threshold: float = 0.02,
-        sharpe_threshold: float = 0.9,
+        sharpe_threshold: float = 0.3,
         # multiprocessing
         n_jobs: int = 30,  # 使用進程數量
         mp_start_method: str | None = 'spawn',    # ← 跨平台穩定；Linux 可不填或用 'fork'
@@ -1209,5 +1395,11 @@ def main(
     # return_features  = loaded_alpha.tree.eval(your_dataframe)
 
 if __name__ == "__main__":
-    main(data_path="data/ohlcv_2023/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
-         save_folder="utils/feature_selections/gp_alpha/results")
+    main(data_path="../data/1h_klines.csv",
+         start_date="2025-02-18 22:00:00+08:00",
+         alphas=ALPHAS,
+        population_size=150,
+        generations=100,
+        fitness_type='ic',  # 可選 'ic' 或 'sharpe'
+        depth=15,
+        save_folder="./")

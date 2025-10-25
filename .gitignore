@@ -17,3 +17,5 @@ feature_selections
 
 utils
 *.json
+*.pth
+train/results/
