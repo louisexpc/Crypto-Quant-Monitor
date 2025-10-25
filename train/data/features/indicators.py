@@ -692,18 +692,47 @@ class FeatureComputer:
         """
         feats = plan.get("features") or []
         return [f for f in feats if f.get("enabled", False)]
-
-    def _build_one(self, name: str, kwargs: Dict[str, Any]) -> pd.DataFrame:
+    
+    @staticmethod
+    def _maybe_flip(df: pd.DataFrame, flip: bool | str | int) -> pd.DataFrame:
         """
-        1. 說明: 呼叫對應 builder 產生單一特徵 DataFrame，並做 shift(1) 以避免未來資訊洩漏。
-        2. inputs: name(str), kwargs(dict)
-        3. return: pd.DataFrame（已 shift(1)）
+        1. 說明: 視設定將特徵整欄反向（乘以 -1）。對連續/符號型(-1/0/1)皆適用。
+        2. inputs:
+            df (DataFrame): 單一特徵(可多欄)已完成 shift(1) 後的輸出
+            flip (bool|str|int): True/'yes'/'on'/1 → 反向；其餘不動作
+        3. return:
+            DataFrame: 可能已被乘以 -1 的特徵表（dtype 保持 float32）
+        """
+        flag = False
+        if isinstance(flip, str):
+            flag = flip.strip().lower() in ("true","yes","y","1","on")
+        else:
+            flag = bool(flip)
+        if not flag:
+            return df
+        out = df.copy()
+        for c in out.columns:
+            out[c] = (-1.0) * pd.to_numeric(out[c], errors="coerce").astype("float32")
+        return out
+    
+
+    def _build_one(self, name: str, kwargs: Dict[str, Any], flip: bool | str | int = False) -> pd.DataFrame:
+        """
+        1. 說明: 呼叫對應 builder 產生單一特徵 DataFrame，做 shift(1) 防未來洩漏，並依需要反向。
+        2. inputs:
+            name(str): 指標名稱（對應 self.lib.builders 的 key）
+            kwargs(dict): 傳給該指標 builder 的參數
+            flip(bool|str|int): 若為真→將所有輸出欄位乘以 -1
+        3. return:
+            DataFrame: 已 shift(1) 並視需要反向的特徵表
         """
         key = str(name).upper()
         if key not in self.lib.builders:
             raise ValueError(f"Unknown indicator: {key}")
         df = self.lib.builders[key](kwargs or {})
-        return df.shift(1)
+        df = df.shift(1)
+        df = self._maybe_flip(df, flip)
+        return df
 
     def _passthrough_columns(self, cfg: Dict[str, Any] | None) -> List[str]:
         """
@@ -753,8 +782,8 @@ class FeatureComputer:
 
     def compute(self, plan: Dict[str, Any], cfg, *, load_if_exists: bool = True) -> pd.DataFrame:
         """
-        1. 說明: 依 plan 計算全部啟用的特徵；統一 shift(1) 防洩漏；可附帶分鐘直通特徵(也 shift(1))。
-        2. inputs: plan(dict), cfg(dict), load_if_exists(bool, 相容用)
+        1. 說明: 依 plan 計算全部啟用的特徵；統一 shift(1)；支援 flip；附帶分鐘直通特徵。
+        2. inputs: plan(dict), cfg(dict), load_if_exists(bool)
         3. return: DataFrame（float32）
         """
         feat_list = self._enabled_features(plan)
@@ -765,7 +794,8 @@ class FeatureComputer:
         for item in feat_list:
             name = str(item.get("name"))
             kwargs = item.get("kwargs", {}) or {}
-            parts.append(self._build_one(name, kwargs))
+            flip = item.get("flip", False)  # ← 新增：讀 flip
+            parts.append(self._build_one(name, kwargs, flip))
 
         # 直通分鐘特徵（白名單）— 同步 shift(1)
         passthrough_cols = self.passthrough_columns(cfg)
