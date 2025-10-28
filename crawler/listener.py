@@ -6,6 +6,11 @@ from typing import List, Dict, Optional, Any
 from datetime import datetime
 import logging
 from pathlib import Path
+
+# --------- basic logging ----------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ---------- try imports ----------
 try:
     from binance import AsyncClient, BinanceSocketManager, DepthCacheManager
 except Exception:
@@ -14,17 +19,42 @@ except Exception:
         from binance.depthcache import DepthCacheManager
     except Exception as e:
         raise ImportError("請安裝 python-binance 並確認版本支援 AsyncClient / DepthCacheManager") from e
-# try:
-#     from binance.ws.reconnecting_websocket import ReconnectingWebsocket
-#     # 把這個值調大 (例如 10k) —— 根據你訂閱的 stream 數量與頻率決定
-#     ReconnectingWebsocket.MAX_QUEUE_SIZE = 10_000
-#     # Optional: 也能改 module-level constant if exists:
-#     import binance.ws.reconnecting_websocket as _rw
-#     if hasattr(_rw, "MAX_QUEUE_SIZE"):
-#         _rw.MAX_QUEUE_SIZE = 10_000
-#     print("Patched ReconnectingWebsocket.MAX_QUEUE_SIZE -> 10000")
-# except Exception as e:
-#     print("Cannot patch MAX_QUEUE_SIZE:", e)
+
+# Optional import of FuturesType enum
+FUTURES_TYPE = None
+try:
+    from binance.enums import FuturesType
+    FUTURES_TYPE = FuturesType.USD_M
+except Exception:
+    # FUTURES_TYPE stays None if enum not available in this installation
+    logging.info("binance.enums.FuturesType not available; futures socket calls will omit futures_type arg")
+
+# ---------- monkey-patch ReconnectingWebsocket queue size (must run before creating sockets) ----------
+try:
+    from binance.ws.reconnecting_websocket import ReconnectingWebsocket
+    ReconnectingWebsocket.MAX_QUEUE_SIZE = 1000  # adjust as you need
+    import binance.ws.reconnecting_websocket as _rw
+    if hasattr(_rw, "MAX_QUEUE_SIZE"):
+        _rw.MAX_QUEUE_SIZE = 1000
+    logging.info("Patched ReconnectingWebsocket.MAX_QUEUE_SIZE -> 1000")
+except Exception as e:
+    logging.warning("Cannot patch MAX_QUEUE_SIZE: %s", e)
+
+# ---------- try import futures depth cache manager (optional) ----------
+_FuturesDepthCacheManager = None
+try:
+    # try likely locations
+    try:
+        from binance.ws.depthcache import FuturesDepthCacheManager
+        _FuturesDepthCacheManager = FuturesDepthCacheManager
+    except Exception:
+        try:
+            from binance.depthcache import FuturesDepthCacheManager
+            _FuturesDepthCacheManager = FuturesDepthCacheManager
+        except Exception:
+            _FuturesDepthCacheManager = None
+except Exception:
+    _FuturesDepthCacheManager = None
 
 # ---------- Helper ----------
 def now_ts():
@@ -39,21 +69,29 @@ class suppress_exceptions:
 
 # ---------- Main class ----------
 class AsyncBinanceStoragePipeline:
+    """
+    Storage pipeline that can operate on two markets:
+      - market="spot"    -> uses DepthCacheManager, bsm.depth_socket, bsm.trade_socket
+      - market="futures" -> uses FuturesDepthCacheManager (if available), bsm.futures_depth_socket, aggtrade_futures_socket
+    Other pipeline behavior (diff/trade queues, snapshot writer) unchanged.
+    """
     def __init__(
         self,
         api_key: str,
         api_secret: str,
         symbols: List[str],
+        market: str = "spot",  # "spot" or "futures"
         # storage params
+        out_dir: str = "output",
         diff_batch_size: int = 1000,
         diff_max_interval: float = 1.0,
         trade_batch_size: int = 500,
         trade_max_interval: float = 2.0,
-        snapshot_interval_sec: int = 60,      # 每 N 秒寫一次 full snapshot (你要每分鐘 -> 60)
-        snapshot_top_k: Optional[int] = None, # None => write full DepthCache.get_bids()/get_asks()
+        snapshot_interval_sec: int = 60,
+        snapshot_top_k: Optional[int] = None,
         # file paths
         diff_log_path: str = "diff_log.jsonl",
-        snapshot_path_template: str = "snapshot_{ts}.jsonl",  # 會產生 timestamped snapshots；也會寫 snapshot_latest.jsonl
+        snapshot_path_template: str = "snapshot_{ts}.jsonl",
         snapshot_latest_path: str = "snapshot_latest.jsonl",
         trades_path: str = "trades.jsonl",
         # runtime params
@@ -64,7 +102,12 @@ class AsyncBinanceStoragePipeline:
     ):
         self.api_key = api_key
         self.api_secret = api_secret
+        self.market = (market or "spot").strip().lower()
+        if self.market not in ("spot", "futures"):
+            raise ValueError("market must be 'spot' or 'futures'")
+        # normalize symbols to Binance format (uppercase)
         self.symbols = [s.strip().upper() for s in symbols]
+
         # queues: separate pipelines
         self.diff_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
         self.trade_queue: asyncio.Queue = asyncio.Queue(maxsize=queue_max)
@@ -80,17 +123,19 @@ class AsyncBinanceStoragePipeline:
         self.snapshot_top_k = snapshot_top_k
 
         # files
-        self.diff_log_path = diff_log_path
-        self.snapshot_path_template = snapshot_path_template
-        self.snapshot_latest_path = snapshot_latest_path
-        self.trades_path = trades_path
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.diff_log_path = self.out_dir / diff_log_path
+        self.snapshot_path_template = self.out_dir / snapshot_path_template
+        self.snapshot_latest_path = self.out_dir / snapshot_latest_path
+        self.trades_path = self.out_dir / trades_path
 
         # runtime
         self._client: Optional[AsyncClient] = None
         self._bsm: Optional[BinanceSocketManager] = None
         self._stop_event = asyncio.Event()
         self._tasks: List[asyncio.Task] = []
-        self._supervisors: Dict[str, List[asyncio.Task]] = {}  # symbol -> [depthcache_supervisor, depth_diff_supervisor, trade_supervisor]
+        self._supervisors: Dict[str, List[asyncio.Task]] = {}
         self._writer_tasks: List[asyncio.Task] = []
 
         # health/backoff
@@ -99,38 +144,45 @@ class AsyncBinanceStoragePipeline:
         self.backoff_max = backoff_max
         self._last_msg_time: Dict[str, float] = {}
 
+        # select depth cache manager class for market
+        if self.market == "spot":
+            self._DepthCacheManagerClass = DepthCacheManager
+        else:
+            if _FuturesDepthCacheManager is None:
+                raise ImportError("FuturesDepthCacheManager not available in python-binance installation. "
+                                  "Please upgrade python-binance or use market='spot'.")
+            self._DepthCacheManagerClass = _FuturesDepthCacheManager
+
+        logging.info("Initialized AsyncBinanceStoragePipeline market=%s symbols=%s", self.market, self.symbols)
+
     # ---------- DepthCacheManager supervisor (maintain local orderbook in-memory) ----------
     async def _depthcache_supervised(self, symbol: str):
         backoff = self.backoff_base
         while not self._stop_event.is_set():
             try:
-                async with DepthCacheManager(self._client, symbol=symbol) as dcm:
-                    print(f"[depthcache:{symbol}] DepthCacheManager started")
+                # use selected DepthCacheManager class
+                async with self._DepthCacheManagerClass(self._client, symbol=symbol) as dcm:
+                    logging.info("[depthcache:%s] DepthCacheManager started (market=%s)", symbol, self.market)
                     backoff = self.backoff_base
-                    # dcm.recv() returns a DepthCache object (lib-specific)
                     while not self._stop_event.is_set():
                         try:
                             depth_cache = await dcm.recv()
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
-                            print(f"[depthcache:{symbol}] recv error: {e}")
+                            logging.exception("[depthcache:%s] recv error: %s", symbol, e)
                             break
                         else:
-                            # update in-memory latest snapshot
                             st = now_ts()
                             self._last_msg_time[symbol] = st
-                            # attempt to extract full bids/asks or use provided getters
                             try:
                                 asks = depth_cache.get_asks()
                                 bids = depth_cache.get_bids()
                                 lastUpdateId = getattr(depth_cache, "update_id", None) or getattr(depth_cache, "lastUpdateId", None) or None
                             except Exception:
-                                # fallback, try attributes
                                 asks = getattr(depth_cache, "asks", None)
                                 bids = getattr(depth_cache, "bids", None)
                                 lastUpdateId = getattr(depth_cache, "update_time", None)
-                            # store latest cache for snapshot writer
                             self.latest_depth_cache[symbol] = {
                                 "symbol": symbol,
                                 "ts": st,
@@ -138,26 +190,36 @@ class AsyncBinanceStoragePipeline:
                                 "asks": asks,
                                 "bids": bids
                             }
-                            # total_received metric optional
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[depthcache:{symbol}] supervisor exception: {e}")
-            # restart with backoff
+                logging.exception("[depthcache:%s] supervisor exception: %s", symbol, e)
             if self._stop_event.is_set():
                 break
-            print(f"[depthcache:{symbol}] restarting in {backoff}s")
+            logging.info("[depthcache:%s] restarting in %s s", symbol, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.backoff_max)
-        print(f"[depthcache:{symbol}] supervisor exiting")
+        logging.info("[depthcache:%s] supervisor exiting", symbol)
 
     # ---------- Raw depth diff listener (subscribe to depth_socket and append diff events) ----------
     async def _depth_diff_supervised(self, symbol: str):
         backoff = self.backoff_base
         while not self._stop_event.is_set():
             try:
-                async with self._bsm.depth_socket(symbol) as stream:
-                    print(f"[depth_diff:{symbol}] depth_socket started")
+                # choose correct socket method based on market
+                if self.market == "spot":
+                    depth_ctx = self._bsm.depth_socket(symbol)
+                else:
+                    # futures depth socket method (with optional futures_type)
+                    if not hasattr(self._bsm, "futures_depth_socket"):
+                        raise RuntimeError("BinanceSocketManager does not expose futures_depth_socket; upgrade python-binance")
+                    if FUTURES_TYPE is not None:
+                        depth_ctx = self._bsm.futures_depth_socket(symbol, depth="20", futures_type=FUTURES_TYPE)
+                    else:
+                        depth_ctx = self._bsm.futures_depth_socket(symbol,depth="20")
+
+                async with depth_ctx as stream:
+                    logging.info("[depth_diff:%s] depth_socket started (market=%s)", symbol, self.market)
                     backoff = self.backoff_base
                     while not self._stop_event.is_set():
                         try:
@@ -165,12 +227,11 @@ class AsyncBinanceStoragePipeline:
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
-                            print(f"[depth_diff:{symbol}] recv exception: {e}")
+                            logging.exception("[depth_diff:%s] recv exception: %s", symbol, e)
                             break
                         else:
                             st = now_ts()
                             self._last_msg_time[symbol] = st
-                            # push raw diff with metadata to diff_queue (backpressure if full)
                             payload = {
                                 "type": "depth_diff",
                                 "symbol": symbol,
@@ -184,21 +245,41 @@ class AsyncBinanceStoragePipeline:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[depth_diff:{symbol}] supervisor error: {e}")
+                logging.exception("[depth_diff:%s] supervisor error: %s", symbol, e)
             if self._stop_event.is_set():
                 break
-            print(f"[depth_diff:{symbol}] restarting in {backoff}s")
+            logging.info("[depth_diff:%s] restarting in %s s", symbol, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.backoff_max)
-        print(f"[depth_diff:{symbol}] supervisor exiting")
+        logging.info("[depth_diff:%s] supervisor exiting", symbol)
 
     # ---------- Trade supervisor (trade_socket) ----------
     async def _trade_supervised(self, symbol: str):
         backoff = self.backoff_base
         while not self._stop_event.is_set():
             try:
-                async with self._bsm.trade_socket(symbol) as stream:
-                    print(f"[trade:{symbol}] trade_socket started")
+                # choose correct trade socket
+                if self.market == "spot":
+                    trade_ctx = self._bsm.trade_socket(symbol)
+                else:
+                    # prefer aggtrade_futures_socket for per-symbol futures trades
+                    trade_ctx = None
+                    if hasattr(self._bsm, "aggtrade_futures_socket"):
+                        if FUTURES_TYPE is not None:
+                            trade_ctx = self._bsm.aggtrade_futures_socket(symbol, futures_type=FUTURES_TYPE)
+                        else:
+                            trade_ctx = self._bsm.aggtrade_futures_socket(symbol)
+                    elif hasattr(self._bsm, "futures_aggtrade_socket"):
+                        # alternative method name in some versions
+                        if FUTURES_TYPE is not None:
+                            trade_ctx = self._bsm.futures_aggtrade_socket(symbol, futures_type=FUTURES_TYPE)
+                        else:
+                            trade_ctx = self._bsm.futures_aggtrade_socket(symbol)
+                    else:
+                        raise RuntimeError("BinanceSocketManager does not expose aggtrade_futures_socket/futures_aggtrade_socket; upgrade python-binance")
+
+                async with trade_ctx as stream:
+                    logging.info("[trade:%s] trade_socket started (market=%s)", symbol, self.market)
                     backoff = self.backoff_base
                     while not self._stop_event.is_set():
                         try:
@@ -206,7 +287,7 @@ class AsyncBinanceStoragePipeline:
                         except asyncio.CancelledError:
                             raise
                         except Exception as e:
-                            print(f"[trade:{symbol}] recv exception: {e}")
+                            logging.exception("[trade:%s] recv exception: %s", symbol, e)
                             break
                         else:
                             st = now_ts()
@@ -224,29 +305,24 @@ class AsyncBinanceStoragePipeline:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[trade:{symbol}] supervisor error: {e}")
+                logging.exception("[trade:%s] supervisor error: %s", symbol, e)
             if self._stop_event.is_set():
                 break
-            print(f"[trade:{symbol}] restarting in {backoff}s")
+            logging.info("[trade:%s] restarting in %s s", symbol, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, self.backoff_max)
-        print(f"[trade:{symbol}] supervisor exiting")
+        logging.info("[trade:%s] supervisor exiting", symbol)
 
-    # ---------- Writers ----------
+    # ---------- Writers (unchanged) ----------
     async def _diff_writer(self):
-        """
-        Batch write diff_queue to diff_log_path (append-only). Also can accept snapshot checkpoints from snapshot writer.
-        """
         try:
             while not self._stop_event.is_set():
-                # wait for first element
                 try:
                     first = await asyncio.wait_for(self.diff_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
                 batch = [first]
                 start = time.time()
-                # collect until batch size or timeout
                 while len(batch) < self.diff_batch_size:
                     remaining = self.diff_max_interval - (time.time() - start)
                     if remaining <= 0:
@@ -256,11 +332,9 @@ class AsyncBinanceStoragePipeline:
                         batch.append(item)
                     except asyncio.TimeoutError:
                         break
-                # write batch to file (synchronously in thread)
                 await asyncio.to_thread(self._sync_write_diffs, batch)
-                print(f"[diff_writer] flushed {len(batch)} diffs (queue={self.diff_queue.qsize()})")
+                logging.info("[diff_writer] flushed %d diffs (queue=%d)", len(batch), self.diff_queue.qsize())
         except asyncio.CancelledError:
-            # flush remaining
             remaining = []
             while True:
                 try:
@@ -269,7 +343,7 @@ class AsyncBinanceStoragePipeline:
                     break
             if remaining:
                 await asyncio.to_thread(self._sync_write_diffs, remaining)
-                print(f"[diff_writer] flushed remaining {len(remaining)} diffs on cancel")
+                logging.info("[diff_writer] flushed remaining %d diffs on cancel", len(remaining))
             raise
 
     def _sync_write_diffs(self, batch: List[Dict[str, Any]]):
@@ -296,7 +370,7 @@ class AsyncBinanceStoragePipeline:
                     except asyncio.TimeoutError:
                         break
                 await asyncio.to_thread(self._sync_write_trades, batch)
-                print(f"[trade_writer] flushed {len(batch)} trades (queue={self.trade_queue.qsize()})")
+                logging.info("[trade_writer] flushed %d trades (queue=%d)", len(batch), self.trade_queue.qsize())
         except asyncio.CancelledError:
             rem = []
             while True:
@@ -306,7 +380,7 @@ class AsyncBinanceStoragePipeline:
                     break
             if rem:
                 await asyncio.to_thread(self._sync_write_trades, rem)
-                print(f"[trade_writer] flushed remaining {len(rem)} trades on cancel")
+                logging.info("[trade_writer] flushed remaining %d trades on cancel", len(rem))
             raise
 
     def _sync_write_trades(self, batch: List[Dict[str, Any]]):
@@ -315,10 +389,6 @@ class AsyncBinanceStoragePipeline:
                 f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
     async def _snapshot_writer(self):
-        """
-        每 snapshot_interval_sec 寫一次 full snapshot（使用 latest_depth_cache），
-        並同時寫一個 checkpoint entry 到 diff_log，以便後續從 diff_log replay。
-        """
         try:
             while not self._stop_event.is_set():
                 await asyncio.sleep(self.snapshot_interval_sec)
@@ -328,7 +398,6 @@ class AsyncBinanceStoragePipeline:
                     snap = self.latest_depth_cache.get(s)
                     if not snap:
                         continue
-                    # optionally trim top_k if set
                     if self.snapshot_top_k:
                         snap_out = {
                             "symbol": s,
@@ -347,12 +416,10 @@ class AsyncBinanceStoragePipeline:
                         }
                     to_write.append(snap_out)
                 if to_write:
-                    # write snapshots (timestamped) AND update snapshot_latest
-                    snapshot_filename = self.snapshot_path_template.format(ts=datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
+                    snapshot_filename = str(self.snapshot_path_template).format(ts=datetime.utcnow().strftime("%Y%m%dT%H%M%SZ"))
                     await asyncio.to_thread(self._sync_write_snapshots, snapshot_filename, to_write)
-                    await asyncio.to_thread(self._sync_write_snapshots, self.snapshot_latest_path, to_write, append=False)
-                    print(f"[snapshot_writer] wrote {len(to_write)} snapshots to {snapshot_filename}")
-                    # also write checkpoint into diff_log so diff replay knows snapshot boundary
+                    await asyncio.to_thread(self._sync_write_snapshots, str(self.snapshot_latest_path), to_write, append=False)
+                    logging.info("[snapshot_writer] wrote %d snapshots to %s", len(to_write), snapshot_filename)
                     checkpoint_entries = []
                     for snap in to_write:
                         checkpoint_entries.append({
@@ -363,7 +430,6 @@ class AsyncBinanceStoragePipeline:
                             "lastUpdateId": snap["lastUpdateId"],
                             "written_ts": now_ts()
                         })
-                    # write checkpoint directly to diff_log to ensure ordering
                     await asyncio.to_thread(self._sync_write_diffs, checkpoint_entries)
         except asyncio.CancelledError:
             raise
@@ -376,6 +442,8 @@ class AsyncBinanceStoragePipeline:
 
     # ---------- lifecycle ----------
     async def start(self):
+        # create AsyncClient and BinanceSocketManager
+        logging.info("Starting AsyncClient (market=%s)...", self.market)
         self._client = await AsyncClient.create(api_key=self.api_key, api_secret=self.api_secret)
         self._bsm = BinanceSocketManager(self._client, user_timeout=60)
 
@@ -395,53 +463,20 @@ class AsyncBinanceStoragePipeline:
         t_snapshot = asyncio.create_task(self._snapshot_writer())
         self._writer_tasks.extend([t_diff, t_trade, t_snapshot])
         self._tasks.extend(self._writer_tasks)
-        print("[service] started")
+        logging.info("[service] started (market=%s)", self.market)
 
     async def stop(self):
         self._stop_event.set()
-        # cancel supervisors
         all_tasks = []
         for tlist in self._supervisors.values():
             for t in tlist:
                 t.cancel()
                 all_tasks.append(t)
-        # cancel writers
         for t in self._writer_tasks:
             t.cancel()
             all_tasks.append(t)
         if all_tasks:
             await asyncio.gather(*all_tasks, return_exceptions=True)
-        # close client
         if self._client:
             await self._client.close_connection()
-        print("[service] stopped")
-
-
-# # ---------- Usage example ----------
-# async def main():
-#     import dotenv
-#     import os
-#     dotenv.load_dotenv()  # load from .env if exists
-    
-#     api_key = os.getenv("BINANCE_API_KEY")
-#     api_secret = os.getenv("BINANCE_API_SECRET")
-#     symbols = ["btcusdt"]  # start small
-#     svc = AsyncBinanceStoragePipeline(
-#         api_key, api_secret, symbols,
-#         diff_batch_size=1000, diff_max_interval=1.0,
-#         trade_batch_size=500, trade_max_interval=2.0,
-#         snapshot_interval_sec=60,
-#         snapshot_top_k=None,  # None -> write full depth from DepthCache
-#         diff_log_path="diff_log.jsonl",
-#         snapshot_path_template="snapshot_{ts}.jsonl",
-#         snapshot_latest_path="snapshot_latest.jsonl",
-#         trades_path="trades.jsonl"
-#     )
-#     await svc.start()
-#     try:
-#         await asyncio.sleep(60 * 5)  # run for 5 minutes for demo
-#     finally:
-#         await svc.stop()
-
-# if __name__ == "__main__":
-#     asyncio.run(main())
+        logging.info("[service] stopped")

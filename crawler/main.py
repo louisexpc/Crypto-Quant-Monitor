@@ -61,11 +61,12 @@ def main():
     symbols = ["BTCUSDT"]
     symbols = ["btcusdt"]  # start small
     svc = AsyncBinanceStoragePipeline(
-        api_key, api_secret, symbols,
+        api_key, api_secret, symbols, market="futures",
         diff_batch_size=1000, diff_max_interval=1.0,
         trade_batch_size=500, trade_max_interval=2.0,
         snapshot_interval_sec=60,
         snapshot_top_k=None,  # None -> write full depth from DepthCache
+        out_dir="output",
         diff_log_path="diff_log.jsonl",
         snapshot_path_template="snapshot_{ts}.jsonl",
         snapshot_latest_path="snapshot_latest.jsonl",
