@@ -1,4 +1,3 @@
-# bsm_storage_pipeline.py
 import asyncio
 import json
 import time
@@ -216,7 +215,7 @@ class AsyncBinanceStoragePipeline:
                     if FUTURES_TYPE is not None:
                         depth_ctx = self._bsm.futures_depth_socket(symbol, depth="20", futures_type=FUTURES_TYPE)
                     else:
-                        depth_ctx = self._bsm.futures_depth_socket(symbol,depth="20")
+                        depth_ctx = self._bsm.futures_depth_socket(symbol, depth="20")
 
                 async with depth_ctx as stream:
                     logging.info("[depth_diff:%s] depth_socket started (market=%s)", symbol, self.market)

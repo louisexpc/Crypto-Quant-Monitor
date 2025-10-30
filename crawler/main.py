@@ -4,8 +4,7 @@ import os
 import signal
 from pathlib import Path
 from listener import AsyncBinanceStoragePipeline
-# 請 import 你的 AsyncBinanceStoragePipeline 類別
-# from bsm_storage_pipeline import AsyncBinanceStoragePipeline
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -38,6 +37,7 @@ async def run_until_signal(svc, pidfile: str = PIDFILE):
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
+        # Ignore cancellation during shutdown; this is expected when stopping the service.
         pass
     finally:
         logging.info("Stopping service...")
@@ -49,12 +49,11 @@ async def run_until_signal(svc, pidfile: str = PIDFILE):
         try:
             Path(pidfile).unlink()
         except Exception:
-            pass
+            logging.warning("Could not remove pidfile %s", pidfile)
         logging.info("Service stopped")
 
 def main():
     import dotenv
-    import os
     dotenv.load_dotenv()  # load from .env if exists
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")

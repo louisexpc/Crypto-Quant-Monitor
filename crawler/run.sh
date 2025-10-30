@@ -1,4 +1,4 @@
-# !/bin/bash
+#!/bin/bash
 
 # 啟動
 nohup python3 main.py > out.log 2>&1 &
