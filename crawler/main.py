@@ -5,10 +5,9 @@ import signal
 from pathlib import Path
 from listener import AsyncBinanceStoragePipeline
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-PIDFILE = "./binance_storage.pid"  # 你可以改成適合權限的路徑，例如 /tmp/... for dev
+PIDFILE = "./binance_storage.pid"
 
 async def run_until_signal(svc, pidfile: str = PIDFILE):
     loop = asyncio.get_running_loop()
@@ -24,7 +23,6 @@ async def run_until_signal(svc, pidfile: str = PIDFILE):
         logging.info("Signal received, setting stop_event")
         stop_event.set()
 
-    # register handlers (may raise NotImplementedError on Windows)
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(s, _on_signal)
@@ -37,7 +35,6 @@ async def run_until_signal(svc, pidfile: str = PIDFILE):
     try:
         await stop_event.wait()
     except asyncio.CancelledError:
-        # Ignore cancellation during shutdown; this is expected when stopping the service.
         pass
     finally:
         logging.info("Stopping service...")
@@ -45,7 +42,6 @@ async def run_until_signal(svc, pidfile: str = PIDFILE):
             await svc.stop()
         except Exception:
             logging.exception("Error while stopping service")
-        # remove pidfile
         try:
             Path(pidfile).unlink()
         except Exception:
@@ -57,7 +53,6 @@ def main():
     dotenv.load_dotenv()  # load from .env if exists
     api_key = os.getenv("BINANCE_API_KEY")
     api_secret = os.getenv("BINANCE_API_SECRET")
-    symbols = ["BTCUSDT"]
     symbols = ["btcusdt"]  # start small
     svc = AsyncBinanceStoragePipeline(
         api_key, api_secret, symbols, market="futures",
