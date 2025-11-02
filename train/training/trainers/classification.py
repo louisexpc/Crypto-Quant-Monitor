@@ -1,0 +1,512 @@
+# train/training/trainers/classification.py
+"""
+--------------
+分類任務專用的訓練迴圈（single fold）。支援：
+1) CE / Focal-BCE 損失（含 class weight、label smoothing、Confidence Penalty）
+2) 類別分佈對齊（distribution alignment）
+3) 自動溫度校準（temperature scaling, CE 版）
+4) 二分類動態門檻（threshold）搜尋：AUC-Youden 或 F-beta
+5) 早停（可選用 val_loss 或 macro F0.5 作為主指標）
+6) 訓練/驗證/測試的完整指標與可視化匯出
+7) CollapseGuard：PPR/熵 監控與自救（λ_cp 調整、LR 衰減、可選回滾最佳權重）
+
+注意：
+- 檔案假設在 CUDA/GPU 環境下執行（會 assert）
+- 時序資料的資料載入器需保證 time-aware 的切分策略（外部保證）
+"""
+from __future__ import annotations
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import amp
+from typing import Dict
+from collections import Counter
+from train.training.trainers.utils import (
+    amp_dtype,
+    build_optimizer,
+    build_warmup_scheduler,
+    build_grad_scaler,
+    infer_class_weights,
+    infer_class_prior,
+    _iter_batches,
+    find_best_threshold_by_fbeta,
+    )
+
+from train.training.metrics.metrics_cls import compute_cls_metrics
+from train.training.losses.cls import build_classification_loss
+from train.training.hooks import CollapseGuard, fit_temperature_ce
+from train.models.xgb_model import XGBClassifierModel
+from train.training.trainers.xgb import _train_one_fold_xgb
+
+# =========================================================
+# 主訓練流程（單一 fold）
+# =========================================================
+def train_one_fold(
+    model,
+    train_loader,
+    val_loader,
+    test_loader,
+    cfg,
+    device: str = None,
+    fold_id: int | None = None,
+    export_dir: str | None = None
+):
+    """
+    1. 說明:
+        針對單一 fold 執行完整的訓練/驗證/測試流程。
+        - 訓練：支援 AMP、warmup、梯度裁剪、分佈對齊、Confidence Penalty。
+        - 驗證：CE 指標、溫度校準、二分類門檻搜尋。
+        - 早停：以主指標（val_loss 或 macro F0.5）決定最佳模型。
+        - 測試：載回最佳權重與最佳溫度，輸出指標與圖表。
+        - CollapseGuard：PPR/熵 監控，自動調 λ_cp 與 LR，必要時回滾最佳權重。
+    2. inputs:
+        model (nn.Module): forward(X)->logits [B,C]
+        *_loader (DataLoader): 三段資料
+        cfg (dict): 設定檔
+        device (str|None): 預設 'cuda'
+        fold_id (int|None): fold 編號
+        export_dir (str|None): 匯出路徑
+    3. return:
+        model (nn.Module), result (dict)
+    """
+    if XGBClassifierModel is not None and isinstance(model, XGBClassifierModel):
+        return _train_one_fold_xgb(model, cfg, fold_id, export_dir)
+
+    if len(train_loader) == 0:
+        print("[ERROR][trainer_cls] empty train loader")
+        return None, None
+
+    # 僅允許 GPU
+    assert torch.cuda.is_available(), "[trainer_cls] 需要 CUDA GPU 環境。"
+    device = device or "cuda"
+
+    # ---- 讀取訓練設定 ----
+    lr        = float(cfg["train"]["lr"])
+    clip      = float(cfg["train"]["grad_clip"])
+    epochs    = int(cfg["train"]["epochs"])
+    patience  = int(cfg["train"]["early_stopping_patience"])
+    num_class = int(cfg["model"]["num_classes"])
+    primary_metric = str(cfg.get("objective", {}).get("primary_metric", "val_loss")).lower()
+    primary_is_f05 = primary_metric in ["macro_f05", "f_05_macro", "threshold_macro_f05"]
+
+    # ---- 準備優化器 / 語意精度 / AMP scaler / scheduler ----
+    model = model.to(device)
+    optimizer = build_optimizer(model, cfg)
+    steps_per_epoch = max(1, len(train_loader))
+    scheduler = build_warmup_scheduler(optimizer, steps_per_epoch, cfg)
+    dtype = amp_dtype(cfg=cfg)                # 例如 torch.float16 或 bfloat16，或 None（停用 AMP）
+    scaler = build_grad_scaler(dtype)
+
+    # ---- 檢查輸出維度並建立 loss ----
+    model.eval()
+    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+        xb0, _ = next(iter(train_loader))
+        xb0 = xb0[:1].to(device, non_blocking=True)
+        logits0 = model(xb0)
+        out_dim = int(logits0.shape[-1])
+    model.train()
+    if out_dim != num_class:
+        raise ValueError(f"[trainer_cls] 模型 out_dim={out_dim} != num_classes={num_class}。請調整 head。")
+
+    # class weights
+    class_weights = infer_class_weights(train_loader, num_class, device)
+    loss_fn = build_classification_loss(cfg, class_weights=class_weights)
+
+    # ---- 額外正則項（分佈對齊 / CE 的信心懲罰）----
+    dist_align_weight = float(cfg["train"].get("dist_align_weight", 0.0))
+    conf_penalty_w    = float(cfg["train"].get("confidence_penalty", 0.0))
+    prior_mode        = str(cfg["train"].get("dist_prior", "train")).lower()
+    if dist_align_weight > 0.0:
+        if prior_mode == "uniform":
+            class_prior = torch.full((num_class,), 1.0 / max(1, num_class), dtype=torch.float32, device=device)
+        else:
+            class_prior = infer_class_prior(train_loader, num_class, device)
+    else:
+        class_prior = None
+
+    # ---- CollapseGuard 設定（只在二分類時啟用）----
+    guard_cfg = cfg.get("guard", cfg.get("collapse_guard", {})) or {}
+    guard_enabled = bool(guard_cfg.get("enabled", True)) and (num_class == 2)
+    guard = None
+    if guard_enabled:
+        # PPR 門檻建議與實際決策門檻一致；若使用固定門檻可讀取 train.threshold
+        thr_mode = str(cfg["train"].get("threshold_mode", "auto_auc")).lower()
+        if thr_mode == "fixed" and (cfg["train"].get("threshold") is not None):
+            pos_thr = float(cfg["train"]["threshold"])
+        else:
+            pos_thr = float(guard_cfg.get("pos_threshold", 0.5))
+
+        # 可選回滾：在觸發時載回當前最佳權重
+        best_state_holder = {"state": None}
+        def _on_trigger(ctx: Dict):
+            if bool(guard_cfg.get("restore_on_trigger", True)) and best_state_holder["state"] is not None:
+                try:
+                    ctx["model"].load_state_dict(best_state_holder["state"])
+                    print("[CollapseGuard] restored best weights.")
+                except Exception as e:
+                    print(f"[CollapseGuard] restore error: {e}")
+
+        guard = CollapseGuard(
+            pos_threshold=pos_thr,
+            ppr_warn_band=tuple(guard_cfg.get("ppr_warn_band", (0.05, 0.60))),
+            warn_patience=int(guard_cfg.get("warn_patience", 50)),
+            ppr_extreme_band=tuple(guard_cfg.get("ppr_extreme_band", (0.02, 0.98))),
+            extreme_patience=int(guard_cfg.get("extreme_patience", 100)),
+            cp_boost_factor=float(guard_cfg.get("cp_boost_factor", 1.25)),
+            lr_decay=float(guard_cfg.get("lr_decay", 0.5)),
+            max_conf_penalty=float(guard_cfg.get("max_conf_penalty", 0.20)),
+            min_lr=float(guard_cfg.get("min_lr", 1e-6)),
+            on_trigger=_on_trigger,
+            smoothing=float(guard_cfg.get("smoothing", 0.95)),
+            warmup_steps=int(guard_cfg.get("warmup_steps", steps_per_epoch * 2)),
+            entropy_hi=float(guard_cfg.get("entropy_hi", 0.60)),
+            cooldown_steps=int(guard_cfg.get("cooldown_steps", max(steps_per_epoch, 200))),
+            verbose=bool(guard_cfg.get("verbose", False))
+            )
+    else:
+        best_state_holder = {"state": None}
+
+    # ---- Early-stop 狀態 ----
+    best_epoch = 0
+    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    best_state_holder["state"] = best_state  # 讓 CollapseGuard 能回滾
+    wait = 0
+    prefix = f"[fold {fold_id}] " if fold_id is not None else ""
+    history = []
+
+    best_cls_val_loss = float("inf")
+    best_val_f1 = -1.0
+    best_val_f_05 = -1.0
+    best_val_prec = -1.0
+    best_val_recall = -1.0
+    best_val_thresh = None
+    best_T = torch.tensor(1.0, device=device)  # 溫度校準參數（每個 fold 最佳）
+
+    printed_shape = False
+
+    # =========================
+    #         EPOCH 迴圈
+    # =========================
+    for epoch in range(1, epochs + 1):
+        # -------- TRAIN --------
+        model.train()
+        train_loss_sum, train_n = 0.0, 0
+        tr_preds, tr_tgts = [], []
+        last_guard_info = None
+
+        for Xb, yb in _iter_batches(train_loader, device, int(cfg["train"]["batch_size"])):
+            Xb = Xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True).long()
+
+            if not printed_shape:
+                print("[trainer_cls] DEBUG batch X shape =", tuple(Xb.shape))
+                printed_shape = True
+
+            optimizer.zero_grad(set_to_none=True)
+            with amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+                logits = model(Xb)
+                loss = loss_fn(logits, yb)
+
+                # (1) 分佈對齊：KL( mean(p) || prior )  — 僅多類/二類 softmax 的情況
+                if dist_align_weight > 0.0 and class_prior is not None and logits.shape[-1] > 1:
+                    probs = torch.softmax(logits, dim=1).float()  # [B, C]
+                    p_mean = probs.mean(dim=0)                     # [C]
+                    kl = F.kl_div((p_mean + 1e-8).log(), class_prior, reduction="batchmean")
+                    loss = loss + dist_align_weight * kl
+
+                # (2) CE 路線的信心懲罰：期望的負熵（logits.shape[-1] > 1）
+                #    使用 BCEWithLogitsFocalLoss 時，CP 已內嵌於 loss；此處不重複。
+                if conf_penalty_w > 0.0 and logits.shape[-1] > 1:
+                    probs = torch.softmax(logits, dim=1).float()
+                    conf_loss = (probs * (probs + 1e-8).log()).sum(dim=1).mean()  # = -Entropy 的期望值
+                    loss = loss + conf_penalty_w * conf_loss
+
+            # 反傳 + AMP 梯度縮放
+            scaler.scale(loss).backward()
+            if clip and clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), clip)
+            scaler.step(optimizer)
+            scheduler.step()
+            scaler.update()
+
+            # CollapseGuard 監控與自救（訓練後、作用於後續 step）
+            if guard is not None:
+                info = guard.on_batch_end(logits.detach(), loss_fn, optimizer, model=model)
+                last_guard_info = info
+                if info["warn"]:
+                    print(f"[WARN step={info['step']}] PPR_ema={info['ppr_ema']:.3f} Entropy_ema={info['entropy_ema']:.3f}")
+                if info["triggered"]:
+                    print(f"[TRIGGER] λ_cp→{getattr(loss_fn,'conf_penalty',0.0):.4f}; LR decayed.")
+
+            # 累計 loss 與收集訓練預測（for train 指標）
+            bs = Xb.size(0)
+            train_loss_sum += loss.item() * bs
+            train_n += bs
+
+            preds = logits.argmax(dim=-1)
+            tr_preds.append(preds.detach().cpu())
+            tr_tgts.append(yb.detach().cpu())
+
+        avg_tr_loss = train_loss_sum / max(1, train_n)
+        y_tr = torch.cat(tr_tgts).numpy()
+        yhat_tr = torch.cat(tr_preds).numpy()
+        m_tr = compute_cls_metrics(y_tr, yhat_tr)
+
+        # -------- VAL --------
+        model.eval()
+        val_loss_sum, val_n = 0.0, 0
+        val_tgts = []
+        val_logits = []
+
+        with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+            for Xb, yb in _iter_batches(val_loader, device, int(cfg["train"]["batch_size"])):
+                Xb = Xb.to(device, non_blocking=True)
+                yb = yb.to(device, non_blocking=True).long()
+                logits = model(Xb)
+                loss = loss_fn(logits, yb)
+
+                bs = Xb.size(0)
+                val_loss_sum += loss.item() * bs
+                val_n += bs
+                val_tgts.append(yb.detach().cpu())
+                val_logits.append(logits.detach())
+
+        avg_va_loss = val_loss_sum / max(1, val_n)
+        y_va = torch.cat(val_tgts, dim=0).numpy()
+        logits_all = torch.cat(val_logits, dim=0)  # [N, C]
+
+        # ---- 溫度校準 ----
+        if cfg["train"].get("use_temperature", True):
+            T_epoch = fit_temperature_ce(logits_all, torch.from_numpy(y_va).to(device))
+        else:
+            T_epoch = torch.tensor(1.0, device=device)
+
+        probs_all = torch.softmax((logits_all / T_epoch).float(), dim=1).cpu().numpy()
+
+        # ---- 二分類：驗證門檻 ----
+        if probs_all.shape[1] == 2:
+            y_score_va = probs_all[:, 1]
+            thr_mode = str(cfg["train"].get("threshold_mode", "auto_auc")).lower()
+            if thr_mode == "auto_fbeta":
+                beta = float(cfg["train"].get("threshold_fbeta", 0.5))
+                grid_points = int(cfg["train"].get("threshold_grid_points", 201))
+                curr_val_thresh, _ = find_best_threshold_by_fbeta(y_va, y_score_va, beta=beta, grid_points=grid_points)
+            else:                
+                cfg_thresh = cfg["train"].get("threshold", None)
+                curr_val_thresh = float(cfg_thresh) if cfg_thresh is not None else 0.5
+
+            yhat_va = (y_score_va >= curr_val_thresh).astype(int)
+        else:
+            yhat_va = probs_all.argmax(axis=1)
+            curr_val_thresh = None
+
+        m_va = compute_cls_metrics(y_va, yhat_va)
+        if guard is not None and curr_val_thresh is not None:
+            guard.set_pos_threshold(float(curr_val_thresh))
+
+        # ---- Early Stopping ----
+        improved = (avg_va_loss < (best_cls_val_loss - 1e-6)) if not primary_is_f05 else \
+                   (m_va.get("macro_f05", m_va.get("f_05_macro", -1.0)) > (best_val_f_05 + 1e-6))
+
+        if epoch == 1 or improved:
+            best_val_f1 = m_va.get("macro_f1", best_val_f1)
+            best_val_f_05 = m_va.get("macro_f05", m_va.get("f_05_macro", best_val_f_05))
+            best_val_prec = m_va.get("macro_precision", best_val_prec)
+            best_val_recall = m_va.get("macro_recall", best_val_recall)
+            best_val_thresh = float(curr_val_thresh) if curr_val_thresh is not None else None
+            best_cls_val_loss = avg_va_loss
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            best_state_holder["state"] = best_state  # 讓 CollapseGuard 能回滾最新最佳
+            best_T = T_epoch.detach().clone()
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"{prefix}Early stop at epoch {epoch} | best_epoch={best_epoch} | val_f1={best_val_f1:.4f} | val_f05={best_val_f_05:.4f}")
+                break
+
+        # ---- CollapseGuard epoch 摘要 ----
+        guard_epoch_info = guard.on_epoch_end() if guard is not None else {}
+        # ---- 記錄歷史 ----
+        history.append({
+            "epoch": epoch,
+            "train_loss": avg_tr_loss, "val_loss": avg_va_loss,
+            "train_acc": m_tr.get("acc", np.nan),  "val_acc":  m_va.get("acc", np.nan),
+            "train_macro_f1": m_tr.get("macro_f1", np.nan), "val_macro_f1": m_va.get("macro_f1", np.nan),
+            "train_macro_precision": m_tr.get("macro_precision", np.nan),
+            "val_macro_precision":   m_va.get("macro_precision", np.nan),
+            "train_macro_recall":    m_tr.get("macro_recall", np.nan),
+            "val_macro_recall":      m_va.get("macro_recall", np.nan),
+            "val_f_05_macro":        m_va.get("f_05_macro", np.nan),
+            # CollapseGuard logs
+            "guard_ppr_ema": guard_epoch_info.get("ppr_ema", np.nan),
+            "guard_entropy_ema": guard_epoch_info.get("entropy_ema", np.nan),
+            "guard_warn_streak": guard_epoch_info.get("warn_streak", np.nan),
+            "guard_extreme_streak": guard_epoch_info.get("extreme_streak", np.nan),
+            "guard_last_ppr": last_guard_info.get("ppr", np.nan) if last_guard_info else np.nan,
+            "guard_last_entropy": last_guard_info.get("entropy", np.nan) if last_guard_info else np.nan,
+        })
+        print(f"{prefix}[Epoch {epoch:03d}] tr_loss={avg_tr_loss:.4f} | val_loss={avg_va_loss:.4f} | "
+              f"val_acc={m_va.get('acc',np.nan):.3f} | val_f1={m_va.get('macro_f1',np.nan):.3f} | "
+              f"val_f05={m_va.get('f_05_macro',np.nan):.3f}")
+
+    # ---- 載回最佳權重 ----
+    model.load_state_dict(best_state)
+    model.eval()
+
+    # -------- TEST --------
+    te_tgts, te_probs = [], []
+    test_loss_sum, test_n = 0.0, 0
+
+    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+        for Xb, yb in _iter_batches(test_loader, device, int(cfg["train"]["batch_size"])):
+            Xb = Xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True).long()
+            logits = model(Xb)
+            loss = loss_fn(logits, yb)
+
+            bs = Xb.size(0)
+            test_loss_sum += loss.item() * bs
+            test_n += bs
+
+            # 用「最佳溫度」做校準，再取 softmax 機率
+            probs = torch.softmax((logits / best_T).float(), dim=1).float()
+            te_probs.append(probs.detach().cpu())
+            te_tgts.append(yb.detach().cpu())
+
+    y_te = torch.cat(te_tgts).numpy()
+    y_prob_te = torch.cat(te_probs).float().numpy()
+
+    # --- 二分類：測試只用驗證最佳門檻 ---
+    is_binary_test = (y_prob_te.shape[1] == 2)
+    best_thresh = None
+    if is_binary_test:
+        y_score = y_prob_te[:, 1]
+
+        # 以驗證最佳門檻為主；若沒學到（理論上會有），再依 cfg 或 0.5
+        thr_mode = str(cfg["train"].get("threshold_mode", "auto_auc")).lower()
+        if thr_mode == "fixed":
+            cfg_thresh = cfg["train"].get("threshold", None)
+            best_thresh = float(cfg_thresh) if cfg_thresh is not None else (
+                float(best_val_thresh) if best_val_thresh is not None else 0.5
+            )
+        elif best_val_thresh is not None:
+            best_thresh = float(best_val_thresh)
+        else:
+            best_thresh = 0.5  # 極端退避
+
+        yhat_te = (y_score >= best_thresh).astype(int)
+
+        # 列印 Top-10：顯示用 threshold 的預測
+        class_names = cfg["model"].get("class_names", ["neg", "pos"])
+        print("\n[Test Predictions - top 10 @thr={:.3f}]".format(best_thresh))
+        for i in range(min(10, len(y_prob_te))):
+            probs = y_prob_te[i]
+            prob_str = ", ".join([f"{c}: {p:.4f}" for c, p in zip(class_names, probs)])
+            pred_thr = int(yhat_te[i])
+            print(f"[{i}] True: {y_te[i]}, Pred_thr: {pred_thr}, Probs: [{prob_str}]")
+
+        # 用 threshold 的結果作為「唯一的」測試指標
+        m_te = compute_cls_metrics(y_te, yhat_te)
+        test_f05 = m_te.get("macro_f05", m_te.get("f_05_macro", 0.0))
+        print(
+            f"{prefix}Test@thr={best_thresh:.3f} | "
+            f"acc={m_te.get('acc', 0.0):.3f} | "
+            f"f1={m_te.get('macro_f1', 0.0):.3f} | "
+            f"f05={test_f05:.3f} | "
+            f"prec={m_te.get('macro_precision', 0.0):.3f} | "
+            f"rec={m_te.get('macro_recall', 0.0):.3f} | "
+            f"mcc={m_te.get('mcc', 0.0):.3f}"
+        )
+
+    else:
+        # 多分類→維持 argmax
+        yhat_te = y_prob_te.argmax(axis=1)
+        class_names = cfg["model"].get("class_names", [str(i) for i in range(y_prob_te.shape[1])])
+        print("\n[Test Predictions - top 10]")
+        for i in range(min(10, len(y_prob_te))):
+            probs = y_prob_te[i]
+            prob_str = ", ".join([f"{c}: {p:.4f}" for c, p in zip(class_names, probs)])
+            print(f"[{i}] True: {y_te[i]}, Pred: {yhat_te[i]}, Probs: [{prob_str}]")
+
+        m_te = compute_cls_metrics(y_te, yhat_te)
+        test_f05 = m_te.get("macro_f05", m_te.get("f_05_macro", 0.0))
+        print(
+            f"{prefix}Test_acc={m_te.get('acc', 0.0):.3f} | "
+            f"test_f1={m_te.get('macro_f1', 0.0):.3f} | "
+            f"test_f05={test_f05:.3f} | "
+            f"test_prec={m_te.get('macro_precision', 0.0):.3f} | "
+            f"test_re={m_te.get('macro_recall', 0.0):.3f} | "
+            f"mcc={m_te.get('mcc', 0.0):.3f}"
+        )
+
+
+
+    # 1) 做出 loss 的歷史序列（collapse_mask 會拿這個用）
+    val_loss_history = [float(h.get("val_loss", np.nan)) for h in history if "val_loss" in h]
+    train_loss_history = [float(h.get("train_loss", np.nan)) for h in history if "train_loss" in h]
+
+    # 2) 標籤分佈（collapse_mask 算 pos_ratio 用）
+    lc_tr = dict(Counter(y_tr.tolist()))  # 最後一個 epoch 的 train 走完整個資料集，分佈即為全訓練集
+    lc_va = dict(Counter(y_va.tolist()))  # 驗證集同理
+    label_counts = {"train": lc_tr, "val": lc_va}
+
+    # ---- 組合回傳 ----
+    result = {
+        "history": history,
+        "val_loss_history": val_loss_history,
+        "label_counts": label_counts, 
+        "best_epoch": best_epoch,
+        "state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+        "val_metrics": {
+            "val_loss": float(best_cls_val_loss),
+            "macro_f1": float(best_val_f1),
+            "f_05_macro": float(best_val_f_05),
+            "macro_precision": float(best_val_prec),
+            "macro_recall": float(best_val_recall),
+        },
+        # ★ test_metrics：二分類時就是用 best_val_thresh 的那組
+        "test_metrics": {
+            "test_acc":        m_te.get("acc", 0.0),
+            "test_macro_f1":   m_te.get("macro_f1", 0.0),
+            "test_weighted_f1":m_te.get("weighted_f1", m_te.get("macro_f1", 0.0)),
+            "test_macro_f05":  m_te.get("macro_f05", m_te.get("f_05_macro", 0.0)),
+            "test_mcc":        m_te.get("mcc", 0.0),
+        },
+        "best_val_thresh": float(best_val_thresh) if best_val_thresh is not None else None,
+        "temperature": float(best_T.item()) if torch.is_tensor(best_T) else 1.0,
+        "threshold_metrics": {}  # 下面填
+    }
+
+    # threshold_metrics 與圖的 threshold 也跟 test 使用的邏輯一致
+    if is_binary_test:
+        result["threshold_metrics"].update({
+            "best_threshold": float(best_thresh),
+            "acc": result["test_metrics"]["test_acc"],
+            "macro_f1": result["test_metrics"]["test_macro_f1"],
+            "macro_precision": result["test_metrics"]["test_macro_precision"] if "test_macro_precision" in result["test_metrics"] else m_te.get("macro_precision", 0.0),
+            "macro_recall": result["test_metrics"]["test_macro_recall"] if "test_macro_recall" in result["test_metrics"] else m_te.get("macro_recall", 0.0),
+            "macro_f05": result["test_metrics"]["test_macro_f05"],
+        })
+    else:
+        result["threshold_metrics"] = {
+            "best_threshold": None,
+            "acc": result["test_metrics"]["test_acc"],
+            "macro_f1": result["test_metrics"]["test_macro_f1"],
+            "macro_precision": m_te.get("macro_precision", 0.0),
+            "macro_recall": m_te.get("macro_recall", 0.0),
+            "macro_f05": result["test_metrics"]["test_macro_f05"],
+        }
+
+    # ---- 匯出與作圖 ----
+    result["eval_payload"] = {
+        "y_true": y_te,
+        "y_pred": yhat_te,
+        "y_prob": y_prob_te,
+        "class_names": cfg["model"].get("class_names", None),
+        "best_threshold": float(best_thresh) if (is_binary_test and best_thresh is not None) else None,
+    }
+    return model, result

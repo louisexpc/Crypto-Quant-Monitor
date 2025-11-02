@@ -12,3 +12,5 @@ torch --extra-index-url https://download.pytorch.org/whl/cpu
 pandas-ta
 pytz
 pyarrow
+pycryptodome==3.23.0
+python-binance==1.0.30

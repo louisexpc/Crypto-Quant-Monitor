@@ -1,0 +1,419 @@
+# train/pipeline/trial_runner.py
+from __future__ import annotations
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
+import torch
+import optuna
+
+# -- 1) 來自 search.space（新位置）：避免拿舊 objective_utils --
+from train.pipeline.search.space import (
+    get_task_type, _format_score_tag, _safe_rename_trial_dir, compute_trial_score
+)
+
+# -- single-fold trainer factory --
+from train.training.trainers.utils import get_trainer
+from train.evaluation.exporters.cv_summary import save_cv_summary
+from train.evaluation.exporters.tbm_exporter import export_tbm_predictions_for_trial
+from train.evaluation.utils import save_fold_metrics
+from train.evaluation.reporters.classification_reporter import ClassificationReporter
+from train.evaluation.reporters.regression_reporter import RegressionReporter
+
+# -- 3) Loader：優先新 -> 退回舊 --
+from train.data.dataloaders.time_loader import make_time_loaders_for_fold  # type: ignore
+from train.data.dataloaders.event_loader import make_event_loaders_for_fold  # type: ignore
+from train.models.model_factory import build_model
+
+
+@dataclass
+class TrialOutputs:
+    """
+    1. 說明: 封裝一次 Trial 的主要輸出，方便 pipeline 與上層使用
+    2. inputs: （建構子自動賦值）
+    3. return: 無（資料屬性）
+    """
+    mean_score: float
+    trial_dir: Path
+    val_avg: Dict[str, float]
+    test_avg: Dict[str, float]
+    fold_results: List[Dict[str, Any]]
+    fold_models_for_infer: List[Tuple[Any, Dict[str, Any], Dict[str, Any]]]
+
+
+class TrialRunner:
+    """
+    1. 說明: 單次 Optuna Trial 的執行器；負責：
+       - 依 cfg/task_type 產生每個 fold 的資料載入器
+       - 建模、訓練、收集指標、PRUNE 回報
+       - 彙整 CV 平均、命名試驗資料夾、寫入報表與（可選）TBM 併回
+       注意：不做「超參建議」與「fold 生成」，那屬於 objective_utils。
+    2. inputs: 於 run() 傳入
+    3. return: TrialOutputs（含 mean_score 與各彙整資訊）
+    """
+
+    def run(
+        self,
+        *,
+        trial: optuna.Trial,
+        cfg: Dict[str, Any],
+        df,  # 時間索引骨架（或完整 DF；維持與你現行 objective 相容）
+        trial_dir: Path,
+        folds: List[Dict[str, Any]],
+        device: Optional[str] = None,
+        effective_seed: Optional[int] = None,
+    ) -> TrialOutputs:
+        """
+        1. 說明: 執行一次 Trial 的完整折訓練流程與彙整
+        2. inputs:
+           - trial: Optuna Trial 物件（用於回報/PRUNE）
+           - cfg: 已套用建議超參的設定 dict
+           - df: 你原先傳入 make_*_loaders 的 df（保相容）
+           - trial_dir: 此次 trial 的輸出資料夾
+           - folds: 由 make_folds() 產生的 Fold 規格清單
+           - device: "cuda" 或 "cpu"（預設依 cfg 與環境判斷）
+           - effective_seed: 這次真正使用的 seed（用於寫回可重現 config）
+        3. return:
+           - TrialOutputs: 包含 mean_score、平均指標、每折結果與模型清單等
+        """
+        task_type = get_task_type(cfg)
+        device = device or ("cuda" if (cfg.get("device", "cuda") == "cuda" and torch.cuda.is_available()) else "cpu")
+        train_one_fold = get_trainer(cfg)
+
+        # === 每 fold 訓練 ===
+        fold_scores: List[float] = []
+        fold_results: List[Dict[str, Any]] = []
+        fold_models_for_infer: List[Tuple[Any, Dict[str, Any], Dict[str, Any]]] = []
+
+        label_mode = str(cfg.get("label", {}).get("mode", "")).lower()
+        also_xgb = bool(cfg.get("also_XGB", cfg.get("also_XGB", False)))
+
+        for i, fold in enumerate(folds):
+            fold_dir = trial_dir / f"fold_{i}"
+            fold_dir.mkdir(parents=True, exist_ok=True)
+
+            # 依任務選擇資料載入器
+            if label_mode == "event_tbm":
+                tr_loader, va_loader, te_loader, info = make_event_loaders_for_fold(
+                    df, [], fold, cfg, also_XGB=also_xgb
+                )
+            else:
+                tr_loader, va_loader, te_loader, info = make_time_loaders_for_fold(
+                    df, None, None, fold, cfg, also_XGB=also_xgb
+                )
+
+            # XGB 選配（不再硬性相依）
+            cfg_fold = dict(cfg)  # 淺拷貝足夠：下層 trainer 會 copy/record
+            if also_xgb and (("XGB" not in info) or (info["XGB"] is None)):
+                # 不中斷訓練，僅提示；若你仍想嚴格，改成 raise ValueError
+                print("[Runner][WARN] also_XGB=True 但資料載入器未回傳 XGB pack -> 跳過 XGB 訓練")
+                cfg_fold.pop("_xgb_pack", None)
+            elif also_xgb:
+                cfg_fold["_xgb_pack"] = info["XGB"]
+            else:
+                cfg_fold.pop("_xgb_pack", None)
+
+            feature_columns = info.get("feat_cols")
+            n_features = len(feature_columns) if feature_columns is not None else None
+
+            model = build_model(cfg, n_features, feature_columns)
+
+            # 單 fold 訓練
+            model_trained, result = train_one_fold(
+                model, tr_loader, va_loader, te_loader,
+                cfg_fold, device=device, fold_id=i, export_dir=fold_dir
+            )
+            fold_results.append(result)
+
+            self._export_fold_artifacts(
+                task_type=task_type,
+                fold_result=result,
+                export_dir=fold_dir,
+                fold_id=i,
+            )
+
+            # 釋放顯存，保留 CPU 權重供 TBM 併回
+            try:
+                if model_trained is not None:
+                    try:
+                        model_trained = model_trained.to("cpu")
+                    finally:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                fold_models_for_infer.append((model_trained, fold, result))
+            except Exception:
+                pass
+
+            # 試驗分數 + PRUNE 回報
+            score = compute_trial_score(result, cfg)
+            fold_scores.append(float(score))
+            trial.report(float(score), step=i)
+            if cfg.get("objective", {}).get("enable_prune", False) and trial.should_prune():
+                raise optuna.TrialPruned()
+
+        # === CV 平均 ===
+        val_avg, test_avg = self._compute_cv_avgs(task_type, fold_results)
+        self._print_cv(task_type, val_avg, test_avg, len(fold_results))
+
+        # === 寫 CV 摘要 ===
+        save_cv_summary(fold_results, export_dir=trial_dir, task_type=task_type)
+
+        # === 依型別為 trial 資料夾加上分數 tag ===
+        trial_dir = self._tag_trial_dir(trial_dir, task_type, test_avg, trial=trial)
+
+        # === 存可重現 config（用實際 effective_seed）===
+        mean_score = float(np.mean(fold_scores)) if fold_scores else float("nan")
+        self._dump_reproducible_cfg(cfg, trial_dir, mean_score, effective_seed)
+
+        # === Optional: TBM 併回 ===
+        self._maybe_export_tbm(cfg, df, folds, fold_models_for_infer, trial_dir, task_type)
+
+        return TrialOutputs(
+            mean_score=mean_score,
+            trial_dir=trial_dir,
+            val_avg=val_avg,
+            test_avg=test_avg,
+            fold_results=fold_results,
+            fold_models_for_infer=fold_models_for_infer,
+        )
+
+    # ----------------- helpers -----------------
+
+    def _export_fold_artifacts(
+        self,
+        *,
+        task_type: str,
+        fold_result: Dict[str, Any],
+        export_dir: Path,
+        fold_id: int,
+    ) -> None:
+        """Generate per-fold plots and metrics outside the trainers."""
+
+        history = fold_result.get("history") or []
+        if history:
+            save_fold_metrics(history, save_dir=export_dir, prefix=f"fold_{fold_id}_")
+
+        prefix = f"fold_{fold_id}_"
+
+        if task_type == "classification":
+            payload = fold_result.get("eval_payload") or {}
+            y_true = payload.get("y_true")
+            y_pred = payload.get("y_pred")
+            y_prob = payload.get("y_prob")
+            if y_true is not None and y_pred is not None and y_prob is not None:
+                reporter = ClassificationReporter(
+                    save_dir=export_dir,
+                    prefix=prefix,
+                    class_names=payload.get("class_names"),
+                )
+                reporter.plot_eval(
+                    y_true=y_true,
+                    y_pred=y_pred,
+                    y_prob=y_prob,
+                    threshold=payload.get("best_threshold"),
+                )
+
+        else:  # regression
+            payload = fold_result.get("eval_payload") or {}
+            y_true = payload.get("y_true")
+            y_pred = payload.get("y_pred")
+            if y_true is not None and y_pred is not None:
+                reporter = RegressionReporter(save_dir=export_dir, prefix=prefix)
+                reporter.plot_eval(y_true=y_true, y_pred=y_pred)
+
+            reg2cls = (fold_result.get("regression_to_class_3c") or {}).get("eval_payload")
+            if reg2cls:
+                cls_dir = export_dir / "cls_results_3c"
+                reporter = ClassificationReporter(
+                    save_dir=cls_dir,
+                    prefix=prefix,
+                    class_names=reg2cls.get("class_names"),
+                )
+                reporter.plot_eval(
+                    y_true=reg2cls.get("y_true"),
+                    y_pred=reg2cls.get("y_pred"),
+                    y_prob=reg2cls.get("y_prob"),
+                    threshold=None,
+                )
+
+    def _numeric_only(self, d: Optional[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        1. 說明: 過濾非數值鍵值，避免平均時出錯
+        2. inputs: d: 字典或 None
+        3. return: 只含數值型的字典
+        """
+        out: Dict[str, float] = {}
+        for k, v in (d or {}).items():
+            if isinstance(v, (int, float, np.floating)) and np.isfinite(v):
+                out[k] = float(v)
+        return out
+
+    def _avg_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, float]:
+        """
+        1. 說明: 對齊鍵名後逐欄平均
+        2. inputs: rows: 字典清單
+        3. return: 每個指標鍵的平均數
+        """
+        pool: Dict[str, List[float]] = {}
+        for d in rows:
+            for k, v in self._numeric_only(d).items():
+                pool.setdefault(k, []).append(v)
+        return {k: float(np.mean(vs)) for k, vs in pool.items()}
+
+    def _compute_cv_avgs(
+        self, task_type: str, fold_results: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        """
+        1. 說明: 依任務型別聚合 VAL/TEST 平均
+        2. inputs:
+           - task_type: "classification" | "regression"
+           - fold_results: 每折結果清單
+        3. return: (val_avg, test_avg)
+        """
+        if task_type == "classification":
+            val_rows  = [r.get("val_metrics",  {}) for r in fold_results]
+            test_rows = [r.get("test_metrics", {}) for r in fold_results]
+        else:
+            val_rows  = [r.get("val_metrics_reg",  {}) for r in fold_results]
+            test_rows = [r.get("test_metrics_reg", {}) for r in fold_results]
+        return self._avg_rows(val_rows), self._avg_rows(test_rows)
+
+    def _print_cv(self, task_type: str, val_avg: Dict[str, float], test_avg: Dict[str, float], k: int) -> None:
+        """
+        1. 說明: 以人類可讀的方式列印 CV 結果
+        2. inputs: task_type, val_avg, test_avg, k 折數
+        3. return: None
+        """
+        print(f"\n[CV] {task_type.upper()} | folds={k}")
+        if val_avg:
+            print("[CV] VAL  avg:")
+            for k in sorted(val_avg):
+                print(f"  {k}: {val_avg[k]:.6g}")
+        if test_avg:
+            print("[CV] TEST avg:")
+            for k in sorted(test_avg):
+                print(f"  {k}: {test_avg[k]:.6g}")
+
+    def _tag_trial_dir(
+        self, trial_dir: Path, task_type: str, test_avg: Dict[str, float], trial: optuna.Trial
+    ) -> Path:
+        """
+        1. 說明: 依任務指標為資料夾加上分數 tag，並寫入 trial user_attr
+        2. inputs: trial_dir, task_type, test_avg, trial
+        3. return: 可能被改名後的新路徑
+        """
+        if task_type == "classification":
+            mcc_cv = test_avg.get("test_mcc", test_avg.get("mcc", np.nan))
+            trial.set_user_attr("test_mcc_avg", float(mcc_cv) if np.isfinite(mcc_cv) else None)
+            if np.isfinite(mcc_cv):
+                tag = _format_score_tag("mcc", mcc_cv, digits=3, signed=True)
+                return _safe_rename_trial_dir(trial_dir, [tag])
+        else:
+            pearson_cv = test_avg.get("pearson", np.nan)
+            trial.set_user_attr("test_pearson_avg", float(pearson_cv) if np.isfinite(pearson_cv) else None)
+            if np.isfinite(pearson_cv):
+                tag = _format_score_tag("pearson", pearson_cv, digits=4, signed=True)
+                return _safe_rename_trial_dir(trial_dir, [tag])
+        return trial_dir
+
+    def _dump_reproducible_cfg(self, cfg: Dict[str, Any], trial_dir: Path, mean_score: float, effective_seed: Optional[int]) -> None:
+        """
+        1. 說明: 將「實際使用的 seed」覆寫後的 cfg 存成可重現 YAML
+        2. inputs: cfg, trial_dir, mean_score, effective_seed
+        3. return: None
+        """
+        import yaml
+        cfg = dict(cfg)
+        if effective_seed is not None:
+            cfg["seed"] = int(effective_seed)
+        path = trial_dir / f"trial_config_{cfg['objective']['primary_metric']}={mean_score:.6g}.yaml"
+        with open(path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, allow_unicode=True)
+        print(f"[runner] saved reproducible config -> {path}")
+
+    def _maybe_export_tbm(
+        self,
+        cfg: Dict[str, Any],
+        df,  # for index
+        folds: List[Dict[str, Any]],
+        fold_models_for_infer: List[Tuple[Any, Dict[str, Any], Dict[str, Any]]],
+        trial_dir: Path,
+        task_type: str,
+    ) -> None:
+        """
+        1. 說明: 依設定執行 TBM 併回匯出（僅分類任務）
+        2. inputs: cfg, df, folds, fold_models_for_infer, trial_dir, task_type
+        3. return: None
+        """
+        try:
+            post_infer = (cfg.get("post_infer", {}) or {}).get("tbm_concat", {}) or {}
+            debug_lines = [
+                f"task_type={task_type}",
+                f"post_infer_enabled={bool(post_infer.get('enabled', False))}",
+                f"trial_dir={trial_dir}",
+                f"n_fold_models={len(fold_models_for_infer)}",
+            ]
+            if bool(post_infer.get("enabled", False)) and task_type == "classification":
+                ds = str(post_infer.get("date_start", "2023-01-01"))
+                de = str(post_infer.get("date_end", "2025-08-01"))
+                out_col = str(post_infer.get("output_column", "pred"))
+                out_csv = str(post_infer.get("csv_path_override") or cfg.get("label", {}).get("tbm_csv_path"))
+                s_tag, e_tag = ds.replace("-", ""), de.replace("-", "")
+                save_csv = trial_dir / f"tbm_with_{out_col}_{s_tag}_{e_tag}.csv"
+                debug_lines += [f"date_range=[{ds},{de}]", f"tbm_src={out_csv}", f"save_to={save_csv}"]
+
+                export_tbm_predictions_for_trial(
+                    cfg=cfg,
+                    df_index=pd.DatetimeIndex(df.index),
+                    folds=folds,
+                    fold_models=fold_models_for_infer,
+                    date_start=ds,
+                    date_end=de,
+                    src_tbm_csv_path=out_csv,
+                    save_to_path=str(save_csv),
+                    output_column=out_col,
+                    threshold_override=(
+                        post_infer.get("threshold_override")
+                        if isinstance(post_infer.get("threshold_override", None), (int, float))
+                        else None
+                    ),
+                    decision_mode="both",
+                )
+                print(f"[PostInfer] Saved TBM with predictions: {save_csv}")
+                debug_lines.append("status=ok")
+
+            # 記錄 debug
+            with open(trial_dir / "post_infer_debug.txt", "w", encoding="utf-8") as dfp:
+                dfp.write("\n".join(debug_lines))
+
+        except Exception as e:
+            print(f"[PostInfer][WARN] skip due to error: {e}")
+            try:
+                with open(trial_dir / "post_infer_error.txt", "w", encoding="utf-8") as ef:
+                    ef.write(str(e))
+            except Exception:
+                pass
+
+
+def run_trial(
+    *,
+    optuna_trial,
+    cfg: Dict[str, Any],
+    df,
+    trial_dir: Path,
+    folds: List[Dict[str, Any]],
+    device: Optional[str] = None,
+    effective_seed: Optional[int] = None,
+) -> TrialOutputs:
+    """Convenience wrapper used by the Optuna objective layer."""
+    runner = TrialRunner()
+    return runner.run(
+        trial=optuna_trial,
+        cfg=cfg,
+        df=df,
+        trial_dir=trial_dir,
+        folds=folds,
+        device=device,
+        effective_seed=effective_seed,
+    )

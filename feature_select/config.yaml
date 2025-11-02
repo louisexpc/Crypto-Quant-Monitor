@@ -1,0 +1,46 @@
+# feature_select/config.yaml
+paths:
+  tbm_labels: "data/TBM_label/BTC-USDT_1h_ewma_up3_dn3_lookback36_label.csv"
+  precomputed: "data/precomputed/btcusdt_15m_features.csv"
+  out_csv: "feature_select/results/vetted_features_ewm_zscore.csv"
+
+index:
+  dt_col_precomputed: "datetime"   # precomputed 的時間欄
+  tz_precomputed: "UTC"            # 若為 "+08:00" 就填 "Asia/Taipei"
+  tz_labels: "Asia/Taipei"         # 你的 TBM 標註看起來是 +08:00
+
+events:
+  window_bars: 144
+  reduce: "ewm_zscore"     # last|sma|ema|zscore|ewm_zscore|slope|percentile
+  halflife_bars: 72
+  percentile_q: 0.8
+  strictly_previous: false # 若事件定義需下一根才可下單，可設 true 更保守
+  max_lag: null            # 例如 "2h"；超過距離就視為 NaN
+
+cv:
+  mode: "purged_kfold" # 直接用你的 train/data/folds.py
+  n_splits: 5
+  embargo_hours: 36
+  train_val_split: 1.0
+  start_date: null     # 可留空
+  end_date: null       # 可留空
+
+filter:
+  side: long    # 可選: "all" | "long" | "short"
+
+scoring:
+  do_spearman: false   # 先關閉；需要簽名報酬時再開
+  fdr_q: 0.10
+  min_non_nan: 20     # 特徵有效樣本下限
+
+columns:
+  # 明確排除不該參與的欄位（label/價量/時間/重複 open,high...）
+  exclude_prefix: ["m_"]  # 若要先專注低頻特徵，可先排除 minute 展開欄
+  exclude_exact:
+    - datetime
+    - timestamp
+    - open
+    - high
+    - low
+    - close
+    - volume
