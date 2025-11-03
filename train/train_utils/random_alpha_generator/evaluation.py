@@ -168,7 +168,7 @@ class BiserialRankEvaluator(BaseEvaluator):
                 - Rank-biserial correlation 的範圍為 [-1, 1]，fitness 取其絕對值。
         """
         # 建立特徵矩陣 X 與標籤 y
-        print(f"[Debug] Start evaluating individual with tree: {individual.show()}")
+        # print(f"[Debug] Start evaluating individual with tree: {individual.show()}")
 
 
         _df = self.df.copy()
