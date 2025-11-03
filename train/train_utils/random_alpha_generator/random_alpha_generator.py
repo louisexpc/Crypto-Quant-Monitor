@@ -1105,21 +1105,24 @@ def main(
     
     # """前處理"""
     data = pd.read_csv(data_path, parse_dates=['datetime'], index_col='datetime')
+    # data = pd.read_csv(data_path)
     data = data[data.index <= start_date]
     print(f"Data Range: {data.index.min()} to {data.index.max()}, Total Rows: {len(data)}")
     returns = data['close'].pct_change().shift(-1)
+    
 
     #Add Features
-    # data[f"obv"] = talib.OBV(data['close'], data['volume'])
-    # for n in [5,10,20]:
-    #     data[f"ema_{n}"] = talib.EMA(data['close'], timeperiod=n)
-    #     data[f"rsi_{n}"] = talib.RSI(data['close'], timeperiod=n)
-    #     data[f"atr_{n}"] = talib.ATR(data['high'], data['low'], data['close'], timeperiod=n)
-    #     data[f"cci_{n}"] = talib.CCI(data['high'], data['low'], data['close'], timeperiod=n)
-    #     data[f"mfi_{n}"] = talib.MFI(data['high'], data['low'], data['close'], data['volume'], timeperiod=n)
-    #     data[f"adx_{n}"] = talib.ADX(data['high'], data['low'], data['close'], timeperiod=n)
-    #     data[f"willr_{n}"] = talib.WILLR(data['high'], data['low'], data['close'], timeperiod=n)
+    data[f"obv"] = talib.OBV(data['close'], data['volume'])
+    for n in [5,10,20]:
+        data[f"ema_{n}"] = talib.EMA(data['close'], timeperiod=n)
+        data[f"rsi_{n}"] = talib.RSI(data['close'], timeperiod=n)
+        data[f"atr_{n}"] = talib.ATR(data['high'], data['low'], data['close'], timeperiod=n)
+        data[f"cci_{n}"] = talib.CCI(data['high'], data['low'], data['close'], timeperiod=n)
+        data[f"mfi_{n}"] = talib.MFI(data['high'], data['low'], data['close'], data['volume'], timeperiod=n)
+        data[f"adx_{n}"] = talib.ADX(data['high'], data['low'], data['close'], timeperiod=n)
+        data[f"willr_{n}"] = talib.WILLR(data['high'], data['low'], data['close'], timeperiod=n)
     feature_cols = data.columns.tolist()
+    # data.to_csv(os.path.join(save_folder, "training_data_with_features.csv"),index=False)
     if 'timestamp' in feature_cols:
         feature_cols.remove('timestamp')  # 移除目標變數
     terminals = terminal_set if terminal_set is not None else feature_cols
@@ -1236,7 +1239,7 @@ def main(
         best_alpha = solver.evolve()
         print(f"\n最佳Alpha {best_alpha.show()} - {best_alpha.show_metrics()}\n")
 
-        if abs(best_alpha.ic) >= ic_threshold and best_alpha.sharpe >= sharpe_threshold:
+        if abs(best_alpha.fitness) >= 0.15:
             # 儲存最佳Alpha
             save_path = os.path.join(save_folder, f"best_evolved_alpha_from_predefined_{i}.json")
             save_alpha(best_alpha, save_path)
@@ -1246,23 +1249,25 @@ def main(
     save_alpha(best_alpha, alpha_path)
     # 載入最佳Alpha
     loaded_alpha = load_alpha(alpha_path)
-    print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")
+    print(f"載入的Alpha: {loaded_alpha.show()} - {loaded_alpha.show_metrics()}")
 
     """HOW TO USE"""
     # return_features  = loaded_alpha.tree.eval(your_dataframe)
 
 if __name__ == "__main__":
     df = pd.read_csv("/home/louisexpc/Crypto-Quant-Monitor/train/data/binanceusdm_swap_BTC-USDT-USDT_1h.csv") 
-    event_df = pd.read_csv("/home/louisexpc/Crypto-Quant-Monitor/train/data/BTC-USDT_1h_ewma_up3_dn3_lookback36_label.csv")      
-    evaluator = BiserialRankEvaluator(event_df=event_df, df=df, lookback=36)
+    event_df = pd.read_csv("/home/louisexpc/Crypto-Quant-Monitor/train/data/BTC-USDT_1h_ewma_up8_dn10_lookback108_label.csv")      
+    evaluator = BiserialRankEvaluator(event_df=event_df, df=df, lookback=108)
 
     main(
         data_path="/home/louisexpc/Crypto-Quant-Monitor/train/data/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
         evaluator=evaluator,
-        population_size=10,
-        generations=10,
+        start_date="2025-04-30 23:00:00+08:00",
+        population_size=150,
+        generations=2,
+        depth=10,
         fitness_type='fixed',
-        n_jobs=1,
+        n_jobs=8,
         save_folder="./results")
     
     """TODO: follow, debug 中記得繼續回去補充"""

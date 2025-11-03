@@ -3,7 +3,7 @@ import pandas as pd
 from analysis import Level, StrategyAnalyzer
 from tqdm import tqdm
 from typing import Tuple, Dict, Any, Optional
-
+from pathlib import Path
 
 def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT", timeframe:str = "1h", volume_ema_window:int = 10) -> pd.DataFrame:
     """
@@ -422,7 +422,7 @@ def analysis_label(label_df:pd.DataFrame):
     print(f"Short Trades :\t{out['short_trades']}")
     print(f"Short Win Rate :\t{out['short_win_rate']}")
     print(f"Total Short PnL :\t{out['total_short_pnl']}")
-    print(f"Avg Short PnL :\t{out['avg_short_pnl']}")
+    print(f"Avg Short PnL :\t{out['avg_short_pnl']}\n")
 
     return out
 
@@ -467,15 +467,18 @@ def worker_task(up_mult, dn_mult, vol_method, horizon, vol_halflife, ambiguous):
 
 
 def main():
-    lookback =108  # 用於產生 raw_signals 的 lookback
+    lookback = 108  # 用於產生 raw_signals 的 lookback
     df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv", parse_dates=['datetime'], index_col='datetime')
     low_timeframe_df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", parse_dates=['datetime'], index_col='datetime')
     df = df.sort_index()
     low_timeframe_df = low_timeframe_df.sort_index()
     raw_signals_df = generate_signals(df=df, lookback=lookback, symbol="BTCUSDT", timeframe="1h", volume_ema_window=10)  # 範例
 
-    up_mults = [2,2.5,3,4]
-    dn_mults = [1.5,2,2.5,3]
+    outpath = Path("labels_output")
+    outpath.mkdir(parents=True, exist_ok=True)
+
+    up_mults = [2,4,6,8,10]
+    dn_mults = [2,4,6,8,10]
     vol_methods = ["ewma", "atr"]
     horizon = 0
     vol_halflife = 14
@@ -509,11 +512,13 @@ def main():
                 vol = res["vol_method"]
                 labels_df = res["labels_df"]
                 # 把參數放進檔名避免覆蓋
-                fname = f"../data/BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label.csv"
+                fname = outpath / f"BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label.csv"
                 labels_df.to_csv(fname, index=False)
+                print(f" ================ BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label ================")
                 print(f"Saved: {fname}")
                 out = analysis_label(labels_df)
-                out_fname = fname.replace(".csv", "_analysis.json")
+
+                out_fname = outpath/f"BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label_analysis.json"
                 out_json = json.dumps(out, indent=4)
                 with open(out_fname, "w") as f:
                     f.write(out_json)
