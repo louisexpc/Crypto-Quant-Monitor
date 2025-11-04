@@ -3,7 +3,7 @@ import pandas as pd
 from analysis import Level, StrategyAnalyzer
 from tqdm import tqdm
 from typing import Tuple, Dict, Any, Optional
-
+from pathlib import Path
 
 def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT", timeframe:str = "1h", volume_ema_window:int = 10) -> pd.DataFrame:
     """
@@ -367,38 +367,199 @@ def triple_barrier_labels(
         
         # if side == -1:
         #     print(f"空單結果: {eid}\nentry time=\t{t0}\nexit time=\t{out.at[eid, 't1']}\nO={O}\npt={pt_price}\nsl={sl_price}\nvol={sig}")
-        if out.at[eid, 't1'] == out.at[eid, 't0']:
+        if out.at[eid, 't1'] == out.at[eid, 't0'] and (hit_pt and hit_sl):
             print(f"事件 {eid} 的 t1 == t0\nt1: {out.at[eid, 't1']}\nt0: {out.at[eid, 't0']}\nStatus: hit_pt:{hit_pt} ; hit_sl:{hit_sl}\n觸發 low timeframe check:{hit_pt and hit_sl}")
         
     return out[['t0','side','entry_price','t1','label','pt','sl','vol']]
 
 
+def analysis_label(label_df:pd.DataFrame):
+    # 分析標籤分佈情況
+    def compute_pnl(row):
+        if pd.isna(row['label']):
+            return 0.0
+        if row['label'] == 0.0:
+            return 100 * row['side']* (row['sl'] - row['entry_price'])/row['entry_price']
+        else:
+            return 100 * row['side'] * (row['pt'] - row['entry_price'])/row['entry_price']
+        
+    def winRate(trades:pd.DataFrame) -> Optional[float]:
+        if trades.empty:
+            return None
+        wins = trades[trades['label'] == 1.0]
+        return len(wins) / len(trades)
+    
+    label_df['pnl'] = label_df.apply(compute_pnl, axis=1)
+
+    long_trades = label_df[label_df['side'] == 1]
+    short_trades = label_df[label_df['side'] == -1]
+
+    out ={
+        "total_trades": len(label_df),
+        "total_pnl": label_df['pnl'].sum(),
+        "avg_pnl": label_df['pnl'].mean(),
+        "win_rate": winRate(label_df),
+        "long_trades": len(long_trades),
+        "long_win_rate": winRate(long_trades),
+        "total_long_pnl": long_trades['pnl'].sum(),
+        "avg_long_pnl": long_trades['pnl'].mean(),
+        "short_trades": len(short_trades),
+        "short_win_rate": winRate(short_trades),
+        "total_short_pnl": short_trades['pnl'].sum(),
+        "avg_short_pnl": short_trades['pnl'].mean(),
+    }
+
+    print(f"Total Trades :\t{out['total_trades']}")
+    print(f"Total PnL :\t{out['total_pnl']}")
+    print(f"Avg PnL :\t{out['avg_pnl']}")
+    print(f"Win Rate :\t{out['win_rate']}")
+    print("-----")
+    print(f"Long Trades :\t{out['long_trades']}")
+    print(f"Long Win Rate :\t{out['long_win_rate']}")
+    print(f"Total Long PnL :\t{out['total_long_pnl']}")
+    print(f"Avg Long PnL :\t{out['avg_long_pnl']}")
+    print("-----")
+    print(f"Short Trades :\t{out['short_trades']}")
+    print(f"Short Win Rate :\t{out['short_win_rate']}")
+    print(f"Total Short PnL :\t{out['total_short_pnl']}")
+    print(f"Avg Short PnL :\t{out['avg_short_pnl']}\n")
+
+    return out
+
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+import json
+
+# 假設 triple_barrier_labels 已在 import path
+# 我們會在 worker 裡使用全域變數以減少每次 submit pickle 大物件。
+
+G_DF = None
+G_LOW_DF = None
+G_RAW_SIGNALS = None
+
+def init_worker(df, low_df, raw_signals):
+    # 這個 initializer 只在建立子 process 時被呼叫一次（initargs 會被序列化到每個 worker）
+    global G_DF, G_LOW_DF, G_RAW_SIGNALS
+    G_DF = df
+    G_LOW_DF = low_df
+    G_RAW_SIGNALS = raw_signals
+
+def worker_task(up_mult, dn_mult, vol_method, horizon, vol_halflife, ambiguous):
+    # 使用全域 G_* 來跑 heavy function，回傳參數 + 結果
+    labels_df = triple_barrier_labels(
+        df=G_DF,
+        low_timeframe_df=G_LOW_DF,
+        raw_signals=G_RAW_SIGNALS,
+        up_mult=up_mult,
+        dn_mult=dn_mult,
+        horizon=horizon,
+        vol_method=vol_method,
+        vol_halflife=vol_halflife,
+        ambiguous=ambiguous,
+    )
+    # 回傳用來辨識的參數（不用再靠外面去對 index）
+    return {
+        "up_mult": up_mult,
+        "dn_mult": dn_mult,
+        "vol_method": vol_method,
+        "labels_df": labels_df
+    }
 
 
-if __name__ == "__main__":
+def main():
+    lookback = 108  # 用於產生 raw_signals 的 lookback
     df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv", parse_dates=['datetime'], index_col='datetime')
     low_timeframe_df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", parse_dates=['datetime'], index_col='datetime')
     df = df.sort_index()
     low_timeframe_df = low_timeframe_df.sort_index()
+    raw_signals_df = generate_signals(df=df, lookback=lookback, symbol="BTCUSDT", timeframe="1h", volume_ema_window=10)  # 範例
 
-    lookback = 36
-    vol_method = "atr"  # "ewma" or "atr"
-    raw_signals_df =generate_signals(
-        df = df,
-        lookback = lookback,
-        symbol = "BTCUSDT",
-        timeframe = "1h",
-        volume_ema_window = 10,
-    )
+    outpath = Path("labels_output")
+    outpath.mkdir(parents=True, exist_ok=True)
+
+    up_mults = [2,4,6,8,10]
+    dn_mults = [2,4,6,8,10]
+    vol_methods = ["ewma", "atr"]
+    horizon = 0
+    vol_halflife = 14
+    ambiguous = "nan"
+
+    # 建立所有參數組合
+    param_list = []
+    for lookback in [lookback]:  # 這裡的 lookback 目前沒用到，因為 raw_signals 已產生
+        for up in up_mults:
+            for dn in dn_mults:
+                for vol in vol_methods:
+                    param_list.append((lookback, up, dn, vol))
+
+    max_workers = max(1, os.cpu_count() - 1)
+    best_pnl = -np.inf
+    best_params = None
+
+    with ProcessPoolExecutor(max_workers=max_workers,
+                            initializer=init_worker,
+                            initargs=(df, low_timeframe_df, raw_signals_df)) as executor:
+        futures = []
+        for (lookback, up, dn, vol) in param_list:
+            # 若 lookback 影響 raw_signals，應在此處或 worker 裡處理
+            futures.append(executor.submit(worker_task, up, dn, vol, horizon, vol_halflife, ambiguous))
+
+        for future in as_completed(futures):
+            try:
+                res = future.result()
+                up = res["up_mult"]
+                dn = res["dn_mult"]
+                vol = res["vol_method"]
+                labels_df = res["labels_df"]
+                # 把參數放進檔名避免覆蓋
+                fname = outpath / f"BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label.csv"
+                labels_df.to_csv(fname, index=False)
+                print(f" ================ BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label ================")
+                print(f"Saved: {fname}")
+                out = analysis_label(labels_df)
+
+                out_fname = outpath/f"BTC-USDT_1h_{vol}_up{up}_dn{dn}_lookback{lookback}_label_analysis.json"
+                out_json = json.dumps(out, indent=4)
+                with open(out_fname, "w") as f:
+                    f.write(out_json)
+                if out['avg_pnl'] is not None and out['avg_pnl'] > best_pnl:
+                    best_pnl = out['avg_pnl']
+                    best_params = (lookback, up, dn, vol)
+                    # print(f"New best avg_pnl: {best_pnl} with params: lookback={lookback}, up_mult={up}, dn_mult={dn}, vol_method={vol}")
+            except Exception as e:
+                # 記錄失敗組合（可以把 exception 和 traceback 寫 log）
+                print("Worker failed:", e)
+
+    if best_params:
+        lookback, up, dn, vol = best_params
+        print(f"Best avg_pnl: {best_pnl} with params: lookback={lookback}, up_mult={up}, dn_mult={dn}, vol_method={vol}")
+
+
+if __name__ == "__main__":
+    main()
+    # df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv", parse_dates=['datetime'], index_col='datetime')
+    # low_timeframe_df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", parse_dates=['datetime'], index_col='datetime')
+    # df = df.sort_index()
+    # low_timeframe_df = low_timeframe_df.sort_index()
+
+    # lookback = 36
+    # vol_method = "atr"  # "ewma" or "atr"
+    # raw_signals_df =generate_signals(
+    #     df = df,
+    #     lookback = lookback,
+    #     symbol = "BTCUSDT",
+    #     timeframe = "1h",
+    #     volume_ema_window = 10,
+    # )
    
-    labels_df = triple_barrier_labels(
-        df=df,
-        low_timeframe_df=low_timeframe_df,
-        raw_signals=raw_signals_df,
-        up_mult=2.5, dn_mult=2.0,
-        horizon=0,                 # 0 or <=0 代表「掃到資料尾、不設到期」
-        vol_method=vol_method, vol_halflife=14,
-        ambiguous="nan",           # 同根雙觸發→丟棄
-    )
-    labels_df.to_csv(f"../data/BTC-USDT_1h_{vol_method}_lookback{lookback}_label.csv", index=False)
-    print(labels_df)
+    # labels_df = triple_barrier_labels(
+    #     df=df,
+    #     low_timeframe_df=low_timeframe_df,
+    #     raw_signals=raw_signals_df,
+    #     up_mult=2.5, dn_mult=2.0,
+    #     horizon=0,                 # 0 or <=0 代表「掃到資料尾、不設到期」
+    #     vol_method=vol_method, vol_halflife=14,
+    #     ambiguous="nan",           # 同根雙觸發→丟棄
+    # )
+    # labels_df.to_csv(f"../data/BTC-USDT_1h_{vol_method}_lookback{lookback}_label.csv", index=False)
+    # analysis_label(labels_df)
