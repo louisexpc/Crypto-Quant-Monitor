@@ -1,10 +1,6 @@
 import pandas as pd
 import numpy as np
-
 from typing import Dict, Any, Tuple, Optional
-import numpy as np
-import pandas as pd
-
 from scipy.stats import rankdata, mannwhitneyu, norm
 
 """ ====================================================== BaseEvaluator ======================================================"""
@@ -170,10 +166,7 @@ class BiserialRankEvaluator(BaseEvaluator):
         # 建立特徵矩陣 X 與標籤 y
         # print(f"[Debug] Start evaluating individual with tree: {individual.show()}")
 
-
-        _df = self.df.copy()
-
-        feature = individual.tree.eval(_df)  # shape (n_total_rows,), aligned with df
+        feature = individual.tree.eval(self.df)  # shape (n_total_rows,), aligned with df
 
         n_events = len(self.event_df)
         m_timepoints = self.lookback

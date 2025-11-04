@@ -367,7 +367,7 @@ def triple_barrier_labels(
         
         # if side == -1:
         #     print(f"空單結果: {eid}\nentry time=\t{t0}\nexit time=\t{out.at[eid, 't1']}\nO={O}\npt={pt_price}\nsl={sl_price}\nvol={sig}")
-        if out.at[eid, 't1'] == out.at[eid, 't0'] and (hit_pt & hit_sl):
+        if out.at[eid, 't1'] == out.at[eid, 't0'] and (hit_pt and hit_sl):
             print(f"事件 {eid} 的 t1 == t0\nt1: {out.at[eid, 't1']}\nt0: {out.at[eid, 't0']}\nStatus: hit_pt:{hit_pt} ; hit_sl:{hit_sl}\n觸發 low timeframe check:{hit_pt and hit_sl}")
         
     return out[['t0','side','entry_price','t1','label','pt','sl','vol']]

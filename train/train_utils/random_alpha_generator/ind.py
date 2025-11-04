@@ -64,7 +64,15 @@ class Individual:
         self.original_signature = self.genotype()          # 原始結構簽名: 初始化後不變
         self.signature = self.original_signature           # 結構簽名:隨演化突變
     def show_metrics(self)->str:
-        """印出個體非 none 的評估指標(含 key:value)"""
+        """
+        Display the non-None evaluation metrics of the individual.
+        Metrics displayed:
+            - Fitness: The fitness value of the individual, if available.
+            - IC: The information coefficient, if available.
+            - Sharpe: The Sharpe ratio, if available.
+        Returns:
+            str: A comma-separated string of key:value pairs for each non-None metric.
+        """
         metrics = []
         if self.fitness is not None:
             metrics.append(f"Fitness: {self.fitness}")
@@ -89,26 +97,8 @@ class Individual:
         self.random_r = metrics.get("random_r", None)
 
         return self.fitness
-
-        # try:
-        #     signal = self.tree.eval(df)
-        #     self.ic = calc_ic(signal, returns)
-        #     self.sharpe = calc_sharpe(signal, returns)
-            
-        #     if fitness_type == 'ic':
-        #         self.fitness = abs(self.ic) if not np.isnan(self.ic) else 0
-        #     elif fitness_type == 'sharpe':
-        #         self.fitness = self.sharpe if not np.isnan(self.sharpe) else 0
-        #     else:
-        #         # 組合評分
-        #         ic_score = abs(self.ic) if not np.isnan(self.ic) else 0
-        #         sharpe_score = self.sharpe if not np.isnan(self.sharpe) else 0
-        #         self.fitness = ic_score * 0.5 + sharpe_score * 0.5
-                
-        # except Exception as e:
-        #     self.fitness = 0
         
-        return self.fitness
+
     
     def show(self) -> str:
         """
