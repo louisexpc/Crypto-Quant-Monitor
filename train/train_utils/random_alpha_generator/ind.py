@@ -1,6 +1,6 @@
 # ================== 遺傳演算法組件 ==================
-from node import Node, Leaf, OpNode
-from evaluation import calc_ic, calc_sharpe, DefaultEvaluator
+from .node import Node, Leaf, OpNode
+from .evaluation import calc_ic, calc_sharpe, DefaultEvaluator
 import json, time
 import hashlib
 import numpy as np

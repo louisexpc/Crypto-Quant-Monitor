@@ -9,12 +9,12 @@ import random
 import copy
 import os
 from typing import Any, List, Optional, Tuple
-from node import Node, Leaf, OpNode
+from .node import Node, Leaf, OpNode
 import json, time
 import talib
 from pprint import pprint,pformat
-from evaluation import BaseEvaluator, DefaultEvaluator, BiserialRankEvaluator
-from ind import Individual
+from .evaluation import BaseEvaluator, DefaultEvaluator, BiserialRankEvaluator
+from .ind import Individual
 # ========== multiprocessing workers (NEW) ==========
 from multiprocessing import get_context
 

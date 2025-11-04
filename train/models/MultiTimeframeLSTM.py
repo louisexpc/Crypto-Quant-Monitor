@@ -354,7 +354,7 @@ def compute_features(df:pd.DataFrame,alpha_dir:str = None) -> pd.DataFrame:
         data[f"willr_{n}"] = talib.WILLR(data['high'], data['low'], data['close'], timeperiod=n)
     if alpha_dir is not None:
         # Load and compute custom alphas
-        from random_alpha_generator.random_alpha_generator import load_alpha
+        from train_utils.random_alpha_generator.random_alpha_generator import load_alpha
 
         alpha_files = [f for f in os.listdir(alpha_dir) if f.endswith('.json')]
         print(f"[INFO] Loading {len(alpha_files)} custom alphas from {alpha_dir}")
