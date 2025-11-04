@@ -8,35 +8,36 @@ import numpy as np
 import random
 import copy
 import os
-from typing import Any, List, Tuple
-from .node import Node, Leaf, OpNode
+from typing import Any, List, Optional, Tuple
+from node import Node, Leaf, OpNode
 import json, time
 import talib
 from pprint import pprint,pformat
+from evaluation import BaseEvaluator, DefaultEvaluator, BiserialRankEvaluator
+from ind import Individual
 # ========== multiprocessing workers (NEW) ==========
 from multiprocessing import get_context
 
 _G_DF = None
 _G_RET = None
 _G_FTYPE = None
-
-def _mp_init(df, returns, fitness_type):
+_G_EVAL = None
+def _mp_init(df, returns, fitness_type, evaluator):
     """子程序初始化：把大物件放到全域，避免每次 pickling 傳遞。"""
-    global _G_DF, _G_RET, _G_FTYPE
-    _G_DF, _G_RET, _G_FTYPE = df, returns, fitness_type
+    global _G_DF, _G_RET, _G_FTYPE, _G_EVAL
+    _G_DF, _G_RET, _G_FTYPE, _G_EVAL = df, returns, fitness_type, evaluator
 
 def _mp_eval_worker(args):
-    """
-    子程序工作：只做純計算，不修改主程序的個體。
-    回傳 (idx, fitness, ic, sharpe)，主程序再寫回。
-    """
     idx, ind = args
     try:
+        # 確保 individual 有 evaluator（指向全域 _G_EVAL）
+
+        ind.evaluator = _G_EVAL
         fit = ind.evaluate(_G_DF, _G_RET, _G_FTYPE)
-        return idx, fit, ind.ic, ind.sharpe
+        # evaluate 已把 ic/sharpe 寫回個體
+        return idx, fit, ind.ic, ind.sharpe, ind.fixed_r, ind.random_r
     except Exception:
-        # 與原本行為一致：錯誤→ fitness=0, ic/sharpe NaN
-        return idx, 0.0, np.nan, np.nan
+        return idx, 0.0, np.nan, np.nan, np.nan, np.nan
 
 
 # ================== 樹構造函數 ==================
@@ -181,267 +182,6 @@ def node_from_dict(d):
         raise ValueError(f"Unknown dict type: {t}")
 
 
-# ================== 遺傳演算法組件 ==================
-
-class Individual:
-    """個體：一個alpha公式樹"""
-    def __init__(self, tree:Node):
-        self.tree = tree
-        self.fitness = None
-        self.ic = None
-        self.sharpe = None
-
-
-        """Operater Info: 目前支援項目"""
-        self.COMMUTATIVE_OPS = {"+", "*", "correlation", "covariance"}  # 若未來要擴充，照樣加入
-        self.WINDOW_OPS = {"rolling_mean", "rolling_std", "signedpower", "delay",
-                    "delta", "decay_linear", "ts_stddev", "ts_sum", "ts_argmax",
-                    "ts_argmin", "ts_product", "ts_rank", "ts_max", "ts_min",
-                    "ts_mean", "ts_wma", "ts_highday", "ts_lowday"}
-        
-        self.original_signature = self.genotype()          # 原始結構簽名: 初始化後不變
-        self.signature = self.original_signature           # 結構簽名:隨演化突變
-    def evaluate(self, df, returns, fitness_type='ic'):
-        """評估個體適應度"""
-        try:
-            signal = self.tree.eval(df)
-            self.ic = calc_ic(signal, returns)
-            self.sharpe = calc_sharpe(signal, returns)
-            
-            if fitness_type == 'ic':
-                self.fitness = abs(self.ic) if not np.isnan(self.ic) else 0
-            elif fitness_type == 'sharpe':
-                self.fitness = self.sharpe if not np.isnan(self.sharpe) else 0
-            else:
-                # 組合評分
-                ic_score = abs(self.ic) if not np.isnan(self.ic) else 0
-                sharpe_score = self.sharpe if not np.isnan(self.sharpe) else 0
-                self.fitness = ic_score * 0.5 + sharpe_score * 0.5
-                
-        except Exception as e:
-            self.fitness = 0
-        
-        return self.fitness
-    
-    def show(self) -> str:
-        """
-        將 alpha 公式樹轉為可閱讀字串（中序表示）
-        """
-        def _fmt_const(v):
-            # 盡量印成整數樣式；否則用短格式浮點
-            if isinstance(v, (int, np.integer)):
-                return str(int(v))
-            if isinstance(v, (float, np.floating)):
-                return str(int(v)) if float(v).is_integer() else f"{float(v):.6g}"
-            return str(v)
-
-        def _visit(node: Node) -> str:
-            from typing import Optional
-            if isinstance(node, Leaf):
-                return node.value if isinstance(node.value, str) else _fmt_const(node.value)
-
-            if isinstance(node, OpNode):
-                op = node.operator
-                arity = node.arity
-
-                # --- 算術（中序，強制括號以保結構） ---
-                if op in {"+", "-", "*", "/"}:
-                    left = _visit(node.left)
-                    right = _visit(node.right)
-                    return f"({left} {op} {right})"
-
-                # --- 一元函數：函數式表示 ---
-                if arity == 1:
-                    return f"{op}({_visit(node.left)})"
-
-                # --- 需要 window 的二元（series, window） ---
-                win_ops = {
-                    "rolling_mean","rolling_std",
-                    "signedpower","delay",
-                    "delta","decay_linear","ts_stddev","ts_sum","ts_argmax","ts_argmin",
-                    "ts_product","ts_rank","ts_max","ts_min","ts_mean","ts_wma",
-                    "ts_highday","ts_lowday",
-                }
-                if op in win_ops:
-                    return f"{op}({_visit(node.left)}, {_visit(node.right)})"
-
-                # --- 雙變量統計（series, series[, maybe window]) ---
-                if op in {"covariance", "correlation"}:
-                    left = _visit(node.left)
-                    right = _visit(node.right)
-                    # 若樹節點真的有第三參數（可選）就一併輸出
-                    third = getattr(node, "third", None)
-                    if isinstance(third, Node) and third is not None:
-                        return f"{op}({left}, {right}, {_visit(third)})"
-                    return f"{op}({left}, {right})"
-
-                # --- 其它：通用函數式回退 ---
-                args = []
-                if node.left is not None:
-                    args.append(_visit(node.left))
-                if node.right is not None:
-                    args.append(_visit(node.right))
-                return f"{op}(" + ", ".join(args) + ")"
-
-            # 不期望型別
-            return "<?>"
-
-        return _visit(self.tree)
-    
-    def to_dict(self):
-        return {
-            "tree": node_to_dict(self.tree),
-            "metrics": {
-                "fitness": self.fitness,
-                "ic": self.ic,
-                "sharpe": self.sharpe,
-            },
-            "meta": {
-                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "fitness_type": getattr(self, "fitness_type", None),
-                "operator_set": getattr(self, "operator_set", None),
-                "depth_limit": getattr(self, "depth", None),
-                "signature": getattr(self, "signature", None),  # 有的話
-            },
-            "formula_str": self.show(),  # 方便人看
-        }
-
-    @classmethod
-    def from_dict(cls, d):
-        ind = cls(node_from_dict(d["tree"]))
-        # 指標在重新 evaluate 後會更新；也可先灌進來供顯示
-        m = d.get("metrics", {})
-        ind.fitness = m.get("fitness", None)
-        ind.ic = m.get("ic", None)
-        ind.sharpe = m.get("sharpe", None)
-        ind.signature = d.get("meta", {}).get("signature", None)
-        return ind
-    # Signature 相關
-    def genotype(self)->str:
-        """API: 取得基因型字串表示"""
-        return self.genotype_signature(self.tree)
-    def genotype_signature(self, node:Node) -> str:
-        """
-        取得基因型簽名: 只考慮運算符與結構，不考慮常數與欄位
-        Args:
-        - node: 樹節點
-        Returns:
-        - str: 基因型簽名字串
-        """
-        return self._digest_dict(self.node_to_canonical_dict(node))
-
-    def _normalize_const(self, val: float, ndigits: int = 8) -> float:
-        """
-        將常數標準化為固定小數位數，避免浮點誤差影響結構簽名
-        Args:
-        - val: 常數值
-        - ndigits: 小數位數
-        Returns:
-        - 標準化後的常數
-        """
-        try:
-            return round(float(val), ndigits)
-        except Exception:
-            return float(val)
-    def _is_scalar_leaf(self, node:Node) -> bool:
-        """
-        判斷是否為純數值常數葉節點: Leaf 節點且 value 非字串
-        Args:
-        - node: 樹節點
-        Returns:
-        - 是否為純數值常數葉節點
-        """
-        return isinstance(node, Leaf) and not isinstance(node.value, str)
-    
-    def _is_field_leaf(self, node:Node) -> bool:
-        """
-        判斷是否為欄位葉節點: Leaf 節點且 value 為字串
-        Args:
-        - node: 樹節點
-        Returns:
-        - 是否為欄位葉節點
-        """
-        return isinstance(node, Leaf) and isinstance(node.value, str)
-    
-    def _canonical_leaf(self,node:Node) -> dict[str, Any]:
-        """
-        將 Leaf 節點轉為標準化 dict 表示
-        Args:
-        - node: 樹節點
-        Returns:
-        - dict 表示
-        """
-        assert isinstance(node, Leaf)
-        if isinstance(node.value, str):
-            # 欄位名 Leaf：直接用字串
-            return {"type": "Leaf", "kind": "field", "value": node.value}
-        else:
-            # 常數 Leaf：規格化
-            return {"type": "Leaf", "kind": "const", "value": self._normalize_const(node.value)}
-        
-    def node_to_canonical_dict(self,node:Node) -> dict[str, Any]:
-        """
-        把樹轉為「穩定的、可交換一致、window 語義固定」的 dict 表示。
-        - 對 commutative ops：依子樹簽名排序左右子，消除 (a+b) vs (b+a) 差異。
-        - 對 window 類：強制 left 為 series, right 為 window（若輸入顛倒，這裡重排）。
-        """
-        if isinstance(node, Leaf):
-            return self._canonical_leaf(node)
-
-        assert isinstance(node, OpNode)
-        op = node.operator  # operator: string
-        ar = node.arity     # arity: 1 or 2
-
-        # 先遞迴拿到左右的 canonical dict（暫時不排）
-        left_d  = self.node_to_canonical_dict(node.left) if node.left  is not None else None
-        right_d = self.node_to_canonical_dict(node.right) if node.right is not None else None
-
-        # --- commutative ops: 排序子樹 ---
-        if op in self.COMMUTATIVE_OPS and left_d is not None and right_d is not None:
-            # 以子樹簽名排序：確保 (a+b) 與 (b+a) 的序列化一致
-            lh = self._digest_dict(left_d) # 左子樹雜湊: str
-            rh = self._digest_dict(right_d) # 右子樹雜湊: str
-            if rh < lh:  # 比字典序小就互換
-                left_d, right_d = right_d, left_d
-        
-        # ----- window 類正規化：左=series, 右=window -----
-        if op in self.WINDOW_OPS and left_d is not None and right_d is not None:
-            # 判斷 series vs window：
-            #   series：欄位 leaf 或經運算的子樹（OpNode）
-            #   window：常數 leaf（注意：你也可能用「常數 series」但在樹上會是 Leaf 常數）
-            def _is_series_like(d):
-                return (d["type"] == "Leaf" and d.get("kind") == "field") or (d["type"] == "OpNode")
-            def _is_window_like(d):
-                return (d["type"] == "Leaf" and d.get("kind") == "const")
-            
-            if _is_window_like(left_d) and _is_series_like(right_d):
-                # 交換，固定 series 在左
-                left_d, right_d = right_d, left_d
-        
-        # --- 建立本節點 dict ---
-        out = {
-            "type": "OpNode",
-            "op": op,
-            "arity": ar,
-            "left": left_d,
-            "right": right_d
-        }
-
-        return out
-    # Hash Helper Function
-    def _digest_dict(self,d: dict[str, Any]) -> str:
-        """
-        將 dict 轉為 JSON（鍵排序）後做雜湊，回傳短字串（簽名的「原料」）。
-        也可直接回傳 JSON 字串做 key（0 碰撞），但用雜湊可省記憶體。
-        Args:
-        - d: dict, 可巢狀
-        Returns:
-        - str: 簽名字串
-        """
-        s = json.dumps(d, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-        # blake2b 速度快，可調 digest_size 短一點
-        return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
-
         
 def save_alpha(ind: Individual, path: str):
     with open(path, "w", encoding="utf-8") as f:
@@ -459,7 +199,8 @@ class GeneticAlphaSolver:
             df:pd.DataFrame, 
             returns:pd.Series, 
             generations:int=10, 
-            fitness_type:str='ic', # 'ic' / 'sharpe'
+            fitness_type:str='ic', #Default: 'ic' / 'sharpe' , Biserial : 'fixed' / 'random'
+            evaluator: Optional[BaseEvaluator] = None,
             point_mutation_rate:float=0.3, 
             crossover_rate:float=0.7,
             population_size:int =50, 
@@ -499,6 +240,7 @@ class GeneticAlphaSolver:
         self.population_size = population_size
         self.generations = generations
         self.fitness_type = fitness_type
+        self.evaluator = evaluator or DefaultEvaluator()
         self.point_mutation_rate = point_mutation_rate
         self.best_history = []
         self.operator_set = operator_set
@@ -633,6 +375,32 @@ class GeneticAlphaSolver:
         """Update: 改為 dict 比較"""
         dict1 = ind1.node_to_canonical_dict(ind1.tree)
         dict2 = ind2.node_to_canonical_dict(ind2.tree)
+        return self._compare_dicts(dict1, dict2)
+
+    def _compare_dicts(self,d1, d2, ignore_keys=None):
+        if ignore_keys is None:
+            ignore_keys = {"value","op"}  # 預設忽略 value 欄位
+
+        if isinstance(d1, dict) and isinstance(d2, dict):
+            # 先比 key 集合，排除要忽略的 key
+            keys1 = set(d1.keys()) - ignore_keys
+            keys2 = set(d2.keys()) - ignore_keys
+            if keys1 != keys2:
+                return False
+            # 遞迴檢查每個 key
+            for k in keys1:
+                if not self._compare_dicts(d1[k], d2[k], ignore_keys):
+                    return False
+            return True
+        elif isinstance(d1, list) and isinstance(d2, list):
+            if len(d1) != len(d2):
+                return False
+            return all(self._compare_dicts(x, y, ignore_keys) for x, y in zip(d1, d2))
+        else:
+            # leaf node -> 只有在不是忽略欄位時才要比對值
+            return d1 == d2
+
+
 
     def _identical_structure(self, node1:Node, node2:Node, mode :str = 'relaxed')-> bool:
         """檢查兩個子樹是否結構相同: 
@@ -718,6 +486,7 @@ class GeneticAlphaSolver:
         if self.n_jobs <= 1:
             # --- 原本同步路徑（行為不變） ---
             for ind in pop:
+                ind.evaluator = self.evaluator
                 ind.evaluate(self.df, self.returns, self.fitness_type)
             return
 
@@ -725,14 +494,17 @@ class GeneticAlphaSolver:
         ctx = get_context(self.mp_start_method or "spawn")  # 跨平臺穩定
         with ctx.Pool(processes=self.n_jobs,
                       initializer=_mp_init,
-                      initargs=(self.df, self.returns, self.fitness_type)) as pool:
+                      initargs=(self.df, self.returns, self.fitness_type, self.evaluator)) as pool:
             tasks = [(i, ind) for i, ind in enumerate(pop)]
             # 用 imap_unordered 加速回傳；以 idx 回寫，不影響排序穩定性
             chunksize = max(1, len(tasks) // (self.n_jobs * 4))
-            for idx, fit, ic, sharpe in pool.imap_unordered(_mp_eval_worker, tasks, chunksize=chunksize):
+            for idx, fit, ic, sharpe, fixed_r, random_r in pool.imap_unordered(_mp_eval_worker, tasks, chunksize=chunksize):
                 pop[idx].fitness = fit
                 pop[idx].ic = ic
                 pop[idx].sharpe = sharpe
+                # 可選：若要記錄更多指標，可在 Individual 加欄位
+                pop[idx].fixed_r = fixed_r
+                pop[idx].random_r = random_r
 
                 
 
@@ -819,7 +591,7 @@ class GeneticAlphaSolver:
         self._evaluate_population(self.population)
 
         # Eealy Stop 機制
-        best_finess = max(ind.fitness if ind.fitness else 0 for ind in self.population)
+        best_fitness = max(ind.fitness if ind.fitness else 0 for ind in self.population)
         tolerance_trials = self.early_stopping_generations
         no_improvement_count = 0
 
@@ -938,22 +710,29 @@ class GeneticAlphaSolver:
             
             self.population.sort(key=lambda x: x.fitness if x.fitness else 0, reverse=True)
             best = self.population[0]
+            best_ic = best.ic if best.ic is not None else 0.0
+            best_sharpe = best.sharpe if best.sharpe is not None else 0.0
+            best_fixed_r = best.fixed_r if best.fixed_r is not None else 0.0
+            best_random_r = best.random_r if best.random_r is not None else 0.0
+
             self.best_history.append({
                 'generation': gen + 1,
                 'fitness': best.fitness,
-                'ic': best.ic,
-                'sharpe': best.sharpe
+                'ic': best_ic,
+                'sharpe': best_sharpe,
+                'fixed_r': best_fixed_r,
+                'random_r': best_random_r
             })
             execution_time = time.time() - start_time
             execution_min = int(execution_time // 60)
             execution_sec = execution_time % 60
 
-            print(f"Gen {gen+1}: {best.show()} Best Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}, Time={execution_min:.2f} min {execution_sec:.2f} sec , Cross={cross_count}, Mutate={mutate_count}, Population={len(self.population)}")
+            print(f"Gen {gen+1}: {best.show()} Best Fitness={best.fitness:.4f}, IC={best_ic:.4f}, Sharpe={best_sharpe:.4f}, Fixed R={best_fixed_r:.4f}, Random R={best_random_r:.4f} Time={execution_min:.2f} min {execution_sec:.2f} sec , Cross={cross_count}, Mutate={mutate_count}, Population={len(self.population)}")
 
             # Early Stopping 檢查
             current_best_fitness = best.fitness if best.fitness else 0
-            if current_best_fitness > best_finess:
-                best_finess = current_best_fitness
+            if current_best_fitness > best_fitness:
+                best_fitness = current_best_fitness
                 no_improvement_count = 0
             else:
                 no_improvement_count += 1
@@ -965,7 +744,7 @@ class GeneticAlphaSolver:
         # Step 6: 演化結束，回傳最佳個體
         self.population.sort(key=lambda x: x.fitness if x.fitness else 0, reverse=True)
         best = self.population[0]
-        print(f"Final Best: Fitness={best.fitness:.4f}, IC={best.ic:.4f}, Sharpe={best.sharpe:.4f}")
+        print(f"Final Best: {best.show_metrics()}")
 
         return best
 
@@ -1033,7 +812,8 @@ def main(
         # generators
         population_size: int = 150,
         generations: int = 100,
-        fitness_type: str = 'ic',  # 可選 'ic' 或 'sharpe'
+        fitness_type: str = 'ic',  # DefaultEvaluator :'ic' 或 'sharpe' ; BiserialEvaluator: 'fixed' / 'random'
+        evaluator: BaseEvaluator = DefaultEvaluator(), # 評估器: 可選 DefaultEvaluator 或其他自訂評估器
         depth: int = 5,
         point_mutation_rate: float = 0.4,
         crossover_rate: float = 0.7,
@@ -1064,9 +844,11 @@ def main(
     
     # """前處理"""
     data = pd.read_csv(data_path, parse_dates=['datetime'], index_col='datetime')
+    # data = pd.read_csv(data_path)
     data = data[data.index <= start_date]
     print(f"Data Range: {data.index.min()} to {data.index.max()}, Total Rows: {len(data)}")
     returns = data['close'].pct_change().shift(-1)
+    
 
     #Add Features
     data[f"obv"] = talib.OBV(data['close'], data['volume'])
@@ -1079,6 +861,7 @@ def main(
         data[f"adx_{n}"] = talib.ADX(data['high'], data['low'], data['close'], timeperiod=n)
         data[f"willr_{n}"] = talib.WILLR(data['high'], data['low'], data['close'], timeperiod=n)
     feature_cols = data.columns.tolist()
+    # data.to_csv(os.path.join(save_folder, "training_data_with_features.csv"),index=False)
     if 'timestamp' in feature_cols:
         feature_cols.remove('timestamp')  # 移除目標變數
     terminals = terminal_set if terminal_set is not None else feature_cols
@@ -1167,6 +950,7 @@ def main(
     for i, ind in enumerate(alphas_to_use):
         test_individual = Individual(ind)
         print("Alpha Formula:", test_individual.show())
+        print("Evaluator:", evaluator.__class__.__name__)
 
         solver_kwargs = dict(
             df=data,
@@ -1174,6 +958,7 @@ def main(
             population_size=population_size,
             generations=generations,
             fitness_type=fitness_type,  # 可選 'ic' 或 'sharpe'
+            evaluator=evaluator,
             population=[test_individual],  # 初始種群:只能放一個
             depth=depth,
             point_mutation_rate=point_mutation_rate,
@@ -1191,9 +976,9 @@ def main(
         solver = GeneticAlphaSolver(**solver_kwargs)
 
         best_alpha = solver.evolve()
-        print(f"\n最佳Alpha {best_alpha.show()} - IC: {best_alpha.ic:.4f}, Sharpe: {best_alpha.sharpe:.4f}")
+        print(f"\n最佳Alpha {best_alpha.show()} - {best_alpha.show_metrics()}\n")
 
-        if abs(best_alpha.ic) >= ic_threshold and best_alpha.sharpe >= sharpe_threshold:
+        if abs(best_alpha.fitness) >= 0.15:
             # 儲存最佳Alpha
             save_path = os.path.join(save_folder, f"best_evolved_alpha_from_predefined_{i}.json")
             save_alpha(best_alpha, save_path)
@@ -1203,11 +988,53 @@ def main(
     save_alpha(best_alpha, alpha_path)
     # 載入最佳Alpha
     loaded_alpha = load_alpha(alpha_path)
-    print(f"載入的Alpha: {loaded_alpha.show()} - IC: {loaded_alpha.ic:.4f}, Sharpe: {loaded_alpha.sharpe:.4f}")
+    print(f"載入的Alpha: {loaded_alpha.show()} - {loaded_alpha.show_metrics()}")
 
     """HOW TO USE"""
     # return_features  = loaded_alpha.tree.eval(your_dataframe)
 
 if __name__ == "__main__":
-    main(data_path="data/ohlcv_2023/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
-         save_folder="utils/feature_selections/gp_alpha/results")
+    df = pd.read_csv("/home/louisexpc/Crypto-Quant-Monitor/train/data/binanceusdm_swap_BTC-USDT-USDT_1h.csv") 
+    event_df = pd.read_csv("/home/louisexpc/Crypto-Quant-Monitor/train/data/BTC-USDT_1h_ewma_up8_dn10_lookback108_label.csv")      
+    evaluator = BiserialRankEvaluator(event_df=event_df, df=df, lookback=108)
+
+    main(
+        data_path="/home/louisexpc/Crypto-Quant-Monitor/train/data/binanceusdm_swap_BTC-USDT-USDT_1h.csv",
+        evaluator=evaluator,
+        start_date="2025-04-30 23:00:00+08:00",
+        population_size=150,
+        generations=2,
+        depth=10,
+        fitness_type='fixed',
+        n_jobs=8,
+        save_folder="./results")
+    
+    """TODO: follow, debug 中記得繼續回去補充"""
+    # test1 = Individual(
+    #     OpNode('*',
+    #         Leaf(-1),
+    #         OpNode('correlation',
+    #             Leaf('low'),
+    #             Leaf('close')
+    #         )
+    #     )
+    # )
+    # test2 = Individual(
+    #     OpNode('+',
+    #         Leaf(-1),
+    #         OpNode('correlation',
+    #             Leaf('volume'),
+    #             Leaf('high')
+    #         )
+    #     )
+    # )
+    # from pprint import pprint, pformat
+    # print(pformat(test1.node_to_canonical_dict(test1.tree), indent=2, width=50))
+    # print(pformat(test2.node_to_canonical_dict(test2.tree), indent=2, width=50))
+    # solver = GeneticAlphaSolver(
+    #         df = pd.DataFrame(),
+    #         returns = pd.Series(),
+    #         n_jobs=1
+    #     )
+    # print(solver._identical_structure_update(test1, test2))
+    
