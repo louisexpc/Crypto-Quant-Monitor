@@ -4,7 +4,7 @@ from analysis import Level, StrategyAnalyzer
 from tqdm import tqdm
 from typing import Tuple, Dict, Any, Optional
 from pathlib import Path
-
+from analysis_update import StrategyAnalyzerUpdate
 def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT", timeframe:str = "1h", volume_ema_window:int = 10) -> pd.DataFrame:
     """
     根據策略 Moduel StrategyAnalyzer 產生交易訊號。
@@ -34,6 +34,7 @@ def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT
         window_df = df.iloc[i - lookback + 1 : i + 1]
         try:
             analyzer = StrategyAnalyzer(window_df, symbol=symbol, timeframe=timeframe, volume_ema_window=volume_ema_window)
+            # analyzer = StrategyAnalyzerUpdate(window_df, symbol=symbol, timeframe=timeframe, volume_ema_window=volume_ema_window, use_band=True, band_gamma_flip=0.15, dbscan_eps_in_atr=0.2)
             sigs = analyzer.analyze()  # ← 只判斷最後一根是否觸發
         except Exception:
             continue
@@ -68,7 +69,7 @@ def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT
         .sort_values(['t0','side'])
         .reset_index(drop=True)
     )
-    raw_signals_df.to_csv("../data/debug_raw_signals.csv", index=False)
+    raw_signals_df.to_csv("../data/debug_raw_signals_update.csv", index=False)
     return raw_signals_df
 
 
@@ -467,18 +468,18 @@ def worker_task(up_mult, dn_mult, vol_method, horizon, vol_halflife, ambiguous):
 
 
 def main():
-    lookback = 108  # 用於產生 raw_signals 的 lookback
+    lookback = 36  # 用於產生 raw_signals 的 lookback
     df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv", parse_dates=['datetime'], index_col='datetime')
     low_timeframe_df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", parse_dates=['datetime'], index_col='datetime')
     df = df.sort_index()
     low_timeframe_df = low_timeframe_df.sort_index()
     raw_signals_df = generate_signals(df=df, lookback=lookback, symbol="BTCUSDT", timeframe="1h", volume_ema_window=10)  # 範例
 
-    outpath = Path("labels_output")
+    outpath = Path(f"labels_output_{lookback}")
     outpath.mkdir(parents=True, exist_ok=True)
 
-    up_mults = [2,4,6,8,10]
-    dn_mults = [2,4,6,8,10]
+    up_mults = [2,4,6,8,10,12,14,16]
+    dn_mults = [2,4,6,8,10,12,14,16]
     vol_methods = ["ewma", "atr"]
     horizon = 0
     vol_halflife = 14
@@ -494,6 +495,11 @@ def main():
 
     max_workers = max(1, os.cpu_count() - 1)
     best_pnl = -np.inf
+    sliding_point = 0.001 # 滑點假設
+    best_win_rate = -np.inf
+    best_long_win_rate = -np.inf # 在 best win rate case 的 long win rate
+    best_short_win_rate = -np.inf # 在 best win rate case 的 short win rate
+    P_breakeven = lambda up, dn, sp: (dn+sp) / (up + dn)
     best_params = None
 
     with ProcessPoolExecutor(max_workers=max_workers,
@@ -522,9 +528,24 @@ def main():
                 out_json = json.dumps(out, indent=4)
                 with open(out_fname, "w") as f:
                     f.write(out_json)
-                if out['avg_pnl'] is not None and out['avg_pnl'] > best_pnl:
-                    best_pnl = out['avg_pnl']
-                    best_params = (lookback, up, dn, vol)
+                
+                if out['win_rate'] is not None and P_breakeven(up, dn, sliding_point) < out['win_rate']:
+                    print(f"Pass breakeven check: P_breakeven={P_breakeven(up, dn, sliding_point):.4f} < win_rate={out['win_rate']:.4f}")
+                    if best_win_rate < out['win_rate']:
+                        best_win_rate = out['win_rate']
+                        best_long_win_rate = out['long_win_rate'] if out['long_win_rate'] is not None else -np.inf
+                        best_short_win_rate = out['short_win_rate'] if out['short_win_rate'] is not None else -np.inf
+                        best_params = (lookback, up, dn, vol)
+                    elif best_win_rate == out['win_rate']:
+                        # 考量 long, short win rate
+                        if best_long_win_rate < out['long_win_rate'] and best_short_win_rate < out['short_win_rate']:
+                            best_long_win_rate = out['long_win_rate']
+                            best_short_win_rate = out['short_win_rate']
+                            best_params = (lookback, up, dn, vol)
+
+                # if out['avg_pnl'] is not None and out['avg_pnl'] > best_pnl:
+                #     best_pnl = out['avg_pnl']
+                #     best_params = (lookback, up, dn, vol)
                     # print(f"New best avg_pnl: {best_pnl} with params: lookback={lookback}, up_mult={up}, dn_mult={dn}, vol_method={vol}")
             except Exception as e:
                 # 記錄失敗組合（可以把 exception 和 traceback 寫 log）
@@ -532,7 +553,7 @@ def main():
 
     if best_params:
         lookback, up, dn, vol = best_params
-        print(f"Best avg_pnl: {best_pnl} with params: lookback={lookback}, up_mult={up}, dn_mult={dn}, vol_method={vol}")
+        print(f"Best avg_win_rate: {best_win_rate} with params: lookback={lookback}, up_mult={up}, dn_mult={dn}, vol_method={vol}")
 
 
 if __name__ == "__main__":
