@@ -40,5 +40,7 @@ database:
 # RF Settings
 rf_model:
   path: "app/models/default_model.pt" # Default model path
+  lookback: 108
+  features: ["open", "high", "low", "close", "volume"]
   # Specific models per pair/timeframe can be added here
   # "BTC/USDT_1h": "app/models/btc_usdt_1h_model.pt"
