@@ -1,7 +1,7 @@
 # ./app/config.yaml
 # --- 新增 exchange 區塊 ---
 exchange:
-  id: 'mexc'           # 交易所 ID，從 binance 改為 mexc
+  id: 'binance'           # 交易所 ID，從 binance 改為 mexc
   default_type: 'swap' # 市場類型，'spot' (現貨) 或 'swap' (永續合約)
 
 # System settings
@@ -14,13 +14,7 @@ schedule:
 # Available timeframes: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
 monitoring:
   - symbol: "BTC/USDT:USDT"
-    timeframes: ["1h", "4h"]
-  - symbol: "ETH/USDT:USDT"
-    timeframes: ["1h", "4h"]
-  - symbol: "SOL/USDT:USDT"
-    timeframes: ["1h", "4h"]
-  - symbol: "XRP/USDT:USDT"
-    timeframes: ["1h", "4h"]
+    timeframes: ["1h"]
 
 # Analysis parameters based on timeframe
 analysis_params:
@@ -29,7 +23,7 @@ analysis_params:
   "30m":
     klines_to_fetch: 48
   "1h":
-    klines_to_fetch: 36
+    klines_to_fetch: 108
   "4h":
     klines_to_fetch: 24
   # Default fallback
@@ -43,8 +37,8 @@ database:
     signals: "trade_signals"
     logs: "system_logs"
 
-# AI Model settings
-model:
+# RF Settings
+rf_model:
   path: "app/models/default_model.pt" # Default model path
   # Specific models per pair/timeframe can be added here
   # "BTC/USDT_1h": "app/models/btc_usdt_1h_model.pt"

@@ -13,6 +13,9 @@ from .data_collector import ExchangeDataCollector
 from .analysis import StrategyAnalyzer
 from .discord_bot import DiscordNotifier, DiscordLogHandler
 
+# RF Model
+from predictor import RFModelPredictor
+RF_MODEL = None
 # --- Globals and TZ setup are correct ---
 config = {}
 db_client = None
@@ -77,6 +80,12 @@ async def check_and_process():
                 analyzer = StrategyAnalyzer(df, symbol, timeframe)
                 signals = analyzer.analyze()
 
+                # Extend RF Model Prediction
+                if RF_MODEL and signals:
+                    # Model Prediction Logic Here
+                    # Batch Prediction
+                    pass
+
                 # --- 關鍵修正：將找到的訊號添加到總列表中，而不是立即處理 ---
                 if signals:
                     all_signals_in_run.extend(signals)
@@ -128,22 +137,28 @@ async def main():
     load_dotenv()
     load_config()
     
-    global data_collector, discord_notifier
+    global data_collector, discord_notifier, RF_MODEL
     
     try:
+        # Initialize RF Model Predictor
+        rf_config = config.get('rf_model', {})
+        RF_MODEL = RFModelPredictor(config=rf_config)
+        log.info("RF Model Predictor initialized.")
+        # Initialize Discord Notifier
         discord_notifier = DiscordNotifier()
         await discord_notifier.connect()
         log.info("Discord Notifier connected.")
         discord_log_handler = DiscordLogHandler(discord_notifier)
         add_discord_handler(discord_log_handler)
-
+        # Connect to Database
         connect_to_db()
-        
+        # Initialize Data Collector
         exchange_config = config.get('exchange', {})
         if not exchange_config:
             raise ValueError("Exchange configuration is missing in config.yaml")
         data_collector = ExchangeDataCollector(exchange_config)
-        
+        log.info("Data Collector initialized.")
+        # Setup Scheduler
         scheduler = AsyncIOScheduler(timezone='Asia/Taipei')
         cron_second = config.get('schedule', {}).get('cron_second', 5)
         # 使用 misfire_grace_time 確保即使系統短暫繁忙，錯過的任務也能被執行
