@@ -83,7 +83,6 @@ class XGBClassifierModel:
             tree_method=str(m.get("tree_method", "hist")),
             n_jobs=int(m.get("n_jobs", -1)),
             random_state=int(cfg.get("seed", 42)),
-            use_label_encoder=False,
             device=device,
         )
 

@@ -1,4 +1,4 @@
-# feature_select/run_vetting.py
+# feature_selection/statistics/rank_biserial/run_rank_biserial.py
 from __future__ import annotations
 from typing import Dict, Tuple
 import argparse
@@ -11,7 +11,7 @@ import pandas as pd
 from train.data.folds import FoldGenerator, split_fold_to_indices
 
 # 單變量評分器
-from feature_select.scorer import VetScorer
+from feature_selection.statistics.rank_biserial.scorer import VetScorer
 
 class EventData:
     """
@@ -230,6 +230,56 @@ def _diagnose(bars: pd.DataFrame, evt_df: pd.DataFrame, folds, feat_at_t0: pd.Da
     print("[debug] top non-NaN ratio features:\n", nnr)
 
 
+def _export_selected_features(cfg: Dict, selected_cols: list[str]) -> None:
+    """
+    1. 說明:
+        讀原始 precomputed CSV，取 selected_cols 的交集並輸出到指定路徑。
+        同時輸出欄名清單（若設定）。
+    """
+    if not selected_cols:
+        print("[feature_select] no rank-biserial selected features to export.")
+        return
+
+    paths = cfg.get("paths", {})
+    source_path = Path(paths["precomputed"])
+    if not source_path.exists():
+        print(f"[WARN] precomputed source not found: {source_path}")
+        return
+
+    df = pd.read_csv(source_path)
+    idx_cfg = cfg.get("index", {})
+    base_cols: list[str] = []
+    dt_col = idx_cfg.get("dt_col_precomputed")
+    for col in [dt_col, "datetime", "timestamp"]:
+        if col and col in df.columns and col not in base_cols:
+            base_cols.append(col)
+
+    keep_cols = [col for col in selected_cols if col in df.columns]
+    missing = sorted(set(selected_cols) - set(keep_cols))
+    if missing:
+        print(f"[WARN] missing {len(missing)} selected features in source CSV; skipped.")
+
+    if not keep_cols:
+        print("[feature_select] selected features not present in source CSV, nothing exported.")
+        return
+
+    selected_df = df[base_cols + keep_cols] if base_cols else df[keep_cols]
+
+    out_csv = paths.get("selected_feat_csv")
+    if out_csv:
+        out_path = Path(out_csv)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        selected_df.to_csv(out_path, index=False)
+        print(f"[feature_select] selected feature matrix saved → {out_path}")
+
+    cols_txt = paths.get("selected_feat_cols")
+    if cols_txt:
+        txt_path = Path(cols_txt)
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        txt_path.write_text("\n".join(keep_cols), encoding="utf-8")
+        print(f"[feature_select] selected feature list saved → {txt_path}")
+
+
 def main():
     """
     1. 說明:
@@ -300,12 +350,28 @@ def main():
     if len(out_df):
         print(out_df.head(20).round(4))
 
+        if "fdr_reject" in out_df.columns:
+            mask = out_df["fdr_reject"].astype(bool)
+            selected_cols = mask[mask].index.tolist()
+        else:
+            selected_cols = []
+
+        top_k = int(cfg.get("scoring", {}).get("top_k", 0))
+        if top_k > 0:
+            additional = out_df.index[:top_k].tolist()
+            selected_cols = list(dict.fromkeys(selected_cols + additional))
+
+        _export_selected_features(cfg, selected_cols)
+    else:
+        _export_selected_features(cfg, [])
+
 if __name__ == "__main__":
     main()
 
 """
 用法：
-python -m feature_select.run_vetting --side all --debug
+python feature_selection/statistics/rank_biserial/run_rank_biserial.py --side long --debug
+
 # 如 precomputed 的時間其實是台北本地時間，請在 YAML 設定：
 # index.tz_precomputed: "Asia/Taipei"
 """

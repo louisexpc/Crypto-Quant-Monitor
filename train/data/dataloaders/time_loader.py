@@ -36,8 +36,12 @@ def make_time_loaders_for_fold(
     ref_index = pd.DatetimeIndex(df.index)
 
     # 1) 取得特徵與標籤來源
-    feat_df = load_precomputed_features(path=cfg["data"]["path"]).astype(np.float32)
-    feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
+    feat_df = load_precomputed_features(path=cfg["data"]["path"], drop_ohlcv=False).astype(np.float32)
+
+    micro_cfg = (cfg.get("data", {}) or {}).get("micro", {})
+    if micro_cfg.get("enabled") and micro_cfg.get("path"):
+        micro_df = load_precomputed_features(path=micro_cfg["path"]).astype(np.float32)
+        feat_df = feat_df.join(micro_df, how="left")
 
     freq = (cfg.get("data", {}) or {}).get("freq")
     if freq and not feat_df.empty:
@@ -51,23 +55,28 @@ def make_time_loaders_for_fold(
     dfb = feat_df.loc[:, need].copy()
 
 
+    # 檢查 NaN
+    nan_rows = feat_df.isna().any(axis=1)
+    if nan_rows.any():
+        raise ValueError(f"[time_loader] 預算特徵尚含 NaN/Inf，請調整特徵匯出流程；例：{feat_df.index[nan_rows][:5].tolist()}")
+
     # 4) 產生 y（若快取有現成資料則使用）
     is_reg = (task_type == "regression")
     y_series = create_label(dfb, cfg, return_what=("reg" if is_reg else "cls"))
     y_series = y_series.reindex(feat_df.index)
+    if y_series.isna().any():
+        raise ValueError("[time_loader] 產生標籤後仍含 NaN，請調整標籤設定或資料。")
 
-    # 5) 清理 + CV 範圍 + 與 fold 對齊（沿用你現有邏輯）
-    feat_df = feat_df.replace([np.inf, -np.inf], np.nan)
-    keep = feat_df.notna().all(axis=1) & y_series.notna()
-    feat_df = feat_df.loc[keep]; y_series = y_series.loc[keep]
-
+    # 5) CV 範圍 + 與 fold 對齊（沿用你現有邏輯）
     cv_start = pd.Timestamp(cfg["cv"]["start_date"]).tz_localize("UTC")
     cv_end   = (pd.Timestamp(cfg["cv"]["end_date"]).tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1))
     mask = (feat_df.index >= cv_start) & (feat_df.index <= cv_end)
     feat_df = feat_df.loc[mask]; y_series = y_series.loc[mask]
 
     work = pd.concat([feat_df, y_series], axis=1)
-    feat_cols = list(feat_df.columns)
+    # 移除 OHLCV 後續僅保留特徵欄
+    feat_df = feat_df.drop(columns=[c for c in need if c in feat_df.columns])
+    feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
     target_col = target_col or ("y_reg" if is_reg else "y_cls")
 
     # 6) fold 對齊

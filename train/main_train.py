@@ -15,7 +15,6 @@ from pathlib import Path
 import optuna
 import pandas as pd
 import os
-import multiprocessing as mp 
 from train.pipeline.search.objective import objective
 from train.core.context import set_seed
 from train.core.config_loader import load_cfg
@@ -27,7 +26,6 @@ __all__ = [
     "prepare_dataframe",
     "build_study",
     "run_single",
-    "run_multi",
 ]
 
 
@@ -55,8 +53,7 @@ def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.S
     study_name = cfg["project_name"]
 
     # --- SQLite URI with timeout for concurrency ---
-    mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
-    sqlite_timeout = int(mg.get("sqlite_timeout_sec", 120))
+    sqlite_timeout = int(cfg.get("search", {}).get("sqlite_timeout_sec", 120))
     db_uri = f"sqlite:///{(run_dir / 'study.db').as_posix()}?timeout={sqlite_timeout}"
 
     # --- Sampler: 平行建議 constant_liar=True ---
@@ -87,7 +84,7 @@ def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.S
 # ======================================================================
 # Section D. 執行訓練與搜尋
 # ======================================================================
-def run_single(cfg_path: str, *, worker_tag: str | None = None, cfg: dict | None = None):
+def run_single(cfg_path: str, *, cfg: dict | None = None):
     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
     cfg = cfg or load_cfg(cfg_path)
     set_seed(int(cfg.get("seed", 42)))
@@ -96,15 +93,11 @@ def run_single(cfg_path: str, *, worker_tag: str | None = None, cfg: dict | None
     run_dir = Path("runs") / cfg.get("project_name", "exp")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # 將 worker_tag 寫入環境變數（objective.py 會用來決定 trial 子資料夾）
-    if worker_tag:
-        os.environ["WORKER_TAG"] = str(worker_tag)
-
     # 3) 準備資料
     df = prepare_dataframe(cfg)
 
     # 4) 建立 Study（parallel=True 時 sampler 會開 constant_liar）
-    study = build_study(cfg, run_dir, parallel=bool(worker_tag))
+    study = build_study(cfg, run_dir, parallel=False)
 
     # 5) 搜尋
     n_trials = int(cfg["search"]["n_trials"])
@@ -113,34 +106,11 @@ def run_single(cfg_path: str, *, worker_tag: str | None = None, cfg: dict | None
         lambda t: objective(t, cfg, df, run_dir),
         n_trials=n_trials,
         timeout=time_hour * 60 * 60,
-        show_progress_bar=not bool(worker_tag)  # worker 不顯示進度條，避免互相干擾
+        show_progress_bar=True
     )
 
     print("Best hyperparameters:", study.best_trial.params)
     print(f"Best `{cfg['objective']['primary_metric']}` ({cfg['objective']['direction']}): {study.best_value:.6g}")
-
-def _worker_entry(cfg_path: str, gpu_id: int):
-    # 每個進程只看到自己那張卡，且標上 worker_tag
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    worker_tag = f"gpu{gpu_id}"
-    # 建議用 spawn（WSL/CUDA 友好）
-    run_single(cfg_path, worker_tag=worker_tag)
-
-def run_multi(cfg_path: str, *, cfg: dict | None = None):
-    cfg = cfg or load_cfg(cfg_path)
-    mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
-    gpu_ids = list(mg.get("gpu_ids", [0, 1]))
-    assert len(gpu_ids) >= 2, "multi_gpu.enabled=true 但 gpu_ids 少於 2"
-
-    mp.set_start_method("spawn", force=True)
-    procs = []
-    for gid in gpu_ids:
-        p = mp.Process(target=_worker_entry, args=(cfg_path, int(gid)), daemon=False)
-        p.start()
-        procs.append(p)
-    for p in procs:
-        p.join()
 
 # ======================================================================
 # Section E. 入口
@@ -148,8 +118,4 @@ def run_multi(cfg_path: str, *, cfg: dict | None = None):
 if __name__ == "__main__":
     cfg_path = "train/config.yaml"
     cfg = load_cfg(cfg_path)
-    mg = cfg.get("search", {}).get("multi_gpu", {}) or {}
-    if mg.get("enabled", False):
-        run_multi(cfg_path, cfg=cfg)
-    else:
-        run_single(cfg_path, cfg=cfg)
+    run_single(cfg_path, cfg=cfg)
