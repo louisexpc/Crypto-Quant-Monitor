@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import precision_recall_fscore_support, matthews_corrcoef, confusion_matrix
 
 # 專案內部匯入
-from train.data.column_plan import select_plan_columns
 from train.data.folds import split_fold_to_indices
 from train.data.scalers import _get_scaler, ColumnSubsetScaler, pick_cols_to_scale
 from train.data.dataset.event_dataset import EventDataset
@@ -272,50 +271,24 @@ def export_tbm_predictions_for_trial(
         feat_cols_current = feat_cols_all
 
         result = result or {}
-        if model_ref is None:
-            print(f"[tbm_exporter][warn] fold {fold_idx} has no model reference; skip.")
-            continue
-        if isinstance(model_ref, dict) and model_ref.get("type") == "checkpoint":
-            rel_path = Path(model_ref.get("path", ""))
-            if trial_dir_path is None:
-                raise ValueError("[tbm_exporter] trial_dir must be provided when using relative checkpoint paths.")
-            model_path = trial_dir_path / rel_path
-            if not model_path.exists():
-                raise FileNotFoundError(f"[tbm_exporter] fold {fold_idx} model checkpoint not found: {model_path}")
-            loaded_checkpoint = torch.load(model_path, map_location="cpu")
-            state_dict = loaded_checkpoint.get("state_dict", loaded_checkpoint)
-            ckpt_cols = loaded_checkpoint.get("feature_columns") or result.get("_feature_columns")
-            if ckpt_cols:
-                feat_cols_current = [c for c in ckpt_cols if c in feat_df.columns]
-                if not feat_cols_current:
-                    raise ValueError(f"[tbm_exporter] checkpoint columns missing in feature DF for fold {fold_idx}")
-            model = build_model(cfg, len(feat_cols_current), feat_cols_current)
-            model.load_state_dict(state_dict)
-        elif isinstance(model_ref, (str, os.PathLike, Path)):
-            model_path = Path(model_ref)
-            if not model_path.exists() and trial_dir_path is not None:
-                tail = Path(*model_path.parts[-2:]) if len(model_path.parts) >= 2 else Path(model_path.name)
-                alt_path = trial_dir_path / tail
-                if alt_path.exists():
-                    model_path = alt_path
-            if not model_path.exists():
-                raise FileNotFoundError(f"[tbm_exporter] fold {fold_idx} model checkpoint not found: {model_path}")
-            loaded_checkpoint = torch.load(model_path, map_location="cpu")
-            state_dict = loaded_checkpoint.get("state_dict", loaded_checkpoint)
-            ckpt_cols = loaded_checkpoint.get("feature_columns") or result.get("_feature_columns")
-            if ckpt_cols:
-                feat_cols_current = [c for c in ckpt_cols if c in feat_df.columns]
-                if not feat_cols_current:
-                    raise ValueError(f"[tbm_exporter] checkpoint columns missing in feature DF for fold {fold_idx}")
-            model = build_model(cfg, len(feat_cols_current), feat_cols_current)
-            model.load_state_dict(state_dict)
+        checkpoint_path = _resolve_checkpoint_path(model_ref, trial_dir_path, fold_idx)
+        if checkpoint_path is not None:
+            model, feat_cols_current = _load_model_from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                cfg=cfg,
+                feat_df=feat_df,
+                default_cols=feat_cols_current,
+                result=result,
+                fold_idx=fold_idx,
+            )
         elif hasattr(model_ref, "state_dict"):
             model = model_ref
             ckpt_cols = result.get("_feature_columns")
             if ckpt_cols:
                 feat_cols_current = [c for c in ckpt_cols if c in feat_df.columns]
         else:
-            raise TypeError(f"[tbm_exporter] unsupported model reference type: {type(model_ref)}")
+            print(f"[tbm_exporter][warn] fold {fold_idx} has no usable model reference; skip.")
+            continue
 
         # 1) split：決定 scaler 擬合窗口（train）
         df_idx = pd.DataFrame(index=pd.DatetimeIndex(df_index))

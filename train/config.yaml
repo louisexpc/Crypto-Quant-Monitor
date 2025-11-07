@@ -186,7 +186,7 @@ objective:
 
 # 3. search 次數 | 時長
 search:
-  n_trials: 10
+  n_trials: 1
   timeout: 10    # 小時
   sampler: tpe
   pruner: median
