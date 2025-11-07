@@ -1,0 +1,354 @@
+# data:
+#   path: data/FNG/btcusdt_15m_with_fng_with_flat_1m.csv
+#   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
+#   freq: "15min"                    # 供缺口提醒（不會自動補齊）
+#   columns:
+#     time: ["datetime", "timestamp"]
+#     ohlcv: ["open","high","low","close","volume"]
+
+#   # 吃1-min的
+#   micro:
+#     enabled: true
+#     window_len: 15                # 每根 15min bar 對應過去 15 個 1min    
+
+
+# export:
+#   out: data/precomputed/btcusdt_15m_features_VBT.csv      # 輸出路徑 (.parquet 或 .csv)
+#   nan_policy: "linear_interp"   # drop | linear_interp | none
+
+
+# features:
+#   dropna: false
+#   include_passthrough: false
+
+#   plan:
+#     features:
+#       # ===================== Group: ohlcv（原始） =====================
+#       - { name: OPEN,   kwargs: {}, enabled: true }     # 開盤價（原始特徵）
+#       - { name: HIGH,   kwargs: {}, enabled: true }     # 最高價（原始特徵）
+#       - { name: LOW,    kwargs: {}, enabled: true }     # 最低價（原始特徵）
+#       - { name: CLOSE,  kwargs: {}, enabled: true }     # 收盤價（原始特徵）
+#       - { name: VOLUME, kwargs: {}, enabled: true }     # 成交量（原始特徵）
+
+#       # ===================== Group: volume（原始成交量與量能指標） =====================      
+#       - { name: PVO,    kwargs: { fast: 12, slow: 26, signal: 9 }, enabled: true } # 量的 MACD（量能動能）
+#       - { name: PVO,    kwargs: { fast: 4,  slow: 12, signal: 6 }, enabled: true }
+#       - { name: PVR,    kwargs: {}, enabled: true  }                                # 價量比率（price-volume ratio）
+#       - { name: BOP,    kwargs: {}, enabled: true  }                                # 買方/賣方力量（Body 對區間）
+
+#       # ===================== Group: trend（趨勢/均線/去趨勢） =====================
+#       - { name: SLOPE,     kwargs: { length: [4, 8, 6] }, enabled: true, flip: true }              # 收盤價線性回歸斜率（近端趨勢）
+#       - { name: TTM_TRND,  kwargs: { length: 6 }, enabled: true, flip: true }              # TTM 趨勢過濾
+#       - { name: DPO,       kwargs: { length: [8, 16] }, enabled: true }             # 去趨勢震盪器（移除長期趨勢）
+#       - { name: AMATE_LR,  kwargs: { fast: 8, slow: 21, mamode: 2 }, enabled: true }  # AMAT 長週期線（趨勢通道）
+
+#       # —— 均線/動能（只輸出 sign：-1/0/1）——
+#       - { name: SMA,  kwargs: { length: 50, sign: false }, enabled: true }       # 簡單均線；sign=收盤相對 SMA 的方向
+#       - { name: EMA,  kwargs: { length: [4, 8, 16], sign: false }, enabled: true }       # 指數均線；較敏感；sign 同上
+#       - { name: TEMA, kwargs: { length: 16, sign: false }, enabled: true }       # 三重 EMA；更平滑、延遲更低；sign 同上
+#       - { name: MACD, kwargs: { fast: 12, slow: 26, signal: 9, sign: false }, enabled: true } # MACD 動能；sign=主線相對訊號線
+#       - { name: MACD, kwargs: { fast: 4,  slow: 12, signal: 6, sign: false }, enabled: true }
+
+#       # ===================== Group: momentum / oscillator（動能/震盪） =====================
+#       - { name: RSI,   kwargs: { length: 4 },  enabled: true, flip: true }
+#       - { name: RSI,   kwargs: { length: 8 },  enabled: true, flip: true }
+#       - { name: RSI,   kwargs: { length: 14 }, enabled: true, flip: true }
+#       - { name: RSI,   kwargs: { length: 28 }, enabled: true, flip: true }
+
+#       - { name: MOM,   kwargs: { length: 30 }, enabled: true  }                 # 價格動量
+#       - { name: STOCH, kwargs: { k: 16,  d: 3, smooth_k: 3 }, enabled: true }  # 隨機指標 %K/%D（短期）
+#       - { name: STOCH, kwargs: { k: 32, d: 3, smooth_k: 3 }, enabled: true }  # 隨機指標（更長期）
+#       - { name: KDJ,   kwargs: { k: 9, d: 3, smooth_k: 3 }, enabled: true }    # KDJ 的 J 線（放大動能）
+#       - { name: RVI,   kwargs: { length: 14 }, enabled: true }                 # 相對活力指標
+#       - { name: WILLR, kwargs: { length: 14 }, enabled: true }                 # 威廉指標（區間位置）
+#       - { name: UO,    kwargs: { fast: 7, medium: 14, slow: 28 }, enabled: true } # 統一動量（多尺度結合）
+#       - { name: CCI,   kwargs: { length: 14, c: 0.015 }, enabled: true, flip: true }       # 商品通道（偏離均值）
+#       - { name: ZS,    kwargs: { length: 30 }, enabled: true, flip: true }                 # 滾動 Z 分數（標準化偏離）
+
+#       # ===================== Group: volatility（波動/區間） =====================
+#       - { name: TRUERANGE, kwargs: {}, enabled: true  }                         # 單期真實區間（HL 與跳空）
+#       - { name: ATR,       kwargs: { length: 14, pct: true }, enabled: true, flip: true }   # 平均真實波動；pct=相對收盤比例
+#       - { name: ATR,    kwargs: { length: 28, pct: true }, enabled: true, flip: true }
+#       - { name: RANGE,  kwargs: { window: 16, pct: true }, enabled: true, flip: true } # HL 區間的滾動均值；pct=相對收盤
+#       - { name: RANGE,  kwargs: { window: 32, pct: true }, enabled: true, flip: true }
+#       - { name: MASSI,     kwargs: { fast: 9, slow: 25 }, enabled: true }      # Mass Index（高低擴張）
+#       - { name: BBP,       kwargs: { length: 16, std: 2.0 }, enabled: true }    # 布林通道百分位位置
+#       - { name: EWMRET,    kwargs: { halflife: [4,12,48] }, enabled: true, flip: true }     # logret 的 EWM 均值/標準差（波動/漂移）
+
+#       # ===================== Group: price_volume（價量交互） =====================
+#       - { name: PXVOL, kwargs: {}, enabled: true }                              # 方向強度、logret×量變、方向×量
+
+#       # ===================== Group: returns（報酬） =====================
+#       - { name: LOGRET, kwargs: { lags: [3], pct: true }, enabled: true, flip: true } # 多期簡單報酬（%），含短中期
+
+#       # ===================== Group: time（時間週期） =====================
+#       - { name: TIME_CYC, kwargs: { tz: "Asia/Taipei", daily: true, weekly: true }, enabled: true } # 日內/週期 sin/cos
+
+#       # ===================== Group: funding rate（資金費率） =====================
+#       - { name: FOUND, kwargs: {}, enabled: false }                                 # 每 8 小時資金費率，可作為散戶情緒 proxy
+
+#       # ===================== Group: Sentiment index（15分鐘子訊號） =====================
+#       - { name: FNG_IDX, kwargs: {}, enabled: true }    
+
+#       # A) vectorbt：一次把多個指標 + 參數網格產出
+#       - name: VBT
+#         enabled: true
+#         kwargs:
+#           all: true                 # 掃描整個庫
+#           lib: "pandas_ta"         # 也可改 "ta" 或 "talib"
+#           exclude: ["*matrix*", "*ichimoku*", "*kama*", "*wave*", "*aroon*", "*psar*", "*vwap*"]
+#           # 針對少數指標做參數網格
+#           per_params:
+#             rsi:    { length: [7, 14, 28, 56] }
+#             bbands: { length: [20, 40], std: [1.5, 2.0] }
+#             ema:    { length: [5, 12, 26, 50, 100, 200] }
+#             sma:    { length: [5, 12, 26, 50, 100, 200] }
+#             macd:   { fast: [12], slow: [26], signal: [9] }  # 可再加變體
+#           max_indicators: null        # 保險上限（先小後大）
+
+#       # ---------- vbt：`ta` 套件（選擇性，想加再打開） ----------
+#       - name: VBT
+#         enabled: true              # 先關掉，跑得動再開
+#         kwargs:
+#           all: true
+#           lib: "ta"
+#           include: ["*"]            # 全抓
+#           exclude: ["*ichimoku*", "*volume_profile*", "*matrix*"]
+#           max_indicators: 200
+
+#       # ---------- vbt：TA-Lib（需先安裝 TA-Lib 再開） ----------
+#       - name: VBT
+#         enabled: true              # 需系統裝 TA-Lib；沒裝先關
+#         kwargs:
+#           all: true
+#           lib: "talib"
+#           include: ["*"]
+#           exclude: ["*MAMA*", "*HT_*"]   # Hilbert 族群常產生多欄且慢
+#           max_indicators: 200
+
+#       # ---------- Nixtla tsfeatures：多窗抽取 ----------
+#       - name: TSF
+#         enabled: false
+#         kwargs:
+#           targets:
+#             - name: "close"          # 只能放你 df 真的有的欄位
+#               transform: "logret"    # raw|logret|pct
+#               windows: ["6h", "12h", "1d"]  # 15m K 建議先別太長
+#             - name: "volume"
+#               transform: "raw"
+#               windows: ["1d"]
+#           tsf_params:
+#             freq: 96                 # 15m 的日季節長度=24*4
+
+#       - alpha:
+#         enabled: false
+#         paths:
+#           # - data/alpha/pnl/best_evolved_alpha_from_predefined_1.json
+#           # - data/alpha/pnl/best_evolved_alpha_from_predefined_2.json
+#           # - data/alpha/pnl/best_evolved_alpha_from_predefined_3.json
+#           # - data/alpha/pnl/best_evolved_alpha_from_predefined_5.json
+          
+
+
+#   min_trade_feat: 
+#     - "imbalance"
+#     - "buy_ratio"
+#     - "buy_count_ratio"
+#     - "price_mean"
+#     - "price_vwap"
+#     - "price_max"
+#     - "trend_slope"
+
+
+
+# ============================================
+# 15m → 1h 預測導向的特徵配置（BTCUSDT, U 本位）
+# 版本說明：
+# - 以 15 分鐘 K 線為基準尺（bar=15m），目標是對 1 小時視窗的方向/幅度預測提供訊號。
+# - 三層時間金字塔：快(1–3 bar=15–45m)、中(4–16 bar=1–4h)、慢(24–96 bar=6–24h)。
+# - 盡量選 4/8/16/32/64/96 等規整窗長，穩定且便於特徵篩選。
+# - 嚴格因果：rolling/z-score/均線等一律只用過去資料（窗口結尾在 t−1）。
+#   （實作時請在建模前對整個 X 再統一 shift(+1) 以避免偷看未來）
+# ============================================
+
+data:
+  # ------------------------------------------------
+  # 原始資料輸入（含 15m K 線與 1m 微結構）
+  # ------------------------------------------------
+  path: data/FNG/btcusdt_15m_with_fng_with_flat_1m.csv
+  index_col: timestamp            # 可為 "timestamp" 或 "datetime"；需與原檔一致
+  freq: "15min"                   # 用於缺口提示（不自動補齊；補齊請在前處理階段做）
+
+  columns:
+    time: ["datetime", "timestamp"]
+    ohlcv: ["open", "high", "low", "close", "volume"]
+
+  micro:                           # 1 分鐘微結構子訊號（供 15m bar 聚合）
+    enabled: true
+    window_len: 15                 # 每根 15m bar 對應過去 15 根的 1m 視窗（嚴格使用 t-1 以前）
+
+export:
+  # ------------------------------------------------
+  # 輸出設定
+  # ------------------------------------------------
+  out: data/precomputed/btcusdt_15m_features_VBT.csv   # 支援 .parquet 或 .csv
+  nan_policy: "linear_interp"                          # 缺值策略：drop | linear_interp | none
+  # 注意：rolling 造成的前置 NaN 請在建模前統一處理（並 shift(+1) 保因果）
+
+features:
+  # ------------------------------------------------
+  # 全域旗標
+  # ------------------------------------------------
+  dropna: false                  # 此處不硬砍；交由 nan_policy 與訓練前清洗處理
+  include_passthrough: false     # 是否把原始欄位（open/high/low/close/volume 等）直通到輸出
+
+  plan:
+    # ------------------------------------------------
+    # 特徵清單（以 15m 為 bar）
+    # ------------------------------------------------
+    features:
+
+      # ===================== Group: ohlcv（原始） =====================
+      - { name: OPEN,   kwargs: {}, enabled: true }     # 開盤價（可與 returns/變化率搭配）
+      - { name: HIGH,   kwargs: {}, enabled: true }     # 最高價
+      - { name: LOW,    kwargs: {}, enabled: true }     # 最低價
+      - { name: CLOSE,  kwargs: {}, enabled: true }     # 收盤價
+      - { name: VOLUME, kwargs: {}, enabled: true }     # 成交量
+
+      # ===================== Group: volume（原始成交量與量能指標） =====================
+      - { name: PVO, kwargs: { fast: 12, slow: 26, signal: 9 }, enabled: true }   # 量版 MACD（標準）
+      - { name: PVO, kwargs: { fast: 4,  slow: 12, signal: 6 }, enabled: true }   # 量版 MACD（加速，貼 1–3h）
+      - { name: PVR, kwargs: {}, enabled: true }                                  # 價量比
+      - { name: BOP, kwargs: {}, enabled: true }                                  # 買賣力（Body/高低區間）
+
+      # ===================== Group: trend（趨勢/均線/去趨勢） =====================
+      - { name: SLOPE,     kwargs: { length: [4, 8, 16] }, enabled: true, flip: true }  # 線性回歸斜率（~1h/2h/4h）
+      - { name: TTM_TRND,  kwargs: { length: 6 },  enabled: true, flip: true }          # TTM 趨勢過濾（~1.5h）
+      - { name: TTM_TRND,  kwargs: { length: 8 },  enabled: true, flip: true }          # 再加一個 8（~2h）
+      - { name: DPO,       kwargs: { length: [8, 16] }, enabled: true }                 # 去趨勢震盪（2h/4h）
+      - { name: AMATE_LR,  kwargs: { fast: 8, slow: 21, mamode: 2 }, enabled: true }    # 趨勢通道（慢尺度）
+
+      # —— 均線/動能（sign=false：輸出數值；如需方向請於下游處理）——
+      - { name: EMA,  kwargs: { length: [4, 8, 16], sign: false }, enabled: true }       # 1h/2h/4h EMA
+      - { name: TEMA, kwargs: { length: 16, sign: false }, enabled: true }               # 三重 EMA，低延遲
+      - { name: MACD, kwargs: { fast: 12, slow: 26, signal: 9, sign: false }, enabled: true }   # 標準 MACD
+      - { name: MACD, kwargs: { fast: 4,  slow: 12, signal: 6, sign: false }, enabled: true }   # 加速 MACD（貼 1–3h）
+
+      # ===================== Group: momentum / oscillator（動能/震盪） =====================
+      - { name: RSI,   kwargs: { length: 4 },  enabled: true, flip: true }         # 快 RSI（~1h）
+      - { name: RSI,   kwargs: { length: 8 },  enabled: true, flip: true }         # 中 RSI（~2h）
+      - { name: RSI,   kwargs: { length: 14 }, enabled: true, flip: true }         # 經典 RSI
+      - { name: RSI,   kwargs: { length: 28 }, enabled: true, flip: true }         # 慢 RSI（~7h）
+
+      - { name: MOM,   kwargs: { length: [4, 8, 16] }, enabled: true }             # 價格動量（1h/2h/4h）
+      - { name: STOCH, kwargs: { k: 16, d: 3, smooth_k: 3 }, enabled: true }       # 隨機指標（~4h 視窗）
+      - { name: STOCH, kwargs: { k: 32, d: 3, smooth_k: 3 }, enabled: true }       # 隨機指標（~8h）
+      - { name: KDJ,   kwargs: { k: 9, d: 3, smooth_k: 3 }, enabled: true }        # KDJ（快指標）
+      - { name: RVI,   kwargs: { length: 14 }, enabled: true }                     # 相對活力
+      - { name: WILLR, kwargs: { length: 14 }, enabled: true }                     # 威廉區間位置
+      - { name: UO,    kwargs: { fast: 7, medium: 14, slow: 28 }, enabled: true }  # 多時間尺度動量融合
+      - { name: CCI,   kwargs: { length: 14, c: 0.015 }, enabled: true, flip: true }     # 偏離均值
+      - { name: CCI,   kwargs: { length: 28, c: 0.015 }, enabled: true, flip: true }
+      - { name: ZS,    kwargs: { length: [8, 32, 96] }, enabled: true, flip: true }      # 滾動 z 分數（2h/8h/1d；96 當 regime）
+
+      # ===================== Group: volatility（波動/區間） =====================
+      - { name: TRUERANGE, kwargs: {}, enabled: true }                           # 單期真實區間
+      - { name: ATR,       kwargs: { length: 14, pct: true }, enabled: true, flip: true }  # 平均真實波動（相對 close）
+      - { name: ATR,       kwargs: { length: 28, pct: true }, enabled: true, flip: true }
+      - { name: RANGE,     kwargs: { window: 16, pct: true }, enabled: true, flip: true }  # HL 區間均值
+      - { name: RANGE,     kwargs: { window: 32, pct: true }, enabled: true, flip: true }
+      - { name: MASSI,     kwargs: { fast: 9, slow: 25 }, enabled: true }                  # 高低擴張
+      - { name: BBP,       kwargs: { length: 16, std: 2.0 }, enabled: true }               # 布林通道百分位
+      - { name: EWMRET,    kwargs: { halflife: [4, 12, 48] }, enabled: true, flip: true }  # logret 的 EWM 均值/波動
+
+      # ===================== Group: price_volume（價量交互） =====================
+      - { name: PXVOL, kwargs: {}, enabled: true }                              # 方向強度、ret×量變等衍生
+
+      # ===================== Group: returns（報酬） =====================
+      - { name: LOGRET, kwargs: { lags: [1, 4, 8, 16], pct: true }, enabled: true, flip: true }
+        # lags：15m / 1h / 2h / 4h；pct=true 代表簡單報酬（%）
+        # 註：若使用 log 報酬，請統一在 preprocess 端處理並對應欄位
+
+      # ===================== Group: time（時間週期） =====================
+      - { name: TIME_CYC, kwargs: { tz: "Asia/Taipei", daily: true, weekly: true }, enabled: true }
+        # 週期編碼：建議同時輸出 hour_of_day 的 sin/cos（實作於指標庫內）
+
+      # ===================== Group: funding rate（資金費率） =====================
+      - { name: FOUND, kwargs: { ema_halflife: 8 }, enabled: false }
+        # 幣安合約資金費率（8h 結算）；以 HL=8 的 EWM 平滑，貼近 1–4h 訊號
+
+      # ===================== Group: Sentiment index（恐懼貪婪） =====================
+      - { name: FNG_IDX,      kwargs: {},          enabled: true }     # 原始 FNG
+
+      # ===================== Group: VBT（vectorbt 指標掃描；建議先只開 pandas_ta） =====================
+      - name: VBT
+        enabled: true
+        kwargs:
+          all: true
+          lib: "pandas_ta"     # 也可改 "ta" 或 "talib"（下方先關閉）
+          # 排除輸出巨大或多輸入難匹配的族群，避免記憶體爆炸
+          exclude: ["*matrix*", "*ichimoku*", "*kama*", "*wave*", "*aroon*", "*psar*", "*vwap*"]
+          # 對少數常用指標做參數網格（其餘走預設）
+          per_params:
+            rsi:    { length: [7, 14, 28] }
+            bbands: { length: [20, 40], std: [1.5, 2.0] }
+            ema:    { length: [5, 12, 26, 50, 100] }
+            sma:    { length: [5, 12, 26, 50, 100] }
+            macd:   { fast: [12], slow: [26], signal: [9] }
+          max_indicators: 300   # 上限保險（請視記憶體調整）
+
+      # ---------- vbt：`ta` 套件（選擇性；先關，穩定後再逐步打開） ----------
+      - name: VBT
+        enabled: false
+        kwargs:
+          all: true
+          lib: "ta"
+          include: ["*"]
+          exclude: ["*ichimoku*", "*volume_profile*", "*matrix*"]
+          max_indicators: 200
+
+      # ---------- vbt：TA-Lib（需系統安裝 TA-Lib；先關） ----------
+      - name: VBT
+        enabled: false
+        kwargs:
+          all: true
+          lib: "talib"
+          include: ["*"]
+          exclude: ["*MAMA*", "*HT_*"]   # Hilbert 族群常產生多欄且較慢
+          max_indicators: 200
+
+      # ---------- Nixtla tsfeatures（多窗抽取；對 1h 先保守，預設關） ----------
+      - name: TSF
+        enabled: false
+        kwargs:
+          targets:
+            - name: "close"           # 必須存在於 df
+              transform: "logret"     # raw|logret|pct
+              windows: ["6h", "12h", "1d"]  # 先用中短窗；太長會稀釋 1h 訊號
+            - name: "volume"
+              transform: "raw"
+              windows: ["1d"]
+          tsf_params:
+            freq: 96                  # 15m 的日季節長度=24*4
+
+      # ---------- 自定義 alpha（選擇性；預設關） ----------
+      - alpha:
+        enabled: false
+        paths:
+          # - data/alpha/pnl/best_evolved_alpha_from_predefined_1.json
+          # - data/alpha/pnl/best_evolved_alpha_from_predefined_2.json
+          # - data/alpha/pnl/best_evolved_alpha_from_predefined_3.json
+          # - data/alpha/pnl/best_evolved_alpha_from_predefined_5.json
+
+  # ------------------------------------------------
+  # 1 分鐘 micro-trade 特徵白名單（若有 1m→15m 聚合器）
+  # 實作端請以「僅用 t-1 以前的 1m 資料」聚合，避免因果違反。
+  # ------------------------------------------------
+  min_trade_feat:
+    - "imbalance"
+    - "buy_ratio"
+    - "buy_count_ratio"
+    - "price_mean"
+    - "price_vwap"
+    - "price_max"
+    - "trend_slope"

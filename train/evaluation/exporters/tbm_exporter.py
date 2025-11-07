@@ -1,20 +1,66 @@
 # export_tbm_pred.py
 from __future__ import annotations
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 from collections import defaultdict
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from torch import amp
-import sys, os
+import os
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_recall_fscore_support, matthews_corrcoef, confusion_matrix
 
 # 專案內部匯入
-from train.data.column_plan import select_plan_columns
 from train.data.folds import split_fold_to_indices
 from train.data.scalers import _get_scaler, ColumnSubsetScaler, pick_cols_to_scale
 from train.data.dataset.event_dataset import EventDataset
 from train.data.dataloaders.base import load_precomputed_features, align_times, ensure_utc_index
+from train.models.model_factory import build_model
+
+
+def _resolve_checkpoint_path(model_ref: Any, trial_dir: Optional[Path], fold_idx: int) -> Optional[Path]:
+    """Return absolute checkpoint path if model_ref points to a saved file."""
+    if isinstance(model_ref, dict):
+        model_ref = model_ref.get("path")
+    if model_ref is None:
+        return None
+    if isinstance(model_ref, (str, os.PathLike, Path)):
+        path = Path(model_ref)
+        if not path.is_absolute() and trial_dir is not None:
+            path = (trial_dir / path).resolve()
+        if not path.exists() and trial_dir is not None:
+            tail = Path(*path.parts[-2:]) if len(path.parts) >= 2 else Path(path.name)
+            alt = trial_dir / tail
+            if alt.exists():
+                path = alt
+        if not path.exists():
+            raise FileNotFoundError(f"[tbm_exporter] fold {fold_idx} checkpoint not found: {path}")
+        return path
+    return None
+
+
+def _load_model_from_checkpoint(
+    *,
+    checkpoint_path: Path,
+    cfg: Dict,
+    feat_df: pd.DataFrame,
+    default_cols: List[str],
+    result: Dict,
+    fold_idx: int,
+):
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = ckpt.get("state_dict", ckpt)
+    ckpt_cols = ckpt.get("feature_columns") or result.get("_feature_columns")
+    feat_cols_current = default_cols
+    if ckpt_cols:
+        feat_cols_current = [c for c in ckpt_cols if c in feat_df.columns]
+        if not feat_cols_current:
+            raise ValueError(f"[tbm_exporter] fold {fold_idx} checkpoint columns missing in feature DF")
+    model = build_model(cfg, len(feat_cols_current), feat_cols_current)
+    model.load_state_dict(state_dict)
+    return model, feat_cols_current
 
 def collapse_mask(result: dict) -> bool:
     """
@@ -66,7 +112,8 @@ def export_tbm_predictions_for_trial(
     cfg: Dict,
     df_index: pd.DatetimeIndex,
     folds: List[Dict],
-    fold_models: List[Tuple[torch.nn.Module, Dict, Dict]],  # (model, fold_dict, result)
+    fold_models: List[Tuple[Any, Dict, Dict]],  # (model/checkpoint, fold_dict, result)
+    trial_dir: str | Path | None = None,
     date_start: str,
     date_end: str,
     src_tbm_csv_path: str | None = None,
@@ -91,7 +138,7 @@ def export_tbm_predictions_for_trial(
        - cfg: Dict                 統一配置（資料/特徵/序列/scaler/AMP/裝置等）
        - df_index: DatetimeIndex   原始全域時間索引（決定 fold split 的索引基準）
        - folds: List[Dict]         每個 fold 的 split 定義（傳給 split_fold_to_indices）
-       - fold_models: List[Tuple(model, fold_dict, result)]  模型與對應 fold 訓練結果（含 best_val_thresh/temperature）
+       - fold_models: List[Tuple(model_ref, fold_dict, result)]  模型或 checkpoint 路徑與對應 fold 訓練結果（含 best_val_thresh/temperature）
        - date_start/date_end: str  推論期間（將轉為 UTC）
        - src_tbm_csv_path: str|None  TBM 來源 CSV（不給則用 cfg["label"]["tbm_csv_path"]）
        - save_to_path: str|None    輸出 CSV 路徑（不給則用來源檔名 + 區間字尾）
@@ -103,7 +150,9 @@ def export_tbm_predictions_for_trial(
     """
     assert cfg["task"]["type"] == "classification", "目前僅支援分類任務的匯出"
 
-    device = "cuda" if (torch.cuda.is_available() and str(cfg.get("device", "cuda")) == "cuda") else "cpu"
+    device = str(cfg.get("device", "cuda")).lower()
+    use_cuda = device.startswith("cuda")
+    trial_dir_path: Optional[Path] = Path(trial_dir) if trial_dir is not None else None
 
     # AMP 選擇
     dtype = None
@@ -114,12 +163,21 @@ def export_tbm_predictions_for_trial(
         elif kind in {"bf16", "bfloat16"}:
             dtype = torch.bfloat16
         else:
-            if device == "cuda":
+            if use_cuda:
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
     # ---- features ----
     feat_df = load_precomputed_features(path=str(cfg["data"]["path"])).astype(np.float32)
-    feat_cols = [c for c in feat_df.columns]
+
+    micro_cfg = (cfg.get("data", {}) or {}).get("micro", {})
+    if micro_cfg.get("enabled") and micro_cfg.get("path"):
+        micro_df = load_precomputed_features(path=str(micro_cfg["path"])).astype(np.float32)
+        feat_df = feat_df.join(micro_df, how="left")
+        if feat_df.isna().any().any():
+            raise ValueError("[tbm_exporter] Joined micro features still contain NaN/Inf. Please sanitize upstream.")
+
+    feat_cols_all = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
+    feat_df = feat_df.loc[:, feat_cols_all].astype(np.float32, copy=False)
     idx_all = pd.DatetimeIndex(feat_df.index)  # UTC, sorted
 
     # ---- TBM (完整表，保留為輸出底稿) ----
@@ -155,7 +213,9 @@ def export_tbm_predictions_for_trial(
     else:
         mask_side = side_i.isin([1, -1])  # both
 
-    mask_date = (t0u_all >= pd.Timestamp(date_start, tz="UTC")) & (t0u_all <= pd.Timestamp(date_end, tz="UTC"))
+    ts_start = pd.Timestamp(date_start, tz="UTC")
+    ts_end = pd.Timestamp(date_end, tz="UTC")
+    mask_date = (t0u_all >= ts_start) & (t0u_all <= ts_end)
 
     tbm_sel = tbm_all.loc[mask_side & mask_date].copy()
     t0u_sel = t0u_all[mask_side & mask_date]
@@ -204,9 +264,31 @@ def export_tbm_predictions_for_trial(
 
     fold_models = _kept
 
-    for fold_idx, (model, fold_d, result) in enumerate(fold_models):
+    for fold_idx, (model_ref, fold_d, result) in enumerate(fold_models):
         # 每個 fold 自己的 t0 配對指標（不互相影響）
         rid_counter = defaultdict(int)  # key: t0_utc -> 已分配次數（當作 rid_lists_by_t0 的索引）
+
+        feat_cols_current = feat_cols_all
+
+        result = result or {}
+        checkpoint_path = _resolve_checkpoint_path(model_ref, trial_dir_path, fold_idx)
+        if checkpoint_path is not None:
+            model, feat_cols_current = _load_model_from_checkpoint(
+                checkpoint_path=checkpoint_path,
+                cfg=cfg,
+                feat_df=feat_df,
+                default_cols=feat_cols_current,
+                result=result,
+                fold_idx=fold_idx,
+            )
+        elif hasattr(model_ref, "state_dict"):
+            model = model_ref
+            ckpt_cols = result.get("_feature_columns")
+            if ckpt_cols:
+                feat_cols_current = [c for c in ckpt_cols if c in feat_df.columns]
+        else:
+            print(f"[tbm_exporter][warn] fold {fold_idx} has no usable model reference; skip.")
+            continue
 
         # 1) split：決定 scaler 擬合窗口（train）
         df_idx = pd.DataFrame(index=pd.DatetimeIndex(df_index))
@@ -224,30 +306,31 @@ def export_tbm_predictions_for_trial(
         fit_index = idx_all[fit_pos] if len(fit_pos) else train_align
 
         # 2) scaler 擬合 + transform
-        cols_to_scale = pick_cols_to_scale(feat_df.loc[fit_index, feat_cols], feat_cols)
+        cols_to_scale = pick_cols_to_scale(feat_df.loc[fit_index, feat_cols_current], feat_cols_current)
         scaler_kind = cfg["sequence"]["scaler"]
         min_frac = float(cfg["sequence"].get("min_frac", 0.2))
         scaler = _get_scaler(scaler_kind, window=L, min_frac=min_frac)
 
         if hasattr(scaler, "is_timesafe") and getattr(scaler, "is_timesafe", False):
             feat_scaled = scaler.transform_full(feat_df, cols_to_scale=cols_to_scale)
+            feat_scaled = feat_scaled.loc[:, feat_cols_current]
         else:
             if scaler is None:
-                feat_scaled = feat_df
+                feat_scaled = feat_df.loc[:, feat_cols_current]
             else:
-                sk = ColumnSubsetScaler(scaler, all_cols=feat_cols, cols_to_scale=cols_to_scale)
-                sk.fit_df(feat_df.loc[fit_index, feat_cols])
-                arr = feat_df.loc[:, feat_cols].values.astype(np.float32, copy=False)
+                sk = ColumnSubsetScaler(scaler, all_cols=feat_cols_current, cols_to_scale=cols_to_scale)
+                sk.fit_df(feat_df.loc[fit_index, feat_cols_current])
+                arr = feat_df.loc[:, feat_cols_current].values.astype(np.float32, copy=False)
                 arr = sk.transform(arr)
-                feat_scaled = feat_df.copy()
-                feat_scaled.loc[:, feat_cols] = arr
+                feat_scaled = feat_df.loc[:, feat_cols_current].copy()
+                feat_scaled.loc[:, feat_cols_current] = arr
 
         # 3) 建推論 Dataset（僅含 allowed_align 事件）
         ds_inf = EventDataset(
             feat_scaled,
             tbm_path,
             seq_len=L,
-            feature_cols=feat_cols,
+            feature_cols=feat_cols_current,
             keep_sides=keep_sides,
             align_method=align_method,
             device="cpu",
@@ -270,12 +353,14 @@ def export_tbm_predictions_for_trial(
 
         # 5) 推論
         per_fold_prob[fold_idx] = {}
+        if not hasattr(model, "to") or not hasattr(model, "eval"):
+            raise TypeError("[tbm_exporter] Only torch.nn.Module models are supported for export.")
         model = model.to(device)
         model.eval()
         with torch.no_grad(), amp.autocast(
-            device_type=("cuda" if device == "cuda" else "cpu"),
+            device_type=("cuda" if use_cuda else "cpu"),
             dtype=dtype,
-            enabled=(dtype is not None and device == "cuda"),
+            enabled=(dtype is not None and use_cuda),
         ):
             ptr = 0
             for Xb, _ in dl:
@@ -313,7 +398,7 @@ def export_tbm_predictions_for_trial(
         # 每個 fold 推論完釋放 GPU 記憶體
         try:
             model = model.to("cpu")
-            if torch.cuda.is_available():
+            if use_cuda and torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception:
             pass
@@ -386,7 +471,8 @@ def export_tbm_predictions_for_trial(
             vote_records.append((rid, p0_mean, p1_mean, v0, v1, yhat_vote, total, margin))
 
     # 組 DataFrame
-    out_df = tbm_all.copy()
+    mask_output = (t0u_all >= ts_start) & (t0u_all <= ts_end)
+    out_df = tbm_all.loc[mask_output].copy()
     if dm in {"mean_prob", "both"} and prob_records:
         prob_df = pd.DataFrame(prob_records, columns=["__rid", col_prob_p0, col_prob_p1, col_prob_thr, col_prob_pred])
         out_df = out_df.merge(prob_df, on="__rid", how="left", validate="one_to_one")
@@ -474,6 +560,89 @@ def export_tbm_predictions_for_trial(
                 "votes_total_min": int(out_df.loc[mask_out, col_vote_total].min(skipna=True)) if col_vote_total in out_df.columns else None,
                 "votes_total_max": int(out_df.loc[mask_out, col_vote_total].max(skipna=True)) if col_vote_total in out_df.columns else None,
             }
+
+        # ---- final metrics與混淆矩陣 ----
+        metrics_info = None
+        cm_info = None
+        label_col = next((c for c in ("label", "tbm_label", "y", "target") if c in out_df.columns), None)
+        if label_col is not None and mask_out.any():
+            candidate_series: List[Tuple[str, pd.Series]] = []
+            if dm in {"mean_prob", "both"} and col_prob_pred in out_df.columns:
+                candidate_series.append(("soft_prob", out_df[col_prob_pred]))
+            if dm in {"fold_vote", "both"} and col_vote_pred in out_df.columns:
+                candidate_series.append(("hard_vote", out_df[col_vote_pred]))
+
+            for mode, series in candidate_series:
+                preds = series[mask_out].dropna()
+                if preds.empty:
+                    continue
+                y_true_series = out_df.loc[preds.index, label_col].dropna()
+                common_idx = preds.index.intersection(y_true_series.index)
+                if len(common_idx) == 0:
+                    continue
+                y_pred_vals = preds.loc[common_idx].astype(int).to_numpy()
+                y_true_vals = y_true_series.loc[common_idx].astype(int).to_numpy()
+                classes = np.unique(y_true_vals)
+                if classes.size == 0:
+                    continue
+                avg = "binary" if classes.size == 2 else "macro"
+                precision, recall, f1, _ = precision_recall_fscore_support(
+                    y_true_vals, y_pred_vals, average=avg, zero_division=0
+                )
+                accuracy = float(np.mean(y_pred_vals == y_true_vals))
+                mcc_val = float(matthews_corrcoef(y_true_vals, y_pred_vals))
+                cm = confusion_matrix(y_true_vals, y_pred_vals, labels=np.sort(classes))
+                class_labels = [str(c) for c in np.sort(classes)]
+
+                cm_plot_path = Path(os.path.splitext(save_to_path)[0] + f"_{mode}_confusion_matrix.png")
+                cm_plot_path.parent.mkdir(parents=True, exist_ok=True)
+                fig, ax = plt.subplots(figsize=(4, 4))
+                im = ax.imshow(cm, cmap="Blues")
+                ax.set_xticks(range(len(class_labels)))
+                ax.set_xticklabels(class_labels)
+                ax.set_yticks(range(len(class_labels)))
+                ax.set_yticklabels(class_labels)
+                ax.set_xlabel("Predicted")
+                ax.set_ylabel("True")
+                ax.set_title(f"Confusion Matrix ({mode})")
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                max_val = cm.max() if cm.size else 0
+                for i in range(cm.shape[0]):
+                    for j in range(cm.shape[1]):
+                        ax.text(
+                            j,
+                            i,
+                            int(cm[i, j]),
+                            ha="center",
+                            va="center",
+                            color="white" if max_val and cm[i, j] > max_val / 2 else "black",
+                        )
+                plt.tight_layout()
+                fig.savefig(cm_plot_path, dpi=200)
+                plt.close(fig)
+
+                metrics_info = {
+                    "mode": mode,
+                    "average": avg,
+                    "support": int(len(y_true_vals)),
+                    "accuracy": accuracy,
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "f1": float(f1),
+                    "mcc": mcc_val,
+                }
+                cm_info = {
+                    "mode": mode,
+                    "labels": class_labels,
+                    "matrix": cm.astype(int).tolist(),
+                    "plot_path": os.path.relpath(cm_plot_path, start=os.path.dirname(save_to_path)),
+                }
+                break
+
+        if metrics_info is not None:
+            summary["metrics"] = metrics_info
+        if cm_info is not None:
+            summary["confusion_matrix"] = cm_info
 
         with open(os.path.splitext(save_to_path)[0] + ".summary.json", "w", encoding="utf-8") as jf:
             json.dump(summary, jf, ensure_ascii=False, indent=2)

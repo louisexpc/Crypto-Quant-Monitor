@@ -5,7 +5,7 @@ __pycache__
 /data
 .csv
 recycle_bin
-runs
+results
 k_group
 plots
 outputs
@@ -14,6 +14,7 @@ train_old
 runs_old
 runs
 feature_selections
+./crypto_quant_monitor.egg-info
 
 /utils
 *.json
@@ -21,3 +22,4 @@ feature_select/results
 train/results/*
 *.csv
 *.pth
+train/research_problem.MD

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import json
 import numpy as np
 import pandas as pd
 import torch
@@ -72,13 +73,13 @@ class TrialRunner:
            - df: 你原先傳入 make_*_loaders 的 df（保相容）
            - trial_dir: 此次 trial 的輸出資料夾
            - folds: 由 make_folds() 產生的 Fold 規格清單
-           - device: "cuda" 或 "cpu"（預設依 cfg 與環境判斷）
+           - device: "cuda" 或 "cpu"（未提供時使用 cfg['device']）
            - effective_seed: 這次真正使用的 seed（用於寫回可重現 config）
         3. return:
            - TrialOutputs: 包含 mean_score、平均指標、每折結果與模型清單等
         """
         task_type = get_task_type(cfg)
-        device = device or ("cuda" if (cfg.get("device", "cuda") == "cuda" and torch.cuda.is_available()) else "cpu")
+        device = device or str(cfg.get("device", "cuda")).lower()
         train_one_fold = get_trainer(cfg)
 
         # === 每 fold 訓練 ===
@@ -115,6 +116,8 @@ class TrialRunner:
                 cfg_fold.pop("_xgb_pack", None)
 
             feature_columns = info.get("feat_cols")
+            if feature_columns is not None:
+                feature_columns = list(feature_columns)
             n_features = len(feature_columns) if feature_columns is not None else None
 
             model = build_model(cfg, n_features, feature_columns)
@@ -124,6 +127,8 @@ class TrialRunner:
                 model, tr_loader, va_loader, te_loader,
                 cfg_fold, device=device, fold_id=i, export_dir=fold_dir
             )
+            if result is not None and feature_columns is not None:
+                result["_feature_columns"] = feature_columns
             fold_results.append(result)
 
             self._export_fold_artifacts(
@@ -134,16 +139,35 @@ class TrialRunner:
             )
 
             # 釋放顯存，保留 CPU 權重供 TBM 併回
+            model_ref: Any = None
             try:
+                checkpoint_payload = None
+                if result is not None:
+                    checkpoint_payload = result.get("state_dict")
+                if checkpoint_payload:
+                    checkpoint_path = fold_dir / "model_state.pt"
+                    meta = {
+                        "state_dict": checkpoint_payload,
+                        "model_name": cfg["model"].get("name"),
+                        "feature_columns": result.get("_feature_columns"),
+                    }
+                    torch.save(meta, checkpoint_path)
+                    model_ref = checkpoint_path
+                    # 釋放記憶體：state_dict 已寫入檔案
+                    result.pop("state_dict", None)
+                else:
+                    model_ref = model_trained
                 if model_trained is not None:
                     try:
                         model_trained = model_trained.to("cpu")
                     finally:
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                fold_models_for_infer.append((model_trained, fold, result))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Runner][WARN] failed to persist fold model: {e}")
+                model_ref = model_trained
+
+            fold_models_for_infer.append((model_ref, fold, result))
 
             # 試驗分數 + PRUNE 回報
             score = compute_trial_score(result, cfg)
@@ -156,8 +180,35 @@ class TrialRunner:
         val_avg, test_avg = self._compute_cv_avgs(task_type, fold_results)
         self._print_cv(task_type, val_avg, test_avg, len(fold_results))
 
+        # === Optional: TBM 併回 ===
+        self._maybe_export_tbm(cfg, df, folds, fold_models_for_infer, trial_dir, task_type)
+
+        # === 保存特徵欄位 ===
+        try:
+            feat_sets = [
+                set(res.get("_feature_columns", []))
+                for res in fold_results
+                if isinstance(res, dict) and res.get("_feature_columns")
+            ]
+            if feat_sets:
+                # 取第一個的順序
+                ordered_cols = fold_results[0].get("_feature_columns", [])
+                common = set.intersection(*feat_sets)
+                final_cols = [c for c in ordered_cols if c in common]
+                feat_path = trial_dir / "feat.txt"
+                with open(feat_path, "w", encoding="utf-8") as fh:
+                    for col in final_cols:
+                        fh.write(f"{col}\n")
+        except Exception as e:
+            print(f"[Runner][WARN] unable to write feat.txt: {e}")
+
         # === 寫 CV 摘要 ===
         save_cv_summary(fold_results, export_dir=trial_dir, task_type=task_type)
+        self._export_holdout_metrics(
+            task_type=task_type,
+            fold_results=fold_results,
+            export_dir=trial_dir,
+        )
 
         # === 依型別為 trial 資料夾加上分數 tag ===
         trial_dir = self._tag_trial_dir(trial_dir, task_type, test_avg, trial=trial)
@@ -165,9 +216,6 @@ class TrialRunner:
         # === 存可重現 config（用實際 effective_seed）===
         mean_score = float(np.mean(fold_scores)) if fold_scores else float("nan")
         self._dump_reproducible_cfg(cfg, trial_dir, mean_score, effective_seed)
-
-        # === Optional: TBM 併回 ===
-        self._maybe_export_tbm(cfg, df, folds, fold_models_for_infer, trial_dir, task_type)
 
         return TrialOutputs(
             mean_score=mean_score,
@@ -236,6 +284,118 @@ class TrialRunner:
                     y_prob=reg2cls.get("y_prob"),
                     threshold=None,
                 )
+
+    def _export_holdout_metrics(
+        self,
+        *,
+        task_type: str,
+        fold_results: List[Dict[str, Any]],
+        export_dir: Path,
+    ) -> None:
+        """Aggregate all test folds once and persist metrics/confusion matrix."""
+        if task_type != "classification":
+            return
+
+        import numpy as np
+        from sklearn.metrics import (
+            accuracy_score,
+            precision_recall_fscore_support,
+            confusion_matrix,
+        )
+
+        y_true_list: List[np.ndarray] = []
+        y_pred_list: List[np.ndarray] = []
+        y_prob_list: List[np.ndarray] = []
+        thresholds: List[float] = []
+        class_names: Optional[List[str]] = None
+
+        for res in fold_results:
+            payload = (res or {}).get("eval_payload") or {}
+            y_true = payload.get("y_true")
+            y_pred = payload.get("y_pred")
+            if y_true is None or y_pred is None:
+                continue
+            y_true_list.append(np.asarray(y_true))
+            y_pred_list.append(np.asarray(y_pred))
+            y_prob = payload.get("y_prob")
+            if y_prob is not None:
+                y_prob_list.append(np.asarray(y_prob))
+            if class_names is None and payload.get("class_names") is not None:
+                class_names = list(payload["class_names"])
+            if payload.get("best_threshold") is not None:
+                thresholds.append(float(payload["best_threshold"]))
+
+        if not y_true_list:
+            return
+
+        y_true = np.concatenate(y_true_list, axis=0)
+        y_pred = np.concatenate(y_pred_list, axis=0)
+        y_prob = np.concatenate(y_prob_list, axis=0) if y_prob_list else None
+
+        if class_names is not None:
+            labels_for_metrics = list(range(len(class_names)))
+        else:
+            labels_for_metrics = sorted({int(v) for v in np.unique(np.concatenate([y_true, y_pred]))})
+
+        acc = float(accuracy_score(y_true, y_pred))
+        macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="macro", zero_division=0, labels=labels_for_metrics
+        )
+        weighted_p, weighted_r, weighted_f1, _ = precision_recall_fscore_support(
+            y_true, y_pred, average="weighted", zero_division=0, labels=labels_for_metrics
+        )
+        per_p, per_r, per_f1, support = precision_recall_fscore_support(
+            y_true, y_pred, average=None, zero_division=0, labels=labels_for_metrics
+        )
+        conf_mat = confusion_matrix(y_true, y_pred, labels=labels_for_metrics).tolist()
+        if class_names is not None:
+            labels = [class_names[i] for i in labels_for_metrics]
+        else:
+            labels = [str(i) for i in labels_for_metrics]
+        per_class = [
+            {
+                "class": labels[i],
+                "precision": float(per_p[i]),
+                "recall": float(per_r[i]),
+                "f1": float(per_f1[i]),
+                "support": int(support[i]),
+            }
+            for i in range(len(labels))
+        ]
+
+        metrics_dir = export_dir / "holdout_eval"
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        metrics = {
+            "samples": int(len(y_true)),
+            "accuracy": acc,
+            "macro_precision": float(macro_p),
+            "macro_recall": float(macro_r),
+            "macro_f1": float(macro_f1),
+            "weighted_precision": float(weighted_p),
+            "weighted_recall": float(weighted_r),
+            "weighted_f1": float(weighted_f1),
+            "per_class": per_class,
+            "confusion_matrix": conf_mat,
+        }
+        if thresholds:
+            metrics["threshold_mean"] = float(np.mean(thresholds))
+            metrics["thresholds"] = thresholds
+
+        with open(metrics_dir / "metrics.json", "w", encoding="utf-8") as fh:
+            json.dump(metrics, fh, ensure_ascii=False, indent=2)
+
+        if y_prob is not None:
+            reporter = ClassificationReporter(
+                save_dir=metrics_dir,
+                prefix="holdout_",
+                class_names=class_names,
+            )
+            reporter.plot_eval(
+                y_true=y_true,
+                y_pred=y_pred,
+                y_prob=y_prob,
+                threshold=(float(np.mean(thresholds)) if thresholds else None),
+            )
 
     def _numeric_only(self, d: Optional[Dict[str, Any]]) -> Dict[str, float]:
         """
@@ -368,6 +528,7 @@ class TrialRunner:
                     df_index=pd.DatetimeIndex(df.index),
                     folds=folds,
                     fold_models=fold_models_for_infer,
+                    trial_dir=trial_dir,
                     date_start=ds,
                     date_end=de,
                     src_tbm_csv_path=out_csv,
