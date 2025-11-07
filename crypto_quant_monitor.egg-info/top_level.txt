@@ -1,2 +1,2 @@
-feature_select
+feature_selection
 train

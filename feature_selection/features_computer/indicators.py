@@ -7,6 +7,14 @@ import re
 import numpy as np
 import pandas as pd
 import pandas_ta as ta
+from tsfeatures import tsfeatures as _tsf  # Nixtla 版 API：tsfeatures(panel, freq=...)
+from train.train_utils.random_alpha_generator.random_alpha_generator import load_alpha
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm optional
+    def tqdm(iterable=None, **kwargs):
+        return iterable if iterable is not None else []
 
 DEFAULT_MINUTE_PREFIXES = ("m_",)
 _M_PAT = re.compile(r"^m_(-?\d+)_(.+)$")
@@ -604,7 +612,383 @@ class IndicatorLibrary:
         }, index=self.df.index)
 
         return out
+    
+    def build_alpha(self, paths: Iterable[Union[str, Path]]) -> pd.DataFrame:
+        """
+        1. 說明: 讀取 save_alpha 輸出的 JSON 檔案，評估其中 alpha 公式並輸出特徵欄位。
+        2. inputs:
+           - paths(Iterable[str|Path]): Alpha JSON 路徑（字串或 Path），可為單一路徑或列表。
+        3. return: DataFrame，欄名格式為 'ALPHA__<檔名>'，dtype=float32。
+        """
+        if paths is None:
+            raise ValueError("build_alpha 需要 paths 參數。")
 
+        if isinstance(paths, (str, Path)):
+            path_list = [paths]
+        else:
+            path_list = list(paths)
+
+        if not path_list:
+            raise ValueError("build_alpha 收到空的 paths。")
+
+        features: Dict[str, pd.Series] = {}
+        used_names: set[str] = set()
+
+        for idx, raw_path in enumerate(path_list, start=1):
+            path = Path(raw_path)
+            if not path.is_file():
+                raise FileNotFoundError(f"alpha 路徑不存在: {path}")
+
+            try:
+                alpha = load_alpha(path.as_posix())
+            except Exception as exc:
+                raise RuntimeError(f"載入 alpha 失敗: {path}") from exc
+
+            try:
+                values = alpha.tree.eval(self.df)
+            except Exception as exc:
+                raise RuntimeError(f"評估 alpha 失敗: {path}") from exc
+
+            if isinstance(values, pd.DataFrame):
+                if values.shape[1] != 1:
+                    raise ValueError(f"alpha {path} 的輸出包含多個欄位，暫不支援。")
+                values = values.iloc[:, 0]
+
+            if not isinstance(values, pd.Series):
+                values = pd.Series(values, index=self.df.index)
+
+            if not values.index.equals(self.df.index):
+                values = values.reindex(self.df.index)
+
+            series = pd.to_numeric(values, errors="coerce").astype("float32")
+
+            base = f"ALPHA__{path.stem or f'alpha_{idx}'}"
+            base = re.sub(r"[^0-9A-Za-z_]+", "_", base)
+            name = base
+            suffix = 1
+            while name in used_names:
+                suffix += 1
+                name = f"{base}__{suffix}"
+
+            used_names.add(name)
+            features[name] = series
+
+        return pd.DataFrame(features, index=self.df.index)
+    
+    # === 新增於 IndicatorLibrary 內：VectorBT（pandas_ta / TA-Lib） ===
+    def build_VBT(self,
+                all: bool = False,
+                lib: str = "pandas_ta",
+                items: list | None = None,
+                include: list[str] | None = None,
+                exclude: list[str] | None = None,
+                per_params: dict | None = None,
+                max_indicators: int | None = None) -> pd.DataFrame:
+        """
+        1. 說明: 以 vectorbt 一次產生大量技術指標。
+                - all=True：掃描整個指標套件（pandas_ta / ta / talib），每個指標用預設參數跑，
+                並可用 per_params 針對個別指標覆寫參數。
+                - all=False：使用 items 列表（lib/fn/inputs/grid）逐項指定。
+        2. inputs:
+        - all(bool): 是否跑該套件所有可解析指標。
+        - lib(str): 'pandas_ta' | 'ta' | 'talib'。
+        - items(list|None): 非 all 模式時的指標規格。
+        - include(list[str]|None): 名稱過濾（* ? [] 萬用字元）。
+        - exclude(list[str]|None): 排除過濾。
+        - per_params(dict|None): {'rsi': {'length':[7,14]}, 'bbands': {...}}（名稱大小寫不敏感）。
+        - max_indicators(int|None): 上限，避免欄位爆炸。
+        3. return:
+        - DataFrame: 欄名格式 'short__out__param=...__...'（float32）。
+        """
+        import fnmatch
+        import numpy as np
+        import pandas as pd
+        import vectorbt as vbt
+
+        # ---- 輸入映射（依工廠 input_names 自動對應）----
+        inputs_map = {
+            "open":   self.ohlcv["open"],
+            "high":   self.ohlcv["high"],
+            "low":    self.ohlcv["low"],
+            "close":  self.ohlcv["close"],
+            "volume": self.ohlcv["volume"],
+            # 常見別名
+            "real":   self.ohlcv["close"],
+            "input":  self.ohlcv["close"],
+            "real0":  self.ohlcv["close"],
+        }
+
+        # ---- 取得並規一工廠清單 → List[(name, FactoryClass)] ----
+        def _collect_factories(libname: str) -> list[tuple[str, type]]:
+            if libname == "pandas_ta":
+                raw = vbt.IndicatorFactory.get_pandas_ta_indicators(silence_warnings=True)
+            elif libname == "ta":
+                raw = vbt.IndicatorFactory.get_ta_indicators()
+            elif libname == "talib":
+                raw = vbt.IndicatorFactory.get_talib_indicators()
+            else:
+                raise ValueError(f"Unknown lib: {libname}")
+
+            pairs: list[tuple[str, type]] = []
+            if isinstance(raw, dict):
+                pairs = [(str(k), v) for k, v in raw.items()]
+            else:
+                # set / list / tuple
+                for item in list(raw):
+                    F = item
+                    if isinstance(item, str):
+                        try:
+                            if libname == "pandas_ta":
+                                F = vbt.IndicatorFactory.from_pandas_ta(item)
+                            elif libname == "ta":
+                                F = vbt.IndicatorFactory.from_ta(item)
+                            elif libname == "talib":
+                                F = vbt.IndicatorFactory.from_talib(item)
+                        except Exception:
+                            continue
+                        nm = str(item).lower()
+                    else:
+                        short_attr = getattr(F, "short_name", None)
+                        if isinstance(short_attr, property):
+                            short_attr = ""
+                        nm = short_attr or getattr(F, "__name__", None) or "ind"
+                        nm = str(nm).lower()
+                    pairs.append((nm, F))
+
+            # 去重名
+            seen = {}
+            uniq = []
+            for nm, F in pairs:
+                base = nm
+                idx = 1
+                while nm in seen:
+                    idx += 1
+                    nm = f"{base}_{idx}"
+                seen[nm] = True
+                uniq.append((nm, F))
+            return uniq
+
+        def _filter_names(names: list[str]) -> list[str]:
+            keep = list(names)
+            if include:
+                inc = []
+                for pat in include:
+                    inc += [n for n in keep if fnmatch.fnmatch(n.lower(), pat.lower())]
+                keep = sorted(set(inc))
+            if exclude:
+                for pat in exclude:
+                    keep = [n for n in keep if not fnmatch.fnmatch(n.lower(), pat.lower())]
+            return keep
+
+        def _flatten_df(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+            if isinstance(df.columns, pd.MultiIndex):
+                cols = ["__".join(map(str, c)) for c in df.columns]
+            else:
+                cols = [str(c) for c in df.columns]
+            df = df.copy()
+            df.columns = [f"{prefix}__{c}" for c in cols]
+            return df
+
+        def _run_factory(F: type, override: dict | None, short_hint: str) -> pd.DataFrame | None:
+            # 準備輸入
+            kw = {}
+            for in_name in (F.input_names or []):
+                key = str(in_name).lower()
+                s = inputs_map.get(key, None)
+                if s is None:
+                    return None  # 缺必要輸入 → 跳過
+                kw[in_name] = s
+
+            # 參數覆寫（可單值或清單 → 自動形成參數網格）
+            if override:
+                kw.update(override)
+
+            ind = F.run(**kw)
+
+            parts = []
+            short_attr = getattr(F, "short_name", None)
+            if isinstance(short_attr, property):
+                short_attr = ""
+            short = short_hint or short_attr or getattr(F, "__name__", None) or "ind"
+            short = str(short).lower()
+            for out_name in (F.output_names or []):
+                if not hasattr(ind, out_name):
+                    continue
+                df_out = getattr(ind, out_name)
+                df_out = _flatten_df(pd.DataFrame(df_out), f"{short}__{out_name}")
+                parts.append(df_out)
+            if not parts:
+                return None
+            out = pd.concat(parts, axis=1)
+            return out.replace([np.inf, -np.inf], np.nan).astype("float32")
+
+        per_params = {str(k).lower(): v for k, v in (per_params or {}).items()}
+
+        # ========= A) all 模式 =========
+        if all:
+            facs = _collect_factories(lib)                         # [(name, F)]
+            names = _filter_names([n for n, _ in facs])
+            if max_indicators is not None:
+                names = names[:int(max_indicators)]
+            names = list(names)
+            name2F = {n: F for n, F in facs}
+            outs, skipped = [], []
+            iter_names = tqdm(names, desc=f"VBT[{lib}] indicators", leave=False) if names else names
+            for name in iter_names:
+                F = name2F[name]
+                short_attr = getattr(F, "short_name", "")
+                if isinstance(short_attr, property):
+                    try:
+                        short_attr = short_attr.fget(F)
+                    except Exception:
+                        short_attr = ""
+                short_key = str(short_attr).lower() if short_attr else ""
+                over = per_params.get(name) or (short_key and per_params.get(short_key))
+                try:
+                    df_one = _run_factory(F, over, name)
+                except Exception:
+                    df_one = None
+                if df_one is None:
+                    skipped.append(name)
+                else:
+                    outs.append(df_one)
+            if not outs:
+                return pd.DataFrame(index=self.df.index)
+            return pd.concat(outs, axis=1)
+
+        # ========= B) items 模式（相容你現有配置） =========
+        if not items:
+            return pd.DataFrame(index=self.df.index)
+
+        outs = []
+        iter_items = tqdm(items, desc=f"VBT[{lib}] items", leave=False) if items else items
+        for it in iter_items:
+            lib_i = str(it.get("lib", lib)).lower()
+            fn = str(it["fn"]).lower()
+            inputs_spec = it.get("inputs", "close")
+            grid = dict(it.get("grid", {}))
+
+            # 建工廠
+            if lib_i == "pandas_ta":
+                F = vbt.IndicatorFactory.from_pandas_ta(fn)
+            elif lib_i == "ta":
+                F = vbt.IndicatorFactory.from_ta(fn)
+            elif lib_i == "talib":
+                F = vbt.IndicatorFactory.from_talib(fn)
+            else:
+                continue
+
+            # 對應輸入（支援 'close' 或 ['high','low','close']）
+            kw = {}
+            in_names = list(F.input_names or [])
+            if isinstance(inputs_spec, (list, tuple)):
+                for in_name, src_name in zip(in_names, inputs_spec):
+                    s = inputs_map.get(str(src_name).lower(), None)
+                    if s is not None:
+                        kw[in_name] = s
+            else:
+                # 單一字串：盡量匹配所有 input_names
+                src = inputs_map.get(str(inputs_spec).lower(), None)
+                for in_name in in_names:
+                    if src is not None and in_name not in kw:
+                        kw[in_name] = src
+
+            kw.update(grid)  # 參數網格
+
+            ind = F.run(**kw)
+            short = (getattr(F, "short_name", None) or fn).lower()
+            for out_name in (F.output_names or []):
+                if not hasattr(ind, out_name):
+                    continue
+                df_out = getattr(ind, out_name)
+                df_out = _flatten_df(pd.DataFrame(df_out), f"{short}__{out_name}")
+                outs.append(df_out)
+
+        if not outs:
+            return pd.DataFrame(index=self.df.index)
+        return pd.concat(outs, axis=1).replace([np.inf, -np.inf], np.nan).astype("float32")
+
+    # ========== B) 兼容舊有 items（逐項指定） ==========
+    # 你原本的 VBT items 流程可放在這裡（略）。如果你已有，保留舊實作即可。
+    # raise NotImplementedError("VBT(items=...) 分支請沿用你原先的實作或告訴我替你補上。")
+
+    # === 新增於 IndicatorLibrary 內：Kats TsFeatures（滑窗抽取） ===
+    def build_TSF(self,
+                targets: List[Dict[str, Any]],
+                tsf_params: Dict[str, Any] | None = None) -> pd.DataFrame:
+        """
+        1. 說明: 使用 Nixtla 的 tsfeatures 套件，對多個單變量序列在多個滑動視窗上抽取
+                經典時間序列特徵（趨勢/季節性/ACF/熵/flat_spots 等），並與索引對齊輸出寬表。
+        2. inputs:
+        - targets (List[dict]): 每個 dict 形如
+                {
+                "name": "<欄位名，如 'close' 或 'volume'>",
+                "transform": "raw" | "logret" | "pct",
+                "windows": ["6h","1d", ...]  # 對每個時間點，使用 (t - window, t] 的資料段
+                }
+        - tsf_params (dict|None): 轉交 tsfeatures() 的參數（常用 'freq': int 季節長度）。
+                                    例如 15m K、以日季節 → {"freq": 96}
+        3. return: DataFrame（float32），欄名格式：
+                TSF__<name>__<transform>__win=<w>__<feature_name>
+                注意：此函式不做 shift，交由 FeatureComputer 統一 shift(1) 防外洩。
+        """
+
+        params = dict(tsf_params or {})
+
+        def _series(col: str, transform: str) -> pd.Series:
+            s = pd.to_numeric(self.df[col], errors="coerce").astype("float32")
+            if transform == "logret":
+                s = np.log(s).diff()
+            elif transform == "pct":
+                s = s.pct_change()
+            return s
+
+        def _panel_from_seg(seg: pd.Series) -> pd.DataFrame:
+            # tsfeatures 需要 panel：unique_id, ds, y；ds 建議用 naive datetime
+            idx = pd.DatetimeIndex(seg.index)
+            if idx.tz is not None:
+                ds = idx.tz_convert("UTC").tz_localize(None)
+            else:
+                ds = idx
+            return pd.DataFrame({
+                "unique_id": "S",  # 單序列
+                "ds": ds,
+                "y": seg.values
+            })
+
+        parts: List[pd.DataFrame] = []
+        targets_list = list(targets)
+        iter_targets = tqdm(targets_list, desc="TSF targets", leave=False) if targets_list else targets_list
+        for tgt in iter_targets:
+            name = tgt["name"]
+            tfm  = str(tgt.get("transform", "raw"))
+            wins = list(tgt.get("windows", []))
+            y = _series(name, tfm)
+
+            iter_wins = tqdm(wins, desc=f"TSF[{name}:{tfm}] windows", leave=False) if wins else wins
+            for w in iter_wins:
+                rows = []
+                iter_idx = tqdm(y.index, desc=f"TSF[{name}:{tfm}] win={w}", leave=False) if len(y.index) else y.index
+                for end in iter_idx:
+                    start = end - pd.Timedelta(w)
+                    seg = y.loc[(y.index > start) & (y.index <= end)].dropna()
+                    if len(seg) < 8:           # 視窗太短跳過，以避免不穩定估計
+                        rows.append({})
+                        continue
+                    panel = _panel_from_seg(seg)
+                    # 只傳 tsfeatures 認得的參數（目前最重要的是 freq）
+                    feats_df = _tsf(panel, **{k: v for k, v in params.items() if k in ("freq",)})
+                    # tsfeatures 回傳一列（每個 unique_id 一列）
+                    feats = feats_df.iloc[0].to_dict()
+                    rows.append(feats)
+
+                df_feat = pd.DataFrame(rows, index=y.index)
+                df_feat = df_feat.add_prefix(f"TSF__{name}__{tfm}__win={w}__")
+                parts.append(df_feat)
+
+        out = pd.concat(parts, axis=1).replace([np.inf, -np.inf], np.nan).astype("float32")
+        return out
+    
     # ---------- Name → Builder ----------
     @property
     def builders(self) -> Dict[str, callable]:
@@ -668,7 +1052,11 @@ class IndicatorLibrary:
             "M15_VOL": lambda kw: self.build_15_VOL(),
 
             # FNG info
-            "FNG_IDX": lambda kw: self.build_fng()
+            "FNG_IDX": lambda kw: self.build_fng(),
+            "ALPHA": lambda kw: self.build_alpha(**kw),
+
+            "VBT":  lambda kw: self.build_VBT(**kw),     # vectorbt + (pandas_ta / TA-Lib)
+            "TSF": lambda kw: self.build_TSF(**kw),
         }
 
 # =========================
@@ -684,14 +1072,61 @@ class FeatureComputer:
         self.lib = lib
 
     @staticmethod
-    def _enabled_features(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _normalize_feature_spec(item: Dict[str, Any]) -> Dict[str, Any]:
         """
-        1. 說明: 從 plan 中篩出 enabled=True 的特徵規格。
+        1. 說明: 將 plan 中單一特徵規格標準化為 {name, enabled, kwargs, flip} 格式。
+        2. inputs: item(dict)
+        3. return: dict
+        """
+        if "name" in item:
+            spec = dict(item)
+        else:
+            # 允許 YAML 中以 `- alpha:` 形式定義（可能同層還有 enabled/paths 等欄位）
+            reserved = {"enabled", "kwargs", "flip"}
+            builder_keys = [k for k in item.keys() if k not in reserved]
+            if not builder_keys:
+                raise ValueError(f"特徵規格缺少 name: {item}")
+            builder = builder_keys[0]
+            value = item.get(builder)
+            spec = {k: v for k, v in item.items() if k != builder}
+            spec["name"] = builder
+
+            if value is not None:
+                if not isinstance(value, dict):
+                    raise ValueError(f"特徵規格格式錯誤（需為 dict）: {item}")
+                nested = dict(value)
+                nested_kwargs = dict(nested.pop("kwargs", {}) or {})
+                spec_kwargs = dict(spec.get("kwargs", {}) or {})
+                spec_kwargs.update(nested_kwargs)
+                for key, val in nested.items():
+                    if key in {"enabled", "flip"}:
+                        spec[key] = val
+                    else:
+                        spec_kwargs[key] = val
+                spec["kwargs"] = spec_kwargs
+
+        kwargs = dict(spec.get("kwargs", {}) or {})
+        extra_keys = [k for k in list(spec.keys()) if k not in {"name", "enabled", "kwargs", "flip"}]
+        for key in extra_keys:
+            kwargs[key] = spec.pop(key)
+        spec["kwargs"] = kwargs
+        spec.setdefault("enabled", True)
+        return spec
+
+    @classmethod
+    def _enabled_features(cls, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        1. 說明: 從 plan 中篩出 enabled=True 的特徵規格，並轉為統一格式。
         2. inputs: plan(dict)
         3. return: List[dict]
         """
         feats = plan.get("features") or []
-        return [f for f in feats if f.get("enabled", False)]
+        normalized: List[Dict[str, Any]] = []
+        for item in feats:
+            spec = cls._normalize_feature_spec(item)
+            if spec.get("enabled", False):
+                normalized.append(spec)
+        return normalized
     
     @staticmethod
     def _maybe_flip(df: pd.DataFrame, flip: bool | str | int) -> pd.DataFrame:
@@ -791,7 +1226,7 @@ class FeatureComputer:
             raise ValueError("計畫沒有任何 enabled=True 的 features。")
 
         parts: List[pd.DataFrame] = []
-        for item in feat_list:
+        for item in tqdm(feat_list, desc="Building features", total=len(feat_list)):
             name = str(item.get("name"))
             kwargs = item.get("kwargs", {}) or {}
             flip = item.get("flip", False)  # ← 新增：讀 flip
@@ -863,9 +1298,44 @@ class FeatureComputer:
 # =========================
 # CLI: Precompute features to a file
 # =========================
+def _apply_nan_policy(df: pd.DataFrame, policy: str, *, name: str) -> pd.DataFrame:
+    """
+    依據 policy 處理 NaN：
+      - drop: 直接 dropna()
+      - linear_interp: 線性插值並補齊兩端
+      - none: 不處理
+    僅對數值欄位操作；時間欄保持原樣。
+    """
+    policy = (policy or "drop").strip().lower()
+    if policy not in {"drop", "linear_interp", "none"}:
+        raise ValueError(f"[nan_policy] 未知策略: {policy}")
+
+    if policy == "none":
+        return df
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    if policy == "drop":
+        cleaned = df.dropna()
+        dropped = len(df) - len(cleaned)
+        if dropped:
+            print(f"[nan_policy] drop: {name} 移除 {dropped} 列含 NaN")
+        return cleaned
+
+    # linear interpolation
+    interp = df.copy()
+    if numeric_cols.any():
+        interp[numeric_cols] = (
+            interp[numeric_cols]
+            .interpolate(method="linear", limit_direction="both")
+            .ffill()
+            .bfill()
+        )
+    return interp
+
+
 def main():
     # 1. load cfg & data
-    cfg_path = r"train/data/features/features_config.yaml"
+    cfg_path = r"feature_selection/features_computer/features_config.yaml"
     with open(cfg_path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
@@ -909,8 +1379,20 @@ def main():
     # 避免重複欄位：將白名單分鐘特徵僅保留一次
     X = X.drop(columns=passthrough_cols, errors="ignore")
 
-    # combine
-    out = pd.concat([time_df, ohlcv_df, X, minute_df], axis=1)
+    # combine（15m 主檔）
+    out = pd.concat([time_df, ohlcv_df, X], axis=1)
+    micro = pd.concat([time_df, minute_df], axis=1) if not minute_df.empty else None
+
+    # NaN policy
+    nan_policy = (cfg.get("export", {}) or {}).get("nan_policy", "drop")
+    out = _apply_nan_policy(out, nan_policy, name="main")
+    if micro is not None:
+        micro = _apply_nan_policy(micro, nan_policy, name="micro")
+        # 若 drop 造成索引不一致，取交集
+        if not out.index.equals(micro.index):
+            common_idx = out.index.intersection(micro.index)
+            out = out.loc[common_idx]
+            micro = micro.loc[common_idx]
 
     # Optional: quick validation of expected vs. actual feature columns
     try:
@@ -934,7 +1416,23 @@ def main():
     elif out_path.suffix.lower() == ".csv":
         out.to_csv(out_path, index=False)
     else:
+        out = out.astype("float32")
         out.to_parquet(out_path.with_suffix(".parquet"), index=False)
+
+    # 4-b) Export micro (1-min) features if available
+    if micro is not None and not micro.empty:
+        micro_dups = micro.columns[micro.columns.duplicated()]
+        if len(micro_dups):
+            raise ValueError(f"Duplicate columns in micro features before export: {list(micro_dups)}")
+
+        micro_path = out_path.with_name(f"{out_path.stem}_1min{out_path.suffix}")
+        if micro_path.suffix.lower() == ".parquet":
+            micro.to_parquet(micro_path, index=False)
+        elif micro_path.suffix.lower() == ".csv":
+            micro.to_csv(micro_path, index=False)
+        else:
+            micro.to_parquet(micro_path.with_suffix(".parquet"), index=False)
+        print(f"[OK] Exported micro features to: {micro_path}")
 
     print(f"[OK] Exported precomputed features to: {out_path}")
 

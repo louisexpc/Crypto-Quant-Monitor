@@ -1,0 +1,24 @@
+# feature_selection/statistics/pca/pca_config.yaml
+# === 路徑設定 ===
+input_csv: "data/precomputed/btcusdt_15m_features_all.csv"     # 你的原始 CSV（含 datetime、y_* 與 m_-k_*）
+output_dir: "feature_selection/results/pca"                    # 輸出資料夾（自動建立）
+start: null                        # 例如 "2023-01-01T00:00:00Z"
+end: null                          # 例如 "2024-01-01T00:00:00Z"
+
+# === 欄位定義 ===
+datetime_col: "datetime"
+exclude_patterns: ["*_flag", "m_*"]              # 不進 PCA 的欄位樣式（支援 Unix shell-style）
+
+# === PCA 與前處理 ===
+n_components: 0.95        # 浮點=累積解釋率門檻；或填整數 k (i.e. 要解釋到多少的變異量)
+whiten: false             # 一般預測任務不建議開
+impute: "median"          # 缺值填補策略：median / mean
+
+# === 時序切分（防外洩） ===
+n_splits: 5
+embargo_minutes: 60       # 建議 >= 你的標籤持有期（1 小時）
+shuffle: false            # 金融時序請保持 false
+
+# === 報表/可視化 ===
+topn_loadings: 15         # 每個主成分輸出前 N 個載荷最大特徵
+random_state: 42

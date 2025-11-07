@@ -1,0 +1,26 @@
+# === 輸入/輸出 ===
+input_pca_csv: "feature_selection/results/pca/pca_output.csv"   # 由 run_pca.py 產生，至少含 [datetime, PC1..PCk]
+output_dir: "feature_selection/results/umap"
+start: null                                # 例如 "2023-01-01T00:00:00Z"
+end: null                                  # 例如 "2024-01-01T00:00:00Z"
+
+# === 欄位設定 ===
+datetime_col: "datetime"                   # 時間欄位名
+pc_prefix: "PC"                            # PC 欄位前綴（會自動抓 PC1..PCk）
+
+# === UMAP 參數 ===
+embedding_dim: 3                           # 2 或 3 常見；需要更高可改
+n_neighbors: 30
+min_dist: 0.1
+metric: "cosine"                           # "euclidean" 也可
+random_state: 42
+
+# === 時序切分（與 PCA 一致，避免外洩） ===
+n_splits: 5
+embargo_minutes: 60
+shuffle: false
+
+# === 繪圖 ===
+plot_scatter: true                         # 嵌入散點圖
+max_points: 200000                         # 過多點會下採樣繪圖（不影響 CSV 輸出）
+point_size: 4

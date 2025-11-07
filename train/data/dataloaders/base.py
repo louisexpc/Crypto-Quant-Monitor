@@ -9,7 +9,13 @@ from train.data.scalers import _get_scaler, ColumnSubsetScaler, pick_cols_to_sca
 
 
 # ---------- I/O & Column selection ----------
-def load_precomputed_features(*, path: Optional[str] = None, pre_feat_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def load_precomputed_features(
+    *,
+    path: Optional[str] = None,
+    pre_feat_df: Optional[pd.DataFrame] = None,
+    drop_time_cols: bool = True,
+    drop_ohlcv: bool = True,
+) -> pd.DataFrame:
     """
     載入離線預算特徵表並正規化索引為 UTC DatetimeIndex；若提供 pre_feat_df 則直接使用。
     - 支援 .csv / .parquet
@@ -30,13 +36,15 @@ def load_precomputed_features(*, path: Optional[str] = None, pre_feat_df: Option
 
     if "datetime" in df.columns:
         idx = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
-        df = df.drop(columns=["datetime"])
+        if drop_time_cols:
+            df = df.drop(columns=["datetime"])
         df.index = idx
     elif "timestamp" in df.columns:
         ts = pd.to_numeric(df["timestamp"], errors="coerce").astype("Int64")
         unit = "ms" if (ts.dropna().iloc[0] if len(ts.dropna()) else 0) > 1_000_000_000_000 else "s"
         idx = pd.to_datetime(ts, unit=unit, utc=True)
-        df = df.drop(columns=["timestamp"])
+        if drop_time_cols:
+            df = df.drop(columns=["timestamp"])
         df.index = idx
     else:
         # 若原本就有 DatetimeIndex，也要統一成 UTC tz-aware
@@ -49,8 +57,14 @@ def load_precomputed_features(*, path: Optional[str] = None, pre_feat_df: Option
     # 再保險一次：全統一 UTC tz-aware
     df.index = ensure_utc_index(df.index)    
     # 最後只保留feature 把 "time" 跟原始 "ohlcv" 丟掉 (如果有要ohlcv在precomputed會有 _L1: shift(-1)版本的 )
-    drop_cols = [col for col in ("datetime","timestamp","open","high","low","close",'volume') if col in df.columns]
-    df = df.drop(columns=drop_cols)    
+    if drop_ohlcv:
+        drop_cols = [col for col in ("open","high","low","close","volume") if col in df.columns]
+        if drop_cols:
+            df = df.drop(columns=drop_cols)
+    if drop_time_cols:
+        for col in ("datetime", "timestamp"):
+            if col in df.columns:
+                df = df.drop(columns=[col])
     return df
 
 

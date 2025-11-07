@@ -180,7 +180,11 @@ class OpNode(Node):
             w = self._get_win_from_value(b.dropna().iloc[0] if b.dropna().size else default, default)
             return a, w
         # 兩邊都是變動的 series：這不是 window 類；讓上層報錯比較好
-        raise TypeError("Expected (series, window) but got (series, series). Provide a constant window Leaf on one side.")
+        if not a_const and not b_const:
+            print(f"[Warning] Both operands are non-constant series in operator '{self.operator}'.\nExpected (series, window) but got (series, series). Provide a constant window Leaf on one side.\n替代方案: 取右側 node 首個非 nan 值作為常數 node")
+            right_val = self._get_win_from_value(b.dropna().iloc[0] if b.dropna().size else default, default)
+            return a, right_val
+        # raise TypeError("Expected (series, window) but got (series, series). Provide a constant window Leaf on one side.")
 
     def eval(self, df):
         """
