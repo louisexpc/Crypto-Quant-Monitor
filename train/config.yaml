@@ -4,13 +4,13 @@
 # ==================================================
 # 1. ---basic---
 seed: 42
-device: "cuda:1"
-project_name: BTC_2-stream_rank_biserial_108_long_v2
+device: "cuda:0"
+project_name: BTC_2-stream_rank_biserial_108_short
 also_XGB: false
 
 # 2. ---Data---
 data:
-  path: feature_selection/results/rank_biserial/rank_biserial_60_feat.csv   # 15-minute aggregated features
+  path: feature_selection/results/rank_biserial/short/rank_biserial_60_feat.csv   # 15-minute aggregated features
   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
   freq: "15min"                    # 供缺口提醒（不會自動補齊）
   columns:
@@ -43,7 +43,7 @@ cv:
 
 # 4. ---sequence (往前看多久)---
 sequence:
-  seq_len: [144]  
+  seq_len: 144  
   stride: [1]
   scaler: none  # [standard / robust / minmax / rolling / ewm / robust_rolling / none]
   stride_anchor: 0
@@ -66,7 +66,7 @@ label:
   vol_window: 96         # 波動估計窗口
 
   tbm_csv_path: data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv
-  keep_sides: long       # 或 short；若 csv 可能同一 t0 有雙邊，請先選邊
+  keep_sides: short       # 或 short；若 csv 可能同一 t0 有雙邊，請先選邊
   align_method: pad        # 若 15m 缺列再用 pad
 
 
@@ -186,7 +186,7 @@ objective:
 
 # 3. search 次數 | 時長
 search:
-  n_trials: 1
+  n_trials: 10
   timeout: 10    # 小時
   sampler: tpe
   pruner: median
@@ -200,7 +200,7 @@ search:
 # =========================
 model:
   name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
-  d_model: [32, 48, 72]
+  d_model: [32, 48, 64]
   n_heads: [1, 2, 4]
   n_layers: [1]
   mlp_ratio: 2.0

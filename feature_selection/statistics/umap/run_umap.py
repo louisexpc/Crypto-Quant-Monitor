@@ -6,13 +6,11 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Dict
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import KFold
 from feature_selection.statistics.common.utils import (
     load_yaml,
     ensure_dir,
