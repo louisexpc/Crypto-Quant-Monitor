@@ -69,7 +69,7 @@ train/
 ```
 
 
-1. `train/core` 讀取設定、設定隨機種子，再呼叫 `main_train.run_single` 或 `run_multi`。
+1. `train/core` 讀取設定、設定隨機種子，再呼叫 `main_train.run_single`。
 2. `train/pipeline/search/objective` 為 Optuna 目標函式，管理超參搜尋、fold 建立與 TrialRunner。
 3. `TrialRunner` 組合資料載入、模型建立與 trainer，收集每個 fold 的結果與產物。
 4. `train/evaluation` 封裝圖表與匯出邏輯，集中在 TrialRunner 內觸發，最後寫入 `runs/<project>/`。
@@ -84,7 +84,7 @@ train/
 ```
 | 路徑 | 說明 |
 | ---- | ---- |
-| `main_train.py` | Pipeline 入口。讀取config => 建立 Optuna Study，並依設定執行單/多 GPU 搜尋。|
+| `main_train.py` | Pipeline 入口。讀取 config => 建立 Optuna Study 並執行搜尋。|
 | `config.yaml`   | 所有超參數設定|
 | `readme.md`     | 本文件。|
 
@@ -270,8 +270,7 @@ train/
    - `model` / `train` / `objective` 設定模型超參、訓練輪次、Optuna 調參指標。
 
 3. **啟動訓練**：
-   - 單機：`python -m train.core.orchestrator train/config.yaml`
-   - 多 GPU：於設定 `search.multi_gpu` 中開啟 `enabled` 並列出 `gpu_ids`。
+   - 執行 `python -m train.core.orchestrator train/config.yaml`
 
 4. **輸出成果**：
    - 每個 trial 目錄包含 fold 指標 (`metrics_epoch.csv`)、圖表、該次的 `trial_config_*.yaml` 等。

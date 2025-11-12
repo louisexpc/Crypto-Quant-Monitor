@@ -33,6 +33,14 @@ def make_event_loaders_for_fold(
 
     # 2) 讀特徵 + 過濾欄位
     feat_df = load_precomputed_features(path=cfg["data"]["path"]).astype(np.float32)
+
+    micro_cfg = (cfg.get("data", {}) or {}).get("micro", {})
+    if micro_cfg.get("enabled") and micro_cfg.get("path"):
+        micro_df = load_precomputed_features(path=micro_cfg["path"]).astype(np.float32)
+        feat_df = feat_df.join(micro_df, how="left")
+
+    if feat_df.isna().any().any():
+        raise ValueError("[event_loader] 預算特徵尚含 NaN/Inf，請在特徵匯出階段處理。")
     feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
 
     # 3) 計算 fit_index（train 事件左窗 union）

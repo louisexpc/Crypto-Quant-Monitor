@@ -4,30 +4,32 @@
 # ==================================================
 # 1. ---basic---
 seed: 42
-device: cuda
-project_name: BTC_two_stream_feat_selected_36_long
-also_XGB: true
+device: "cuda:1"
+project_name: BTC_2-stream_rank_biserial_108_long_v2
+also_XGB: false
 
 # 2. ---Data---
 data:
-  path: data/precomputed/btcusdt_15m_features_selected.parquet   # precomputed feat data: include flat 1-min and FNG
+  path: feature_selection/results/rank_biserial/rank_biserial_60_feat.csv   # 15-minute aggregated features
   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
   freq: "15min"                    # 供缺口提醒（不會自動補齊）
   columns:
     time: ["datetime", "timestamp"]
     ohlcv: ["open","high","low","close","volume"]
-  # 吃1-min的
+
+  # 1-min的短時間序列
   micro:
     enabled: false
+    path: data/precomputed/btcusdt_15m_features_VBT_1min_z_norm.csv
     window_len: 15                # 每根 15min bar 對應過去 15 個 1min    
 
 # 3. ---Cross-Validation---
 cv:                 
-  start_date: "2023-01-01"
+  start_date: "2023-01-04"
   end_date:   "2025-04-30"
   train_val_split: 0.8  # train/val
 
-  # [Rolling, Purged_kfold]
+  # 有: [Rolling, Purged_kfold]
 
   # type: Rolling
   # test_freq: 3M
@@ -41,12 +43,41 @@ cv:
 
 # 4. ---sequence (往前看多久)---
 sequence:
-  seq_len: [36, 72, 144]  # , 216, 288
-  stride: [1, 2, 4, 12]
-  scaler: standard  # [standard / robust / minmax / rolling / ewm / robust_rolling / none]
+  seq_len: [144]  
+  stride: [1]
+  scaler: none  # [standard / robust / minmax / rolling / ewm / robust_rolling / none]
   stride_anchor: 0
   min_frac: 0.2
   preload_to_gpu: true  
+
+# 5.TBM Label & sequence
+
+label:
+  ret_shift: 4  # horizon
+  # reg
+  ret_type: fractionally   # "logret" | "fractionally"
+  fracdiff:
+    d: 0.4
+    thres: 1.0e-5
+
+  # cls
+  mode: event_tbm   # event_tbm | vol
+  k_vol: 0.5             # 門檻 = k * sigma * sqrt(horizon)
+  vol_window: 96         # 波動估計窗口
+
+  tbm_csv_path: data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv
+  keep_sides: long       # 或 short；若 csv 可能同一 t0 有雙邊，請先選邊
+  align_method: pad        # 若 15m 缺列再用 pad
+
+
+post_infer:
+  tbm_concat:
+    enabled: true                 # 設為 true 啟用 trial 完成後的全區間推論 + 寫回 TBM CSV
+    date_start: "2025-05-01"      # 推論起始
+    date_end:   "2025-10-25"      # 推論結束
+    output_column: "pred"          # 追加到 TBM CSV 的欄位名
+    csv_path_override: null        # 若不為空，覆蓋 cfg.label.tbm_csv_path
+
 
 
 # ==================================================
@@ -54,10 +85,10 @@ sequence:
 # ==================================================
 # 1. basic
 train:
-  lr: [1e-5, 3e-4]
-  weight_decay: [1e-6, 3e-4]
+  lr: [1e-5]
+  weight_decay: [1e-5]
   batch_size: 256
-  epochs: 50
+  epochs: 300
   grad_clip: [0.3, 3.0]
 
   early_stopping_patience: 20
@@ -67,7 +98,7 @@ train:
   amp_dtype: "bf16"       # "none" / "fp16" / "bf16" / "auto"
 
   grad_accum_steps: 1
-  val_every: 5
+  val_every: 1
   val_delay: 0
 
   # cls
@@ -153,7 +184,7 @@ objective:
   direction: maximize     # [minimize / maximize]
   enable_prune: true
 
-# 3. search 次數 | 時長 | multi_gpu
+# 3. search 次數 | 時長
 search:
   n_trials: 1
   timeout: 10    # 小時
@@ -162,78 +193,46 @@ search:
   pruner_warmup_folds: 20
   epoch_pruning: false
   seed: 42
-
-  multi_gpu:
-    enabled: false           # 打開就會啟兩個子程序併行；false=單進程
-    gpu_ids: [0, 1]         # 5070 Ti / 4060
-    sqlite_timeout_sec: 120  # SQLite 併發鎖等待時間（建議 60~300）
+  sqlite_timeout_sec: 120  # SQLite 鎖等待時間（秒）
 
 # =========================
 # D. Model
 # =========================
-# model:
-#   name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
-#   d_model: [32, 64, 72, 96]
-#   n_heads: [2, 4, 8]
-#   n_layers: [1, 2, 3]
-#   mlp_ratio: 2.0
-#   dropout: [0.1, 0.25] 
-#   attn_dropout: [0.0, 0.1]
-#   pooling: attn     # ["cls" / "attn" / "mean"]
-#   use_causal: true
-#   num_classes: 2             # ★ 回歸=1，分類再改成2/3
-#   # class_names: ["down", "flat", "up"]  
-#   class_names: ["sl", "tp"] 
-
-#   # ==== Two-Stream 新增 ====
-#   minute_steps: 15              # 每根 15m bar 含 15 個 1m 切片
-#   minute_hidden: [32, 64]
-#   minute_layers: 2
-#   minute_dropout: [0.0, 0.1]
-
 model:
-  name: "xgb"          # 或 "xgb_cls" / "xgb_reg"
-  num_classes: 2       # TBM 二分類
-  n_estimators: 800
-  max_depth: 6
-  learning_rate: 0.03
-  subsample: 0.8
-  colsample_bytree: 0.8
-  min_child_weight: 1.0
-  reg_alpha: 0.0
-  reg_lambda: 1.0
-  tree_method: "gpu_hist"   # 沒 GPU 可改 "hist"
-  n_jobs: 0                 # GPU 版建議 0
-  es_step: 50               # 早停 step（可選）
-  es_patience: 5
-  es_min_delta: 0.0
+  name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
+  d_model: [32, 48, 72]
+  n_heads: [1, 2, 4]
+  n_layers: [1]
+  mlp_ratio: 2.0
+  dropout: [0, 0.3] 
+  attn_dropout: [0.0, 0.1]
+  pooling: attn     # ["cls" / "attn" / "mean"]
+  use_causal: true
+  num_classes: 2             # ★ 回歸=1，分類再改成2/3
+  # class_names: ["down", "flat", "up"]  
+  class_names: ["sl", "tp"] 
 
-# =========================
-# E. Label & sequence
-# =========================
-label:
-  ret_shift: 4  # horizon
-  # reg
-  ret_type: fractionally   # "logret" | "fractionally"
-  fracdiff:
-    d: 0.4
-    thres: 1.0e-5
+  # ==== Two-Stream 新增 ====
+  minute_steps: 15              # 每根 15m bar 含 15 個 1m 切片
+  minute_hidden: [32, 48, 64]
+  minute_layers: 2
+  minute_dropout: [0, 0.1]
 
-  # cls
-  mode: event_tbm   # event_tbm | vol
-  k_vol: 0.5             # 門檻 = k * sigma * sqrt(horizon)
-  vol_window: 96         # 波動估計窗口
+# model:
+#   name: "xgb"            # 使用自訂 XGBoost 包裝，可切換 "xgb_cls"/"xgb_reg"
+#   num_classes: 2         # 任務類別數；二分類請設 2，回歸則設 1
+#   n_estimators: 800      # 棵數上限（迴圈會 warm-start 並配合早停擇最佳迭代）
+#   max_depth: 6           # 單棵樹的最大深度，控制模型複雜度
+#   learning_rate: 0.03    # shrinkage/LR，越小越穩定但需更多樹
+#   subsample: 0.8         # 每棵樹抽樣資料比例，<1 有助降低過擬合
+#   colsample_bytree: 0.8  # 每棵樹抽樣特徵比例，配合 subsample 做隨機化
+#   min_child_weight: 1.0  # 子節點最小資料量，增大可抑制過擬合
+#   reg_alpha: 0.0         # L1 正則（葉節點權重的 Lasso）
+#   reg_lambda: 1.0        # L2 正則（葉節點權重的 Ridge）
+#   tree_method: "hist"    # 直方圖演算法；若要用 GPU，請改在 config 設定 device: cuda
+#   n_jobs: 0              # CPU 線程數，0 讓 xgboost 自動選擇（GPU 版仍保留 0）
+#   es_step: 50            # 每次增量樹的數量，配合早停掃描
+#   es_patience: 5         # 早停耐心值，連續未改善幾次就停止
+#   es_min_delta: 0.0      # 早停判準最小改善幅度（<=此差異視為未提升）
 
-  tbm_csv_path: data/TBM_label/BTC-USDT_1h_ewma_up3_dn3_lookback36_label.csv
-  keep_sides: long       # 或 short；若 csv 可能同一 t0 有雙邊，請先選邊
-  align_method: pad        # 若 15m 缺列再用 pad
-
-
-post_infer:
-  tbm_concat:
-    enabled: true                 # 設為 true 啟用 trial 完成後的全區間推論 + 寫回 TBM CSV
-    date_start: "2023-01-01"      # 推論起始
-    date_end:   "2025-08-22"      # 推論結束
-    output_column: "pred"          # 追加到 TBM CSV 的欄位名
-    csv_path_override: null        # 若不為空，覆蓋 cfg.label.tbm_csv_path
 
