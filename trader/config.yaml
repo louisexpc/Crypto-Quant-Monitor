@@ -1,0 +1,17 @@
+data:
+  symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+  interval: "1m"
+  market: "futures" # Options: "spot", "futures"
+  lookback: 100
+  features:
+    - "open"
+    - "high"
+    - "low"
+    - "close"
+    - "volume"
+  redis_url: "redis://localhost:6379"
+  # rumtime option
+  queue_max: 200000
+  health_timeout: 30.0
+  backoff_base: 1.0
+  backoff_max: 60.0
