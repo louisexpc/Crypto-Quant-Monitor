@@ -1,14 +1,11 @@
 data:
   symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-  interval: "1m"
+  interval: "15m" # Options: "1m", "5m", "15m", "1h", "4h", "1d"
   market: "futures" # Options: "spot", "futures"
   lookback: 100
   features:
-    - "open"
-    - "high"
-    - "low"
-    - "close"
-    - "volume"
+    long_feature_cfg_path: "configs/feature_108_long.yaml"
+    short_feature_cfg_path: "configs/feature_108_short.yaml"
   redis_url: "redis://localhost:6379"
   # rumtime option
   queue_max: 200000
