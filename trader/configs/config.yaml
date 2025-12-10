@@ -1,3 +1,6 @@
+exchange:
+  id: 'binance'           # 交易所 ID，從 binance 改為 mexc
+  default_type: 'swap' # 市場類型，'spot' (現貨) 或 'swap' (永續合約)
 data:
   symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
   interval: "15m" # Options: "1m", "5m", "15m", "1h", "4h", "1d"

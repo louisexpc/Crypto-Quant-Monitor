@@ -6,9 +6,12 @@ import yaml
 import re
 import numpy as np
 import pandas as pd
+# 在檔案開頭改成這段
 import pandas_ta as ta
+
+
 from tsfeatures import tsfeatures as _tsf  # Nixtla 版 API：tsfeatures(panel, freq=...)
-from train.train_utils.random_alpha_generator.random_alpha_generator import load_alpha
+
 
 try:
     from tqdm.auto import tqdm
@@ -30,6 +33,7 @@ class IndicatorLibrary:
     """
 
     def __init__(self,
+                 df_raw: pd.DataFrame,
                  *,
                  freq_check: str | None = None,
                  prefer_time_col: str = "timestamp"):
@@ -43,7 +47,7 @@ class IndicatorLibrary:
         """
         self.freq_check = freq_check
         self.prefer_time_col = prefer_time_col
-        self.df = None  # type: pd.DataFrame
+        self.df = self._normalize_ohlcv(df_raw)
         self.ohlcv = {
             "open":   self.df["open"],
             "high":   self.df["high"],
@@ -98,7 +102,7 @@ class IndicatorLibrary:
             if len(miss_idx) > 0:
                 print(f"[WARN] 缺少 {len(miss_idx)} 根 {self.freq_check} K；預設不補齊。")
 
-        self.df = df
+        return df
 
     @staticmethod
     def _make_utc_index_from_col(col: pd.Series, kind: str) -> pd.DatetimeIndex:
@@ -633,46 +637,47 @@ class IndicatorLibrary:
         features: Dict[str, pd.Series] = {}
         used_names: set[str] = set()
 
-        for idx, raw_path in enumerate(path_list, start=1):
-            path = Path(raw_path)
-            if not path.is_file():
-                raise FileNotFoundError(f"alpha 路徑不存在: {path}")
+        # for idx, raw_path in enumerate(path_list, start=1):
+        #     path = Path(raw_path)
+        #     if not path.is_file():
+        #         raise FileNotFoundError(f"alpha 路徑不存在: {path}")
 
-            try:
-                alpha = load_alpha(path.as_posix())
-            except Exception as exc:
-                raise RuntimeError(f"載入 alpha 失敗: {path}") from exc
+        #     try:
+        #         alpha = load_alpha(path.as_posix())
+        #     except Exception as exc:
+        #         raise RuntimeError(f"載入 alpha 失敗: {path}") from exc
 
-            try:
-                values = alpha.tree.eval(self.df)
-            except Exception as exc:
-                raise RuntimeError(f"評估 alpha 失敗: {path}") from exc
+        #     try:
+        #         values = alpha.tree.eval(self.df)
+        #     except Exception as exc:
+        #         raise RuntimeError(f"評估 alpha 失敗: {path}") from exc
 
-            if isinstance(values, pd.DataFrame):
-                if values.shape[1] != 1:
-                    raise ValueError(f"alpha {path} 的輸出包含多個欄位，暫不支援。")
-                values = values.iloc[:, 0]
+        #     if isinstance(values, pd.DataFrame):
+        #         if values.shape[1] != 1:
+        #             raise ValueError(f"alpha {path} 的輸出包含多個欄位，暫不支援。")
+        #         values = values.iloc[:, 0]
 
-            if not isinstance(values, pd.Series):
-                values = pd.Series(values, index=self.df.index)
+        #     if not isinstance(values, pd.Series):
+        #         values = pd.Series(values, index=self.df.index)
 
-            if not values.index.equals(self.df.index):
-                values = values.reindex(self.df.index)
+        #     if not values.index.equals(self.df.index):
+        #         values = values.reindex(self.df.index)
 
-            series = pd.to_numeric(values, errors="coerce").astype("float32")
+        #     series = pd.to_numeric(values, errors="coerce").astype("float32")
 
-            base = f"ALPHA__{path.stem or f'alpha_{idx}'}"
-            base = re.sub(r"[^0-9A-Za-z_]+", "_", base)
-            name = base
-            suffix = 1
-            while name in used_names:
-                suffix += 1
-                name = f"{base}__{suffix}"
+        #     base = f"ALPHA__{path.stem or f'alpha_{idx}'}"
+        #     base = re.sub(r"[^0-9A-Za-z_]+", "_", base)
+        #     name = base
+        #     suffix = 1
+        #     while name in used_names:
+        #         suffix += 1
+        #         name = f"{base}__{suffix}"
 
-            used_names.add(name)
-            features[name] = series
+        #     used_names.add(name)
+        #     features[name] = series
 
-        return pd.DataFrame(features, index=self.df.index)
+        # return pd.DataFrame(features, index=self.df.index)
+        return pd.DataFrame()  # 暫時註解掉，避免未定義 load_alpha 導致錯誤。
     
     # === 新增於 IndicatorLibrary 內：VectorBT（pandas_ta / TA-Lib） ===
     def build_VBT(self,
@@ -895,8 +900,21 @@ class IndicatorLibrary:
             kw.update(grid)  # 參數網格
 
             ind = F.run(**kw)
-            short = (getattr(F, "short_name", None) or fn).lower()
-            for out_name in (F.output_names or []):
+            # 處理 short_name：可能是字串，也可能是 @property
+            short_attr = getattr(F, "short_name", None)
+            if isinstance(short_attr, property):
+                try:
+                    short_attr = short_attr.fget(F)
+                except Exception:
+                    short_attr = None
+
+            if short_attr:
+                short = str(short_attr).lower()
+            else:
+                short = str(fn).lower()
+
+            # 依 output_names 展開所有輸出
+            for out_name in (getattr(F, "output_names", None) or []):
                 if not hasattr(ind, out_name):
                     continue
                 df_out = getattr(ind, out_name)
@@ -1332,109 +1350,5 @@ def _apply_nan_policy(df: pd.DataFrame, policy: str, *, name: str) -> pd.DataFra
     return interp
 
 
-def main():
-    # 1. load cfg & data
-    cfg_path = r"feature_selection/features_computer/features_config.yaml"
-    with open(cfg_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    plan = cfg["features"]["plan"]
-    data_cfg = cfg["data"]
-    out_path = cfg["export"]["out"]
-
-    # 2. Normalize OHLCV & compute feature
-    df_raw = pd.read_csv(data_cfg["path"])
-    lib = IndicatorLibrary(df_raw=df_raw, freq_check=data_cfg["freq"], prefer_time_col=data_cfg["index_col"])
-    fc = FeatureComputer(lib)
-    passthrough_cols = fc.passthrough_columns(cfg)
-    X = fc.compute(plan, cfg)
-
-    # 3. Assemble final dataframe: time columns + OHLCV + features + 1-min info
-    idx = pd.DatetimeIndex(X.index)
-
-    # time columns（重新建立，避免與原表重名）
-    dt_naive = idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None else idx
-    ts_ms = (idx.view("int64") // 1_000_000).astype("int64")
-    time_df = pd.DataFrame({
-        "datetime": dt_naive,
-        "timestamp": ts_ms,
-    }, index=idx)
-
-    # original OHLCV（未 shift，僅供標註/檢查；訓練時請勿選用）
-    ohlcv_cols = [c for c in ["open","high","low","close","volume"] if c in lib.df.columns]
-    ohlcv_df = lib.df.loc[idx, ohlcv_cols].astype("float32")
-
-    # all 1-min columns (prefix m_) — 也 shift(1) 以保證「所有訓練可用特徵」都不洩漏
-    if passthrough_cols:
-        minute_df = (
-            lib.df.loc[idx, passthrough_cols]
-            .apply(pd.to_numeric, errors="coerce")
-            .astype("float32")
-            .shift(1)
-        )
-    else:
-        minute_df = pd.DataFrame(index=idx)
-
-    # 避免重複欄位：將白名單分鐘特徵僅保留一次
-    X = X.drop(columns=passthrough_cols, errors="ignore")
-
-    # combine（15m 主檔）
-    out = pd.concat([time_df, ohlcv_df, X], axis=1)
-    micro = pd.concat([time_df, minute_df], axis=1) if not minute_df.empty else None
-
-    # NaN policy
-    nan_policy = (cfg.get("export", {}) or {}).get("nan_policy", "drop")
-    out = _apply_nan_policy(out, nan_policy, name="main")
-    if micro is not None:
-        micro = _apply_nan_policy(micro, nan_policy, name="micro")
-        # 若 drop 造成索引不一致，取交集
-        if not out.index.equals(micro.index):
-            common_idx = out.index.intersection(micro.index)
-            out = out.loc[common_idx]
-            micro = micro.loc[common_idx]
-
-    # Optional: quick validation of expected vs. actual feature columns
-    try:
-        expect_cols = FeatureComputer(lib).columns_for_plan(plan, cfg)
-        missing_cols = [c for c in expect_cols if c not in X.columns]
-        if missing_cols:
-            print(f"[WARN] {len(missing_cols)} feature columns missing in X (可能在 dropna 前全 NaN 或 builder 無輸出):\n  {missing_cols[:20]}{' ...' if len(missing_cols)>20 else ''}")
-    except Exception as e:
-        print(f"[INFO] columns_for_plan() check skipped: {e}")
-
-    # 寫檔前檢查不允許重複欄位（Parquet 嚴格）
-    dups = out.columns[out.columns.duplicated()]
-    if len(dups):
-        raise ValueError(f"Duplicate columns remain before export: {list(dups)}")
-
-    # 4. Export
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.suffix.lower() == ".parquet":
-        out.to_parquet(out_path, index=False)
-    elif out_path.suffix.lower() == ".csv":
-        out.to_csv(out_path, index=False)
-    else:
-        out = out.astype("float32")
-        out.to_parquet(out_path.with_suffix(".parquet"), index=False)
-
-    # 4-b) Export micro (1-min) features if available
-    if micro is not None and not micro.empty:
-        micro_dups = micro.columns[micro.columns.duplicated()]
-        if len(micro_dups):
-            raise ValueError(f"Duplicate columns in micro features before export: {list(micro_dups)}")
-
-        micro_path = out_path.with_name(f"{out_path.stem}_1min{out_path.suffix}")
-        if micro_path.suffix.lower() == ".parquet":
-            micro.to_parquet(micro_path, index=False)
-        elif micro_path.suffix.lower() == ".csv":
-            micro.to_csv(micro_path, index=False)
-        else:
-            micro.to_parquet(micro_path.with_suffix(".parquet"), index=False)
-        print(f"[OK] Exported micro features to: {micro_path}")
-
-    print(f"[OK] Exported precomputed features to: {out_path}")
 
 
-if __name__ == "__main__":
-    main()

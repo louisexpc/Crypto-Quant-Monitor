@@ -71,7 +71,6 @@ features:
       kwargs:
         fast: 8
         slow: 21
-        lookback: 2
         mamode: "ema"
 
     # === PVO（custom builder）：PVO_4_12_6, PVO_12_26_9 ===
@@ -81,7 +80,6 @@ features:
         fast: 4
         slow: 12
         signal: 6
-        scalar: 100
 
     - name: PVO
       enabled: true
@@ -89,7 +87,6 @@ features:
         fast: 12
         slow: 26
         signal: 9
-        scalar: 100
 
     # === PVR（Price Volume Ratio / Rank）：PVR ===
     - name: PVR
@@ -143,8 +140,15 @@ features:
     - name: MOM
       enabled: true
       kwargs:
-        lengths: [4, 8, 16]
-        source: "close"
+        length: 4
+    - name: MOM
+      enabled: true
+      kwargs:
+        length: 8
+    - name: MOM
+      enabled: true
+      kwargs:
+        length: 16
 
     # === 透過 VBT 跑 pandas_ta 指標 ===
     - VBT:
@@ -152,6 +156,8 @@ features:
         kwargs:
           lib: pandas_ta
           all: false
+          # 排除輸出巨大或多輸入難匹配的族群，避免記憶體爆炸
+          exclude: ["*matrix*", "*ichimoku*", "*kama*", "*wave*", "*aroon*", "*psar*", "*vwap*"]
           items:
             # 1) er__er__close
             - fn: "er"

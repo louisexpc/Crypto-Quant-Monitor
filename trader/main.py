@@ -3,7 +3,8 @@ import logging
 import os
 import signal
 from pathlib import Path
-from data_manager import DataManager
+from utils.data_collector import ExchangeDataCollector
+from utils.feature_engine import FeatureEngine
 import dotenv
 import yaml
 import argparse
@@ -19,10 +20,27 @@ class Trader:
     """
 
     def __init__(self, api_key:str, api_secret:str, config:dict):
-        self.data_manager = DataManager(api_key, api_secret, config['data'])
+       
+        self.data_collector = ExchangeDataCollector( config['exchange'])
+        
+        """Feature Computer"""
+        self.long_feat_engine = FeatureEngine.from_yaml(config['data']['features']['long_feature_cfg_path'])
+        self.short_feat_engine = FeatureEngine.from_yaml(config['data']['features']['short_feature_cfg_path'])
         self.logger = logging.getLogger(self.__class__.__name__)
 
         self.pidfile = "./trader.pid"
+    def test_pipeline(self):
+        df_15m  = self.data_collector.fetch_ohlcv("BTCUSDT", "15m", 400)
+        # df_1hr  = self.data_collector.fetch_ohlcv("BTCUSDT", "1h", 200)
+        fng = self.data_collector.fetch_FNG(5)
+        merged_df = self.data_collector.merge_ohlcv_fng(df_15m, fng)
+
+        if merged_df is not None:
+            X_short = self.short_feat_engine.compute_features(merged_df)
+            self.logger.info(f"Short-term feature matrix shape: {X_short.shape}, columns: {X_short.columns.tolist()}\n{X_short}")
+
+            X_long = self.long_feat_engine.compute_features(merged_df)
+            self.logger.info(f"Long-term feature matrix shape: {X_long.shape}, columns: {X_long.columns.tolist()}\n{X_long}")
 
     async def run_until_signal(self):
         """
@@ -85,7 +103,7 @@ def main():
         raise ValueError("API_KEY and API_SECRET must be set in environment variables")
     
     parser = argparse.ArgumentParser(description="Trader Application")
-    parser.add_argument("--config", type=str, required=True, help="Path to the configuration YAML file")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to the configuration YAML file")
     parser.add_argument("--log_dir", type=str, default="logs", help="Directory to store log files")
     args = parser.parse_args()
 
@@ -103,13 +121,15 @@ def main():
     )
 
     trader = Trader(api_key, api_secret, config)
-    try:
-        asyncio.run(trader.run_until_signal())
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        logging.exception("Unhandled exception in main: %s", e)
-
+    # try:
+    #     asyncio.run(trader.run_until_signal())
+    # except KeyboardInterrupt:
+    #     pass
+    # except Exception as e:
+    #     logging.exception("Unhandled exception in main: %s", e)
+    trader.test_pipeline()
+if __name__ == "__main__":
+    main()
 
 
 

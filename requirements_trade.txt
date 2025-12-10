@@ -1,0 +1,8 @@
+ccxt
+pandas
+PyYAML
+numpy
+pandas_ta
+vectorbt
+tsfeatures
+dotenv
