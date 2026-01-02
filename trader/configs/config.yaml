@@ -15,3 +15,7 @@ data:
   health_timeout: 30.0
   backoff_base: 1.0
   backoff_max: 60.0
+
+trader:
+  type: "futures" # Options: "spot", "futures"
+  useTestnet: true
