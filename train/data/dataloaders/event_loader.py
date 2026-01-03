@@ -12,6 +12,7 @@ from train.data.dataloaders.base import (
     apply_scaling,
     label_counts_from_ds,
     build_loaders,
+    clip_df_by_start_date,
 )
 from train.data.folds import split_fold_to_indices
 from train.data.dataset.event_dataset import EventDataset
@@ -32,11 +33,13 @@ def make_event_loaders_for_fold(
     tr_idx, va_idx, te_idx = split_fold_to_indices(df_events, fold, cfg)
 
     # 2) 讀特徵 + 過濾欄位
-    feat_df = load_precomputed_features(path=cfg["data"]["path"]).astype(np.float32)
+    feat_df = load_precomputed_features(path=cfg["data"]["path"])
+    feat_df = clip_df_by_start_date(feat_df, cfg).astype(np.float32)
 
     micro_cfg = (cfg.get("data", {}) or {}).get("micro", {})
     if micro_cfg.get("enabled") and micro_cfg.get("path"):
-        micro_df = load_precomputed_features(path=micro_cfg["path"]).astype(np.float32)
+        micro_df = load_precomputed_features(path=micro_cfg["path"])
+        micro_df = clip_df_by_start_date(micro_df, cfg).astype(np.float32)
         feat_df = feat_df.join(micro_df, how="left")
 
     if feat_df.isna().any().any():

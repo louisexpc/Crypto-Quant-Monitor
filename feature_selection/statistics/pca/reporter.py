@@ -100,5 +100,5 @@ if __name__ == "__main__":
     main()
 
 """
-python feature_selection/statistics/pca/reporter.py --meta feature_selection/results/pca/meta.json
+python feature_selection/statistics/pca/reporter.py --meta feature_selection/results/pca_60/meta.json
 """

@@ -8,7 +8,10 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from tsfeatures import tsfeatures as _tsf  # Nixtla 版 API：tsfeatures(panel, freq=...)
-from train.train_utils.random_alpha_generator.random_alpha_generator import load_alpha
+try:
+    from train.train_utils.random_alpha_generator.random_alpha_generator import load_alpha
+except ImportError:  # pragma: no cover - tqdm optional
+    pass
 
 try:
     from tqdm.auto import tqdm

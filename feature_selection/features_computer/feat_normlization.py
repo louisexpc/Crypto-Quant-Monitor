@@ -234,6 +234,6 @@ if __name__ == "__main__":
 
 """
 python3 -m feature_selection.features_computer.feat_normlization \
-    --input data/precomputed/btcusdt_15m_features_VBT_1min.csv
+    --input data/precomputed/btcusdt_15m_features_VBT_no_leak.csv \
     --rolling-window 144
 """

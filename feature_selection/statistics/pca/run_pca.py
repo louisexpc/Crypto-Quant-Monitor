@@ -43,9 +43,28 @@ class PCAConfig:
     shuffle: bool
     topn_loadings: int
     random_state: int
+    start: str | None = None
+    end: str | None = None
+
+    def __post_init__(self):
+        # YAML 可能將未加引號的日期解析為 datetime.date；統一轉成字串以便後續處理/序列化
+        self.start = str(self.start) if self.start is not None else None
+        self.end = str(self.end) if self.end is not None else None
 
 
 # ----------------------------- Helper (PCA 專屬) -----------------------------
+
+def _to_utc(ts: str | None):
+    """將輸入字串轉成 UTC timezone aware Timestamp（None/空字串則回傳 None）"""
+    if not ts:
+        return None
+    parsed = pd.Timestamp(ts)
+    if parsed.tzinfo is None:
+        parsed = parsed.tz_localize("UTC")
+    else:
+        parsed = parsed.tz_convert("UTC")
+    return parsed
+
 
 def make_pipeline(n_components: float | int, whiten: bool, impute: str) -> Pipeline:
     """ 1. 說明: 建立 Imputer → StandardScaler → PCA 的安全管線
@@ -106,6 +125,17 @@ def run(cfg: PCAConfig) -> None:
     if cfg.datetime_col not in df.columns:
         raise ValueError(f"datetime 欄位 {cfg.datetime_col} 不存在")
     df[cfg.datetime_col] = pd.to_datetime(df[cfg.datetime_col], utc=True)
+
+    # 依 start/end 範圍過濾
+    start_ts = _to_utc(cfg.start)
+    end_ts = _to_utc(cfg.end)
+    if start_ts is not None:
+        df = df[df[cfg.datetime_col] >= start_ts]
+    if end_ts is not None:
+        df = df[df[cfg.datetime_col] <= end_ts]
+    if df.empty:
+        raise ValueError("指定的時間範圍內沒有資料，請檢查 start/end 或輸入檔。")
+
     df.sort_values(cfg.datetime_col, inplace=True)
     df.reset_index(drop=True, inplace=True)
 

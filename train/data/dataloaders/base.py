@@ -1,6 +1,6 @@
 # train/data/dataloaders/base.py
 from __future__ import annotations
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Any
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
@@ -66,6 +66,30 @@ def load_precomputed_features(
             if col in df.columns:
                 df = df.drop(columns=[col])
     return df
+
+
+def clip_df_by_start_date(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
+    """
+    若 cfg.cv.start_date 有設，僅保留該日期（含）之後的列，避免 rolling 前置 NaN 影響。
+    """
+    cv_cfg = (cfg.get("cv", {}) or {})
+    start_date = cv_cfg.get("start_date")
+    if not start_date:
+        return df
+    try:
+        start_ts = pd.Timestamp(start_date)
+    except Exception:
+        return df
+    idx_tz = getattr(df.index, "tz", None)
+    if idx_tz is not None:
+        if start_ts.tzinfo is None:
+            start_ts = start_ts.tz_localize(idx_tz)
+        else:
+            start_ts = start_ts.tz_convert(idx_tz)
+    else:
+        if start_ts.tzinfo is not None:
+            start_ts = start_ts.tz_convert(None)
+    return df.loc[df.index >= start_ts]
 
 
 # ---------- Align & Fit-index ----------

@@ -121,6 +121,7 @@ def export_tbm_predictions_for_trial(
     output_column: str = "pred",
     threshold_override: float | None = None,
     decision_mode: str = "mean_prob",   # "mean_prob" | "fold_vote" | "both"
+    collapse_mask_enable: bool = True,
 ) -> str:
     """
     1. 說明:
@@ -249,16 +250,19 @@ def export_tbm_predictions_for_trial(
     _kept, _dropped = [], []
     for i, (m, fdict, res) in enumerate(fold_models):
         try:
-            if collapse_mask(res):
-                _dropped.append({"fold_idx": i})
-                continue
+            if collapse_mask_enable:
+                if collapse_mask(res):
+                    _dropped.append({"fold_idx": i})
+                    continue
         except Exception as e:
             # 資料缺欄等異常：保守起見留著，並提示
             print(f"[export][warn] collapse_mask failed on fold {i}: {e}; keep it.")
         _kept.append((m, fdict, res))
 
     if not _kept:
-        raise RuntimeError("[export] 所有 fold 皆被 collapse_mask 剔除，停止匯出。")
+        raise RuntimeError(
+            "[export] 無可用 fold 供匯出（可能因 collapse_mask 剔除或 fold_models 為空）。"
+        )
     if _dropped:
         print(f"[export] drop {len(_dropped)} fold(s) by collapse_mask: {_dropped}")
 

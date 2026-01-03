@@ -13,6 +13,31 @@ from train.data.folds import FoldGenerator, split_fold_to_indices
 # 單變量評分器
 from feature_selection.statistics.rank_biserial.scorer import VetScorer
 
+
+def _prepare_paths(paths_cfg: Dict[str, str]) -> Dict[str, str]:
+    """
+    Resolve plain filenames for outputs against paths.output_folder; precomputed stays as-is.
+    """
+    resolved = dict(paths_cfg)
+    output_folder = paths_cfg.get("output_folder")
+    base_path = Path(output_folder) if output_folder else None
+    folder_keys = {"out_csv", "selected_feat_csv", "selected_feat_cols"}
+    for key in ("precomputed", "out_csv", "selected_feat_csv", "selected_feat_cols"):
+        raw_value = paths_cfg.get(key)
+        if not raw_value:
+            continue
+        path_obj = Path(raw_value)
+        join_with_base = (
+            base_path is not None
+            and key in folder_keys
+            and not path_obj.is_absolute()
+            and len(path_obj.parts) == 1
+        )
+        resolved[key] = str((base_path / path_obj) if join_with_base else path_obj)
+    if base_path:
+        resolved["output_folder"] = str(base_path)
+    return resolved
+
 class EventData:
     """
     1. 說明:
@@ -300,6 +325,7 @@ def main():
     args = ap.parse_args()
 
     cfg: Dict = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    cfg["paths"] = _prepare_paths(cfg.get("paths", {}))
     if args.side is not None:
         cfg.setdefault("filter", {})["side"] = args.side
 
@@ -370,7 +396,7 @@ if __name__ == "__main__":
 
 """
 用法：
-python feature_selection/statistics/rank_biserial/run_rank_biserial.py --side long --debug
+python feature_selection/statistics/rank_biserial/run_rank_biserial.py --side short --debug
 
 # 如 precomputed 的時間其實是台北本地時間，請在 YAML 設定：
 # index.tz_precomputed: "Asia/Taipei"
