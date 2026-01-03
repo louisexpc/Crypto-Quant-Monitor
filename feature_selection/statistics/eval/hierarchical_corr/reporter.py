@@ -40,8 +40,16 @@ def main():
 
     # 附贈：群大小長條圖
     counts = clusters["cluster"].value_counts().sort_index()
+    cluster_ids = counts.index.astype(int)
     fig, ax = plt.subplots(figsize=(6, 3))
-    ax.bar(counts.index.astype(str), counts.values)
+    ax.bar(cluster_ids, counts.values, width=0.8, align="center")
+    if len(cluster_ids) > 0:
+        tick_start = (cluster_ids.min() // 5) * 5
+        tick_end = cluster_ids.max()
+        ticks = list(range(tick_start, tick_end + 1, 5))
+        if tick_end not in ticks:
+            ticks.append(tick_end)
+        ax.set_xticks(ticks)
     ax.set_xlabel("cluster id")
     ax.set_ylabel("#features")
     ax.set_title("Cluster sizes")

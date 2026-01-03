@@ -1,0 +1,464 @@
+timeframe: 15m
+indicators:
+- name: er__er__close
+  formula: Efficiency Ratio = abs(close_t - close_{t-10}) divided by the sum of absolute
+    1-bar close moves across the same 10-bar window (pandas_ta.er).
+  parameters:
+    source: close
+    length: 10
+    drift: 1
+  period: 10
+- name: thermo__thermos__0
+  formula: THERMOs output from Elder's Thermometer; equals 1 whenever max(|low_t-low_{t-1}|,
+    |high_t-high_{t-1}|) exceeds EMA(length=20) scaled by the short factor (pandas_ta.thermo).
+  parameters:
+    length: 20
+    long: 2
+    short: 0.5
+    mamode: ema
+  period: 20
+- name: squeeze_pro__sqzpro_off__0
+  formula: Squeeze Pro OFF flag indicating Bollinger Bands (20,2) have expanded beyond
+    the wide Keltner Channel (20, scalar=2) while the momentum filter (12/6) confirms
+    release.
+  parameters:
+    bb_length: 20
+    bb_std: 2.0
+    kc_length: 20
+    kc_scalar_wide: 2.0
+    kc_scalar_normal: 1.5
+    kc_scalar_narrow: 1.0
+    mom_length: 12
+    mom_smooth: 6
+    mamode: sma
+  period: 20
+- name: pvo__pvoh__volume
+  formula: PVO histogram = scalar*((EMA(volume,fast) - EMA(volume,slow))/EMA(volume,slow))
+    - EMA(PVO, signal) with pandas_ta.pvo defaults.
+  parameters:
+    fast: 12
+    slow: 26
+    signal: 9
+    scalar: 100
+  period: 12
+- name: DOW_SIN
+  formula: Weekly sine term sin(2π * day_of_week / 7) derived from build_TIME_CYC
+    in the Asia/Taipei timezone.
+  parameters:
+    tz: Asia/Taipei
+    weekly: true
+  period: 672
+- name: sent_fng_diff1
+  formula: Fear & Greed Index first difference sent_fng(t) - sent_fng(t-1 day) passed
+    through build_fng.
+  parameters:
+    source: sent_fng
+    lag: 1 day
+  period: 96
+- name: ATR_28
+  formula: Average True Range over 28 bars (ta.atr on high/low/close) with pct=True
+    so ATRP is emitted alongside the raw ATR.
+  parameters:
+    length: 28
+    pct: true
+  period: 28
+- name: PVO_4_12_6
+  formula: Percentage Volume Oscillator using EMA(volume,4) and EMA(volume,12) with
+    a 6-bar signal EMA (IndicatorLibrary.build_PVO).
+  parameters:
+    fast: 4
+    slow: 12
+    signal: 6
+    scalar: 100
+  period: 12
+- name: stoch__stochh__0
+  formula: Stochastic oscillator histogram (%K-%D) computed with k=14, d=3, smooth_k=3
+    on OHLC prices (pandas_ta.stoch).
+  parameters:
+    k: 14
+    d: 3
+    smooth_k: 3
+    mamode: sma
+  period: 14
+- name: RANGE_32
+  formula: Rolling mean of (high-low)/|close| across a 32-bar window (build_RANGE
+    with pct=True).
+  parameters:
+    window: 32
+    pct: true
+  period: 32
+- name: ATR_14
+  formula: Average True Range over 14 bars with the same pct-normalized companion
+    column (build_ATR).
+  parameters:
+    length: 14
+    pct: true
+  period: 14
+- name: tos_stdevall__tos_stdevall_lr__close
+  formula: Linear regression baseline fitted to the available closes by pandas_ta.tos_stdevall
+    (length defaults to the entire history).
+  parameters:
+    length: expanding
+    stds:
+    - 1
+    - 2
+    - 3
+    ddof: 1
+  period: 0
+- name: ATRP_28
+  formula: Relative ATR = ATR_28 divided by the absolute close (emitted as ATRP_28
+    when pct=True).
+  parameters:
+    length: 28
+    pct: true
+  period: 28
+- name: vhf__vhf__close
+  formula: Vertical Horizontal Filter = |HH_28 - LL_28| / Σ|close_t - close_{t-1}|
+    over 28 bars (pandas_ta.vhf).
+  parameters:
+    length: 28
+    drift: 1
+  period: 28
+- name: smi__smio__close
+  formula: SMI oscillator (SMI - signal) derived from pandas_ta.smi with fast=5, slow=20,
+    signal=5.
+  parameters:
+    fast: 5
+    slow: 20
+    signal: 5
+  period: 20
+- name: ATRP_14
+  formula: Relative ATR = ATR_14 divided by the absolute close (IndicatorLibrary.build_ATR
+    with pct=True).
+  parameters:
+    length: 14
+    pct: true
+  period: 14
+- name: exhc__exhc_upa__close
+  formula: Exhaustion Count upward sequence (DeMark style) counting up to 13 consecutive
+    closes that exceed the value 4 bars prior.
+  parameters:
+    length: 4
+    cap: 13
+    show_all: true
+  period: 4
+- name: EWM_S_12
+  formula: Exponentially weighted std of log returns with halflife=12 (build_EWMRET).
+  parameters:
+    halflife: 12
+    stat: std
+  period: 12
+- name: RANGE_16
+  formula: Rolling mean of (high-low)/|close| over a 16-bar window (build_RANGE).
+  parameters:
+    window: 16
+    pct: true
+  period: 16
+- name: squeeze__sqz_off__0
+  formula: TTM Squeeze OFF flag when Bollinger Bands (20,2) extend outside the Keltner
+    Channel (20, scalar=1.5) with momentum smoothing 12/6.
+  parameters:
+    bb_length: 20
+    bb_std: 2.0
+    kc_length: 20
+    kc_scalar: 1.5
+    mom_length: 12
+    mom_smooth: 6
+    mamode: sma
+  period: 20
+- name: eri__bearp__0
+  formula: Bear Power = low - EMA(close, length=13) from pandas_ta.eri.
+  parameters:
+    length: 13
+    mamode: ema
+  period: 13
+- name: PXV_LR_VCHG
+  formula: Log-return (1 bar) multiplied by the clipped volume percentage change ([-1,1])
+    per build_PXVOL.
+  parameters:
+    logret_lag: 1
+    volume_clip:
+    - -1.0
+    - 1.0
+  period: 1
+- name: rwi__rwil__0
+  formula: Random Walk Index low line = (high_{t-length} - low_t) / (ATR(length)*sqrt(length))
+    with length=14.
+  parameters:
+    length: 14
+    mamode: rma
+    drift: 1
+  period: 14
+- name: cfo__cfo__close
+  formula: Chande Forecast Oscillator = 100 * (close - TSF(close, length=9)) / close.
+  parameters:
+    length: 9
+    scalar: 100
+    drift: 1
+  period: 9
+- name: kurtosis__kurt__close
+  formula: Rolling kurtosis of close over a 30-bar lookback (pandas_ta.kurtosis).
+  parameters:
+    length: 30
+  period: 30
+- name: skew__skew__close
+  formula: Rolling skewness of close over a 30-bar lookback (pandas_ta.skew).
+  parameters:
+    length: 30
+  period: 30
+- name: J_9_3
+  formula: Custom KDJ J line = 3*K - 2*D computed with k=9, d=3, smooth_k=3 (IndicatorLibrary.build_KDJ).
+  parameters:
+    k: 9
+    d: 3
+    smooth_k: 3
+  period: 9
+- name: PVO_12_26_9
+  formula: Percentage Volume Oscillator with fast=12, slow=26, signal=9 (IndicatorLibrary.build_PVO).
+  parameters:
+    fast: 12
+    slow: 26
+    signal: 9
+    scalar: 100
+  period: 26
+- name: pvo__pvo__volume
+  formula: Main PVO line using the pandas_ta defaults (EMA(volume,12) vs EMA(volume,26)
+    with signal=9).
+  parameters:
+    fast: 12
+    slow: 26
+    signal: 9
+    scalar: 100
+  period: 26
+- name: EWM_S_48
+  formula: Exponentially weighted std of log returns with halflife=48 (build_EWMRET).
+  parameters:
+    halflife: 48
+    stat: std
+  period: 48
+- name: RSI_28
+  formula: Wilder RSI of the close over 28 bars (IndicatorLibrary.build_RSI).
+  parameters:
+    length: 28
+  period: 28
+- name: AMATe_LR_8_21_2
+  formula: Long-run Archer Moving Average Trend value computed with EMA fast=8, slow=21,
+    lookback=2 (IndicatorLibrary.build_AMATE_LR).
+  parameters:
+    fast: 8
+    slow: 21
+    lookback: 2
+    mamode: ema
+  period: 21
+- name: amat__amate_lr__close
+  formula: Vectorbt/pandas_ta AMAT long-run state using the same fast=8, slow=21,
+    lookback=2 EMA settings on close.
+  parameters:
+    fast: 8
+    slow: 21
+    lookback: 2
+    mamode: ema
+  period: 21
+- name: kdj__j__0
+  formula: J line from pandas_ta.kdj with length=9 and signal=3 (3*K - 2*D).
+  parameters:
+    length: 9
+    signal: 3
+  period: 9
+- name: vortex__vtxm__0
+  formula: Negative Vortex Indicator (VIM) = Σ|low_t - high_{t-1}| / Σ true range
+    over 14 bars.
+  parameters:
+    length: 14
+    drift: 1
+  period: 14
+- name: cti__cti__close
+  formula: Correlation Trend Indicator = Pearson r between close and time over 12
+    bars (linreg with r=True).
+  parameters:
+    length: 12
+  period: 12
+- name: reflex__reflex__close
+  formula: Reflex zero-lag cycle indicator with length=20, smooth=20, alpha=0.04 (pandas_ta.reflex).
+  parameters:
+    length: 20
+    smooth: 20
+    alpha: 0.04
+  period: 20
+- name: tsv__tsvr__0
+  formula: Time Segmented Volume ratio = TSV / signal SMA using length=18 and signal=10
+    (pandas_ta.tsv).
+  parameters:
+    length: 18
+    signal: 10
+    mamode: sma
+  period: 18
+- name: LOGRET_16
+  formula: Logarithmic return log(close_t) - log(close_{t-16}) (build_LOGRET).
+  parameters:
+    lag: 16
+    pct: false
+  period: 16
+- name: aobv__aobv_lr__0
+  formula: Archer OBV long-run flag using OBV EMAs (fast=4, slow=12) and run_length=2
+    (pandas_ta.aobv).
+  parameters:
+    fast: 4
+    slow: 12
+    run_length: 2
+    mamode: ema
+  period: 12
+- name: stochrsi__stochrsik__close
+  formula: Stochastic RSI %K computed with length=14, rsi_length=14, k=3, d=3 on close
+    (pandas_ta.stochrsi).
+  parameters:
+    length: 14
+    rsi_length: 14
+    k: 3
+    d: 3
+    mamode: sma
+  period: 14
+- name: bbands__bbl__40
+  formula: Lower Bollinger Band = SMA(close,40) - 2 * STD(close,40) (pandas_ta.bbands).
+  parameters:
+    length: 40
+    std: 2.0
+    mamode: sma
+  period: 40
+- name: RSI_14
+  formula: Wilder RSI of the close over 14 bars.
+  parameters:
+    length: 14
+  period: 14
+- name: EWM_S_4
+  formula: Exponentially weighted std of log returns with halflife=4 (build_EWMRET).
+  parameters:
+    halflife: 4
+    stat: std
+  period: 4
+- name: pvr__pvr__0
+  formula: 'Price Volume Rank: rank 1-4 depending on the signs of close and volume
+    changes over one bar (pandas_ta.pvr).'
+  parameters:
+    drift: 1
+  period: 1
+- name: PVR
+  formula: Price Volume Ratio computed by IndicatorLibrary.build_PVR using the same
+    Anthony Macek rank logic over one bar.
+  parameters:
+    drift: 1
+  period: 1
+- name: SLOPE_[4, 8, 16]
+  formula: Linear regression slope of close for lengths 4, 8, and 16 bars (ta.slope)
+    retained as a composite vector in the z-normalized dataset.
+  parameters:
+    lengths:
+    - 4
+    - 8
+    - 16
+    source: close
+  period:
+  - 4
+  - 8
+  - 16
+- name: macd__macdh__12__26__9__close
+  formula: MACD histogram = (EMA(close,12) - EMA(close,26)) - EMA(MACD,9) (pandas_ta.macd).
+  parameters:
+    fast: 12
+    slow: 26
+    signal: 9
+  period: 26
+- name: LOGRET_1
+  formula: 1-bar log return log(close_t) - log(close_{t-1}).
+  parameters:
+    lag: 1
+    pct: false
+  period: 1
+- name: EWM_M_48
+  formula: Exponentially weighted mean of log returns with halflife=48 (build_EWMRET).
+  parameters:
+    halflife: 48
+    stat: mean
+  period: 48
+- name: tos_stdevall__tos_stdevall_u1__close
+  formula: +1σ upper band relative to the regression line from pandas_ta.tos_stdevall
+    (expanding window).
+  parameters:
+    length: expanding
+    std_level: 1
+  period: 0
+- name: ZS_[8, 32, 96]
+  formula: Rolling z-scores of close for windows 8, 32, and 96 bars (ta.zscore) retained
+    together for the 15m/1h/1d regimes.
+  parameters:
+    lengths:
+    - 8
+    - 32
+    - 96
+  period:
+  - 8
+  - 32
+  - 96
+- name: squeeze_pro__sqzpro_on_narrow__0
+  formula: Squeeze Pro ON (narrow) flag when Bollinger Bands (20,2) sit entirely inside
+    the narrow KC channel (scalar=1).
+  parameters:
+    bb_length: 20
+    bb_std: 2.0
+    kc_length: 20
+    kc_scalar_wide: 2.0
+    kc_scalar_normal: 1.5
+    kc_scalar_narrow: 1.0
+    mom_length: 12
+    mom_smooth: 6
+    mamode: sma
+  period: 20
+- name: pvt__pvt__0
+  formula: Price Volume Trend cumulative sum of volume * price rate-of-change (pandas_ta.pvt).
+  parameters:
+    drift: 1
+  period: 0
+- name: EWM_M_12
+  formula: Exponentially weighted mean of log returns with halflife=12 (build_EWMRET).
+  parameters:
+    halflife: 12
+    stat: mean
+  period: 12
+- name: efi__efi__0
+  formula: Elder Force Index = EMA(length=13) of close_diff * volume (pandas_ta.efi).
+  parameters:
+    length: 13
+    mamode: ema
+    drift: 1
+  period: 13
+- name: decreasing__dec__close
+  formula: Binary indicator returned by pandas_ta.decreasing that equals 1 when close_t
+    < close_{t-1}.
+  parameters:
+    length: 1
+    drift: 1
+    strict: false
+  period: 1
+- name: MOM_[4, 8, 16]
+  formula: Simple momentum close_t - close_{t-L} for lengths 4, 8, and 16 bars retained
+    as a combined feature block.
+  parameters:
+    lengths:
+    - 4
+    - 8
+    - 16
+    source: close
+  period:
+  - 4
+  - 8
+  - 16
+- name: mom__mom__close
+  formula: pandas_ta Momentum using the default 10-bar difference close_t - close_{t-10}.
+  parameters:
+    length: 10
+  period: 10
+- name: pgo__pgo__0
+  formula: Pretty Good Oscillator = (close - SMA(close,14)) / EMA(ATR(14),14) (pandas_ta.pgo).
+  parameters:
+    length: 14
+  period: 14

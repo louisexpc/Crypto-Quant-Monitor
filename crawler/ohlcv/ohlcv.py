@@ -175,7 +175,7 @@ def pick(cli, cfg, default=None):
         return cfg
     return default
 
-DEFAULT_CFG = r"utils/collector/collector_config.yaml"
+DEFAULT_CFG = r"crawler/ohlcv/collector_config.yaml"
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--config', type=str, default=None, help='YAML config path')
