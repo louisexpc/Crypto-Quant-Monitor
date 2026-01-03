@@ -10,15 +10,16 @@ Main entry for Optuna tuning with runtime-built features.
 """
 
 from __future__ import annotations
+import argparse
 from pathlib import Path
-
+from typing import Any, Dict
 import optuna
 import pandas as pd
 import os
 from train.pipeline.search.objective import objective
 from train.core.context import set_seed
 from train.core.config_loader import load_cfg
-from train.data.dataloaders.base import load_precomputed_features, reindex_to_full_grid
+from train.data.dataloaders.base import load_precomputed_features, reindex_to_full_grid, clip_df_by_start_date
 
 
 __all__ = [
@@ -40,6 +41,7 @@ def prepare_dataframe(cfg: dict) -> pd.DataFrame:
     freq = (cfg.get("data", {}) or {}).get("freq")
     if freq and not feat_df.empty:
         feat_df = reindex_to_full_grid(feat_df, str(freq))
+    feat_df = clip_df_by_start_date(feat_df, cfg)
 
     # 沿用舊行為：只取 index 骨架給 make_folds 用
     df = pd.DataFrame(index=feat_df.index)
@@ -84,6 +86,42 @@ def build_study(cfg: dict, run_dir: Path, *, parallel: bool = False) -> optuna.S
 # ======================================================================
 # Section D. 執行訓練與搜尋
 # ======================================================================
+def _apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    cfg = dict(cfg)
+
+    def ensure_branch(parent: Dict[str, Any], key: str) -> Dict[str, Any]:
+        node = parent.get(key)
+        if not isinstance(node, dict):
+            node = {}
+            parent[key] = node
+        return node
+
+    if args.project_name:
+        cfg["project_name"] = args.project_name
+
+    if args.data_path:
+        ensure_branch(cfg, "data")["path"] = args.data_path
+
+    if args.micro_path:
+        data_branch = ensure_branch(cfg, "data")
+        micro_branch = ensure_branch(data_branch, "micro")
+        micro_branch["path"] = args.micro_path
+
+    if args.tbm_csv_path or args.tbm_lookback is not None or args.tbm_keep_sides:
+        label_branch = ensure_branch(cfg, "label")
+        if args.tbm_csv_path:
+            label_branch["tbm_csv_path"] = args.tbm_csv_path
+        if args.tbm_lookback is not None:
+            label_branch["lookback"] = int(args.tbm_lookback)
+        if args.tbm_keep_sides:
+            label_branch["keep_sides"] = args.tbm_keep_sides
+
+    if args.n_trials is not None:
+        ensure_branch(cfg, "search")["n_trials"] = int(args.n_trials)
+
+    return cfg
+
+
 def run_single(cfg_path: str, *, cfg: dict | None = None):
     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
     cfg = cfg or load_cfg(cfg_path)
@@ -116,6 +154,17 @@ def run_single(cfg_path: str, *, cfg: dict | None = None):
 # Section E. 入口
 # ======================================================================
 if __name__ == "__main__":
-    cfg_path = "train/config.yaml"
-    cfg = load_cfg(cfg_path)
-    run_single(cfg_path, cfg=cfg)
+    parser = argparse.ArgumentParser(description="Optuna TBM training entry")
+    parser.add_argument("--config", default="train/config.yaml", help="Path to config YAML.")
+    parser.add_argument("--project-name", help="Override cfg.project_name.")
+    parser.add_argument("--data-path", help="Override cfg.data.path.")
+    parser.add_argument("--micro-path", help="Override cfg.data.micro.path.")
+    parser.add_argument("--tbm-csv-path", help="Override cfg.label.tbm_csv_path.")
+    parser.add_argument("--tbm-lookback", type=int, help="Override cfg.label.lookback.")
+    parser.add_argument("--tbm-keep-sides", choices=["short", "long", "both"], help="Override cfg.label.keep_sides.")
+    parser.add_argument("--n-trials", type=int, help="Override cfg.search.n_trials.")
+    args = parser.parse_args()
+
+    cfg = load_cfg(args.config)
+    cfg = _apply_cli_overrides(cfg, args)
+    run_single(args.config, cfg=cfg)

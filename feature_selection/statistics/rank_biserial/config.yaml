@@ -1,10 +1,10 @@
 # feature_select/config.yaml
 paths:
-  tbm_labels: "data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv"
-  precomputed: "data/precomputed/btcusdt_15m_features_VBT_z_norm.csv"
+  tbm_labels: "data/TBM_label/win_rate/BTC-USDT_1h_atr_up4_dn4_lookback36_label.csv"
+  precomputed: "data/precomputed/btcusdt_15m_features_VBT_no_leak_z_norm.csv"
 
-  output_folder: "feature_selection/results/rank_biserial/short"  
-  out_csv: "rank_biserial_60.csv"
+  output_folder: "feature_selection/results/rank_biserial/short_no_leak_36"  
+  out_csv: "rank_biserial_60_no_leak.csv"
   selected_feat_csv: "rank_biserial_60_feat.csv"
   selected_feat_cols: "rank_biserial_60_feat_cols.txt"
 
@@ -32,7 +32,7 @@ cv:
   end_date: null       # 可留空
 
 filter:
-  side: long    # 可選: "all" | "long" | "short"
+  side: short    # 可選: "all" | "long" | "short"
 
 scoring:
   do_spearman: false   # 先關閉；需要簽名報酬時再開

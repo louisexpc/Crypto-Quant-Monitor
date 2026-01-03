@@ -13,6 +13,8 @@ cache_features
 train_old
 runs_old
 runs
+DAML
+Report
 feature_selections
 ./crypto_quant_monitor.egg-info
 

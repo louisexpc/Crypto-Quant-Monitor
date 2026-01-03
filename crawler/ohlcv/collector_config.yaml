@@ -4,7 +4,7 @@ exchange:
 
 range:
   start: "2023-01-01"
-  end: "2025-10-25"
+  end: "2025-11-20"
 
 io:
   outdir: "data/ohlcv_2023_new"
@@ -19,4 +19,4 @@ fetch:
 
 monitoring:
   - symbol: "BTC/USDT:USDT"
-    timeframes: ["4h" ]
+    timeframes: ["1m" ]

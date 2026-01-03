@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
+import re
 import numpy as np
 import pandas as pd
 import torch
@@ -214,7 +215,7 @@ class TrialRunner:
         trial_dir = self._tag_trial_dir(trial_dir, task_type, test_avg, trial=trial)
 
         # === 存可重現 config（用實際 effective_seed）===
-        mean_score = float(np.mean(fold_scores)) if fold_scores else float("nan")
+        mean_score = float(np.mean(fold_scores)) if fold_scores else float(-1e9)
         self._dump_reproducible_cfg(cfg, trial_dir, mean_score, effective_seed)
 
         return TrialOutputs(
@@ -515,12 +516,25 @@ class TrialRunner:
                 f"n_fold_models={len(fold_models_for_infer)}",
             ]
             if bool(post_infer.get("enabled", False)) and task_type == "classification":
+                if not folds or not fold_models_for_infer:
+                    debug_lines.append("skip_export=empty_folds_or_models")
+                    with open(trial_dir / "post_infer_debug.txt", "w", encoding="utf-8") as dfp:
+                        dfp.write("\n".join(debug_lines))
+                    return
                 ds = str(post_infer.get("date_start", "2023-01-01"))
                 de = str(post_infer.get("date_end", "2025-08-01"))
                 out_col = str(post_infer.get("output_column", "pred"))
                 out_csv = str(post_infer.get("csv_path_override") or cfg.get("label", {}).get("tbm_csv_path"))
-                s_tag, e_tag = ds.replace("-", ""), de.replace("-", "")
-                save_csv = trial_dir / f"tbm_with_{out_col}_{s_tag}_{e_tag}.csv"
+                trial_name = trial_dir.name
+                match = re.match(r"^(trial_\d+)", trial_name)
+                trial_token = match.group(1) if match else trial_name
+                keep_sides = str(cfg.get("label", {}).get("keep_sides", "both")).lower()
+                lookback_val = cfg.get("label", {}).get("lookback", "unknown")
+                try:
+                    lookback_token = f"{int(lookback_val)}"
+                except (TypeError, ValueError):
+                    lookback_token = str(lookback_val)
+                save_csv = trial_dir / f"{trial_token}_{keep_sides}_{lookback_token}.csv"
                 debug_lines += [f"date_range=[{ds},{de}]", f"tbm_src={out_csv}", f"save_to={save_csv}"]
 
                 export_tbm_predictions_for_trial(
@@ -540,6 +554,7 @@ class TrialRunner:
                         else None
                     ),
                     decision_mode="both",
+                    collapse_mask_enable=bool(post_infer.get("collapse_mask_enable", True)),
                 )
                 print(f"[PostInfer] Saved TBM with predictions: {save_csv}")
                 debug_lines.append("status=ok")

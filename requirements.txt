@@ -3,6 +3,7 @@ python-dotenv
 pyyaml
 ccxt
 pandas
+matplotlib
 numpy<2.0
 pymongo[srv]
 discord.py

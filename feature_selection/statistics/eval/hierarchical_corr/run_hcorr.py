@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# feature_selection/statistics/hierarchical_corr/run_hcorr.py
 from __future__ import annotations
 
 import argparse
@@ -17,6 +17,17 @@ from scipy.spatial.distance import squareform
 def _load_cfg(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+
+def _to_utc(ts: str | None):
+    if not ts:
+        return None
+    parsed = pd.Timestamp(ts)
+    if parsed.tzinfo is None:
+        parsed = parsed.tz_localize("UTC")
+    else:
+        parsed = parsed.tz_convert("UTC")
+    return parsed
 
 
 def _prepare_matrix(cfg: Dict) -> tuple[pd.DataFrame, List[str]]:
@@ -38,18 +49,38 @@ def _prepare_matrix(cfg: Dict) -> tuple[pd.DataFrame, List[str]]:
 
     df.index = pd.to_datetime(df.index, utc=True)
 
+    start_ts = _to_utc(ip.get("start"))
+    end_ts = _to_utc(ip.get("end"))
+    if start_ts is not None:
+        df = df[df.index >= start_ts]
+    if end_ts is not None:
+        df = df[df.index <= end_ts]
+    if df.empty:
+        raise ValueError("[hierarchical_corr] 所選時間範圍沒有資料")
+
     exclude = set(ip.get("exclude_cols") or [])
     num_cols = [c for c in df.columns if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
     if not num_cols:
         raise ValueError("[hierarchical_corr] 沒有可用的數值欄位")
 
     X = df[num_cols].copy()
-    if X.isna().any().any():
-        raise ValueError("[hierarchical_corr] 特徵矩陣仍含 NaN/Inf，請先處理後再分析。")
+    X = X.replace([np.inf, -np.inf], np.nan)
 
     drop_na = bool(ip.get("drop_na", True))
     if drop_na:
         X = X.dropna()
+        if X.isna().any().any():
+            raise ValueError("[hierarchical_corr] dropna 後仍含 NaN/Inf，請檢查輸入資料。")
+    else:
+        if X.isna().any().any():
+            raise ValueError("[hierarchical_corr] 特徵矩陣仍含 NaN/Inf，請先處理後再分析。")
+    var = X.var(axis=0, ddof=0)
+    zero_var_cols = var[var <= 0].index.tolist()
+    if zero_var_cols:
+        X = X.drop(columns=zero_var_cols)
+        if X.empty:
+            raise ValueError("[hierarchical_corr] 全部欄位皆為零變異，無法建立相關矩陣")
+        print(f"[WARN] drop zero-variance columns: {len(zero_var_cols)} removed")
     if X.empty:
         raise ValueError("[hierarchical_corr] dropna 後沒有資料可分析")
     return X, list(X.columns)
@@ -144,6 +175,27 @@ def _plot_corr_heatmap(C: pd.DataFrame, Z, out_png: Path):
     plt.close(fig)
 
 
+def _plot_repr_corr_heatmap(C: pd.DataFrame, reps: List[str], out_png: Path):
+    # 代表指標間的相關性矩陣
+    reps_present = [r for r in reps if r in C.index and r in C.columns]
+    if len(reps_present) < 2:
+        print("[WARN] 代表指標少於 2 或缺資料，略過代表相關矩陣繪圖")
+        return
+    sub = C.loc[reps_present, reps_present]
+    n = len(sub)
+    fig, ax = plt.subplots(figsize=(min(max(4.0, n * 0.4), 20.0), min(max(3.5, n * 0.4), 20.0)))
+    im = ax.imshow(sub.values, origin="lower", aspect="auto", vmin=-1, vmax=1)
+    ax.set_xticks(range(n))
+    ax.set_yticks(range(n))
+    ax.set_xticklabels(reps_present, rotation=90, fontsize=7)
+    ax.set_yticklabels(reps_present, fontsize=7)
+    ax.set_title("Correlation heatmap (representatives)")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+
+
 def _export_selected_features(cfg: Dict, representatives: Iterable[str], run_dir: Path) -> None:
     ip = cfg["input"]
     source_path = Path(ip["csv_path"])
@@ -206,6 +258,8 @@ def main() -> None:
         _plot_dendrogram(Z, names, run_dir / f"{prefix}_dendrogram.png")
     if cfg["report"].get("make_heatmap", True):
         _plot_corr_heatmap(C, Z, run_dir / f"{prefix}_corr_heatmap.png")
+    if cfg["report"].get("make_repr_corr_heatmap", True):
+        _plot_repr_corr_heatmap(C, reps["representative"].tolist(), run_dir / f"{prefix}_repr_corr_heatmap.png")
 
     meta = {
         "n_features": len(names),

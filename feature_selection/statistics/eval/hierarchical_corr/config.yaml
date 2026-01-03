@@ -2,8 +2,8 @@
 input:
   csv_path: "data/precomputed/btcusdt_15m_features_VBT_z_norm.csv"
   index_col: "datetime"      # 可為 "timestamp" 或 None（若整檔全是數值欄）
-  start: null                # 例如 "2023-01-01T00:00:00Z"
-  end: null                  # 例如 "2024-01-01T00:00:00Z"
+  start: 2023-01-03                # 例如 "2023-01-01T00:00:00Z"
+  end: 2025-04-30                  # 例如 "2024-01-01T00:00:00Z"
   drop_na: false              # 是否丟掉含 NaN 的列
   exclude_cols:              # 不參與分群的欄（時間戳、標籤等）
     - datetime
@@ -33,6 +33,7 @@ cluster:
 report:
   make_dendrogram: true
   make_heatmap: true
+  make_repr_corr_heatmap: true
   compute_silhouette: true   # 用 precomputed 距離
   compute_dbindex: false     # DB 需原始向量；可略或用 MDS 投影再近似
 output:

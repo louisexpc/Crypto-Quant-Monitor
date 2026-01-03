@@ -5,8 +5,8 @@
 # 1. ---basic---
 seed: 42
 device: "cuda:0"
-project_name: BTC_2-stream_rank_biserial_108_short
-also_XGB: false
+project_name: BTC_xgboost_long_108
+also_XGB: True
 
 # 2. ---Data---
 data:
@@ -66,6 +66,7 @@ label:
   vol_window: 96         # 波動估計窗口
 
   tbm_csv_path: data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv
+  lookback: 108
   keep_sides: short       # 或 short；若 csv 可能同一 t0 有雙邊，請先選邊
   align_method: pad        # 若 15m 缺列再用 pad
 
@@ -77,6 +78,7 @@ post_infer:
     date_end:   "2025-10-25"      # 推論結束
     output_column: "pred"          # 追加到 TBM CSV 的欄位名
     csv_path_override: null        # 若不為空，覆蓋 cfg.label.tbm_csv_path
+    collapse_mask_enable: false     # 是否啟用 collapse_mask
 
 
 
@@ -89,7 +91,7 @@ train:
   weight_decay: [1e-5]
   batch_size: 256
   epochs: 300
-  grad_clip: [0.3, 3.0]
+  grad_clip: [0.3]
 
   early_stopping_patience: 20
   warmup_epochs: 5
@@ -186,7 +188,7 @@ objective:
 
 # 3. search 次數 | 時長
 search:
-  n_trials: 10
+  n_trials: 1
   timeout: 10    # 小時
   sampler: tpe
   pruner: median
@@ -200,12 +202,12 @@ search:
 # =========================
 model:
   name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
-  d_model: [32, 48, 64]
-  n_heads: [1, 2, 4]
+  d_model: [32]
+  n_heads: [2]
   n_layers: [1]
   mlp_ratio: 2.0
-  dropout: [0, 0.3] 
-  attn_dropout: [0.0, 0.1]
+  dropout: [0.1] 
+  attn_dropout: [0.0]
   pooling: attn     # ["cls" / "attn" / "mean"]
   use_causal: true
   num_classes: 2             # ★ 回歸=1，分類再改成2/3
@@ -222,17 +224,16 @@ model:
 #   name: "xgb"            # 使用自訂 XGBoost 包裝，可切換 "xgb_cls"/"xgb_reg"
 #   num_classes: 2         # 任務類別數；二分類請設 2，回歸則設 1
 #   n_estimators: 800      # 棵數上限（迴圈會 warm-start 並配合早停擇最佳迭代）
-#   max_depth: 6           # 單棵樹的最大深度，控制模型複雜度
+#   max_depth: 3           # 單棵樹的最大深度，控制模型複雜度
 #   learning_rate: 0.03    # shrinkage/LR，越小越穩定但需更多樹
 #   subsample: 0.8         # 每棵樹抽樣資料比例，<1 有助降低過擬合
 #   colsample_bytree: 0.8  # 每棵樹抽樣特徵比例，配合 subsample 做隨機化
-#   min_child_weight: 1.0  # 子節點最小資料量，增大可抑制過擬合
-#   reg_alpha: 0.0         # L1 正則（葉節點權重的 Lasso）
+#   min_child_weight: 5.0  # 子節點最小資料量，增大可抑制過擬合
+#   reg_alpha: 0.1         # L1 正則（葉節點權重的 Lasso）
 #   reg_lambda: 1.0        # L2 正則（葉節點權重的 Ridge）
 #   tree_method: "hist"    # 直方圖演算法；若要用 GPU，請改在 config 設定 device: cuda
 #   n_jobs: 0              # CPU 線程數，0 讓 xgboost 自動選擇（GPU 版仍保留 0）
 #   es_step: 50            # 每次增量樹的數量，配合早停掃描
-#   es_patience: 5         # 早停耐心值，連續未改善幾次就停止
+#   es_patience: 2         # 早停耐心值，連續未改善幾次就停止
 #   es_min_delta: 0.0      # 早停判準最小改善幅度（<=此差異視為未提升）
-
 
