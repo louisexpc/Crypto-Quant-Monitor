@@ -2,7 +2,6 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, Union, Iterable, List
-import yaml
 import re
 import numpy as np
 import pandas as pd
@@ -19,108 +18,31 @@ except ImportError:  # pragma: no cover - tqdm optional
     def tqdm(iterable=None, **kwargs):
         return iterable if iterable is not None else []
 
-DEFAULT_MINUTE_PREFIXES = ("m_",)
-_M_PAT = re.compile(r"^m_(-?\d+)_(.+)$")
-
 # =========================
-# 1) 指標庫：負責把 raw_df → 各種特徵
+# 1) 指標庫：負責把已規格化的 df → 各種特徵
 # =========================
 class IndicatorLibrary:
     """
-    1. 說明: 規格化原始 OHLCV，並提供各類技術指標的建構介面（builders）。
-    2. inputs: 於 __init__ 注入原始 df、期望頻率 freq_check、時間欄位 prefer_time_col。
-    3. return: 實例化後提供 self.builders（name → callable(kwargs)）與多個 build_* 方法。
+    僅負責計算特徵：給定已正規化的 df（DatetimeIndex、OHLCV、附帶其他欄位）後，提供 builders。
     """
 
-    def __init__(self,
-                 df_raw: pd.DataFrame,
-                 *,
-                 freq_check: str | None = None,
-                 prefer_time_col: str = "timestamp"):
+    def __init__(self, df: pd.DataFrame):
         """
-        1. 說明: 初始化並將原始 df 規格化為 UTC DatetimeIndex，且保留 OHLCV 為 float32。
-        2. inputs:
-           - df_raw(pd.DataFrame): 原始 K 線資料，需含 open/high/low/close/volume 與時間欄。
-           - freq_check(str|None): 預期頻率（如 '1h'），僅做警告不修補。
-           - prefer_time_col(str): 優先用來建立索引的時間欄位名稱。
-        3. return: None；初始化 self.df 與 self.ohlcv。
+        df: 已正規化、對齊時間索引的 DataFrame；需包含 open/high/low/close/volume。
         """
-        self.freq_check = freq_check
-        self.prefer_time_col = prefer_time_col
-        self.df = self._normalize_ohlcv(df_raw)
+        need = ["open", "high", "low", "close", "volume"]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            raise ValueError(f"IndicatorLibrary 缺少必要欄位: {missing}")
+        self.df = df
         self.ohlcv = {
-            "open":   self.df["open"],
-            "high":   self.df["high"],
-            "low":    self.df["low"],
-            "close":  self.df["close"],
-            "volume": self.df["volume"],
+            "open":   df["open"],
+            "high":   df["high"],
+            "low":    df["low"],
+            "close":  df["close"],
+            "volume": df["volume"],
         }
 
-    def _normalize_ohlcv(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        """
-        1. 說明: 將原始 df 正規化：建立 UTC 時間索引、排序去重、OHLCV 轉 float32、頻率檢查。
-        2. inputs:
-           - df_raw(pd.DataFrame): 原始資料（可含 timestamp/datetime 欄或已是 DatetimeIndex）。
-        3. return: 規格化後的 DataFrame（UTC DatetimeIndex、含 OHLCV float32）。
-        """
-        df = df_raw.copy()
-        df.columns = [c.lower().strip() for c in df.columns]
-
-        # 1) 建立 UTC 索引（優先用 prefer_time_col，其次 timestamp/datetime）
-        if not isinstance(df.index, pd.DatetimeIndex) or df.index.tz is None:
-            if self.prefer_time_col in df.columns:
-                idx = self._make_utc_index_from_col(df[self.prefer_time_col], self.prefer_time_col)
-            elif "timestamp" in df.columns:
-                idx = self._make_utc_index_from_col(df["timestamp"], "timestamp")
-            elif "datetime" in df.columns:
-                idx = self._make_utc_index_from_col(df["datetime"], "datetime")
-            else:
-                raise ValueError("需要 DatetimeIndex 或 'timestamp'/'datetime' 欄位")
-            df.index = idx
-
-        # 2) 排序、去重（保留最後一筆）
-        df = df.sort_index()
-        df = df[~df.index.duplicated(keep="last")]
-
-        # 3) 確認 OHLCV 存在；只把 OHLCV 轉成 float32，其他欄位一律保留
-        need = ["open", "high", "low", "close", "volume"]
-        miss = [c for c in need if c not in df.columns]
-        if miss:
-            raise ValueError(f"缺少欄位: {miss}")
-        for c in need:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
-
-        # 4) 刪掉原始的時間欄，避免稍後與 time_df['datetime','timestamp'] 衝突
-        for c in (self.prefer_time_col, "timestamp", "datetime"):
-            if c in df.columns:
-                df = df.drop(columns=[c])
-
-        # 5) （可選）頻率檢查：只警告，不補、不砍
-        if self.freq_check and len(df) > 1:
-            expected = pd.date_range(df.index[0], df.index[-1], freq=self.freq_check, tz="UTC")
-            miss_idx = expected.difference(df.index)
-            if len(miss_idx) > 0:
-                print(f"[WARN] 缺少 {len(miss_idx)} 根 {self.freq_check} K；預設不補齊。")
-
-        return df
-
-    @staticmethod
-    def _make_utc_index_from_col(col: pd.Series, kind: str) -> pd.DatetimeIndex:
-        """
-        1. 說明: 將時間欄位轉為 UTC DatetimeIndex，支援秒/毫秒的 timestamp 與 datetime 字串。
-        2. inputs:
-           - col(pd.Series): 時間欄位序列。
-           - kind(str): 'timestamp' 或 'datetime'。
-        3. return: pd.DatetimeIndex (UTC)。
-        """
-        if kind == "timestamp":
-            ts = pd.to_numeric(col, errors="coerce").astype("Int64").astype("int64")
-            unit = "ms" if ts.iloc[0] > 1_000_000_000_000 else "s"
-            return pd.to_datetime(ts, unit=unit, utc=True)
-        elif kind == "datetime":
-            return pd.to_datetime(col, utc=True)
-        else:
-            raise ValueError(f"未知時間欄位型態：{kind}")
 
     @staticmethod
     def _resolve_sign_mode(sign) -> str:
@@ -138,8 +60,15 @@ class IndicatorLibrary:
             raise ValueError(f"Invalid sign param: {sign}")
         return "sign" if sign is True else "cont"
 
+    @staticmethod
+    def _iter_params(val) -> List[int]:
+        """允許單一數值或可迭代的數值，回傳整數列表。"""
+        if isinstance(val, (list, tuple, set)):
+            return [int(x) for x in val]
+        return [int(val)]
+
     # ========== Trend / Averages ==========
-    def build_SMA(self, length: int, sign=False) -> pd.DataFrame:
+    def build_SMA(self, length: int | Iterable[int], sign=False) -> pd.DataFrame:
         """
         1. 說明: 計算簡單移動平均（SMA），可輸出連續值與符號版（價格高於/低於 SMA）。
         2. inputs:
@@ -148,17 +77,18 @@ class IndicatorLibrary:
         3. return: DataFrame，欄名 'SMA_{length}' 與/或 'SSMA_{length}'。
         """
         mode = self._resolve_sign_mode(sign)
-        sma = ta.sma(self.ohlcv["close"], length=length)
         out = {}
-        if mode in ("cont","both"):
-            out[f"SMA_{length}"] = sma.astype(np.float32)
-        if mode in ("sign","both"):
-            sig = np.where(self.ohlcv["close"].values > sma.values, 1.0,
-                           np.where(self.ohlcv["close"].values < sma.values, -1.0, 0.0))
-            out[f"SSMA_{length}"] = pd.Series(sig, index=self.df.index, dtype=np.float32)
+        for l in self._iter_params(length):
+            sma = ta.sma(self.ohlcv["close"], length=l)
+            if mode in ("cont","both"):
+                out[f"SMA_{l}"] = sma.astype(np.float32)
+            if mode in ("sign","both"):
+                sig = np.where(self.ohlcv["close"].values > sma.values, 1.0,
+                               np.where(self.ohlcv["close"].values < sma.values, -1.0, 0.0))
+                out[f"SSMA_{l}"] = pd.Series(sig, index=self.df.index, dtype=np.float32)
         return pd.DataFrame(out, index=self.df.index)
 
-    def build_EMA(self, length: int, sign=False) -> pd.DataFrame:
+    def build_EMA(self, length: int | Iterable[int], sign=False) -> pd.DataFrame:
         """
         1. 說明: 計算指數移動平均（EMA），可輸出連續值與符號版。
         2. inputs:
@@ -167,17 +97,18 @@ class IndicatorLibrary:
         3. return: DataFrame，欄名 'EMA_{length}' 與/或 'SEMA_{length}'。
         """
         mode = self._resolve_sign_mode(sign)
-        ema = ta.ema(self.ohlcv["close"], length=length)
         out = {}
-        if mode in ("cont","both"):
-            out[f"EMA_{length}"] = ema.astype(np.float32)
-        if mode in ("sign","both"):
-            sig = np.where(self.ohlcv["close"].values > ema.values, 1.0,
-                           np.where(self.ohlcv["close"].values < ema.values, -1.0, 0.0))
-            out[f"SEMA_{length}"] = pd.Series(sig, index=self.df.index, dtype=np.float32)
+        for l in self._iter_params(length):
+            ema = ta.ema(self.ohlcv["close"], length=l)
+            if mode in ("cont","both"):
+                out[f"EMA_{l}"] = ema.astype(np.float32)
+            if mode in ("sign","both"):
+                sig = np.where(self.ohlcv["close"].values > ema.values, 1.0,
+                               np.where(self.ohlcv["close"].values < ema.values, -1.0, 0.0))
+                out[f"SEMA_{l}"] = pd.Series(sig, index=self.df.index, dtype=np.float32)
         return pd.DataFrame(out, index=self.df.index)
 
-    def build_TEMA(self, length: int, sign=False) -> pd.DataFrame:
+    def build_TEMA(self, length: int | Iterable[int], sign=False) -> pd.DataFrame:
         """
         1. 說明: 計算三重指數移動平均（TEMA），可輸出連續值與符號版。
         2. inputs:
@@ -186,14 +117,15 @@ class IndicatorLibrary:
         3. return: DataFrame，欄名 'TEMA_{length}' 與/或 'STEMA_{length}'。
         """
         mode = self._resolve_sign_mode(sign)
-        tema = ta.tema(self.ohlcv["close"], length=length)
         out = {}
-        if mode in ("cont","both"):
-            out[f"TEMA_{length}"] = tema.astype(np.float32)
-        if mode in ("sign","both"):
-            sig = np.where(self.ohlcv["close"].values > tema.values, 1.0,
-                           np.where(self.ohlcv["close"].values < tema.values, -1.0, 0.0))
-            out[f"STEMA_{length}"] = pd.Series(sig, index=self.df.index, dtype=np.float32)
+        for l in self._iter_params(length):
+            tema = ta.tema(self.ohlcv["close"], length=l)
+            if mode in ("cont","both"):
+                out[f"TEMA_{l}"] = tema.astype(np.float32)
+            if mode in ("sign","both"):
+                sig = np.where(self.ohlcv["close"].values > tema.values, 1.0,
+                               np.where(self.ohlcv["close"].values < tema.values, -1.0, 0.0))
+                out[f"STEMA_{l}"] = pd.Series(sig, index=self.df.index, dtype=np.float32)
         return pd.DataFrame(out, index=self.df.index)
 
     def build_MACD(self, fast: int = 12, slow: int = 26, signal: int = 9, sign=False) -> pd.DataFrame:
@@ -221,15 +153,18 @@ class IndicatorLibrary:
             out[f"SMACD_{fast}_{slow}_{signal}"] = pd.Series(sgn, index=self.df.index, dtype=np.float32)
         return pd.DataFrame(out, index=self.df.index)
 
-    def build_SLOPE(self, length: int) -> pd.DataFrame:
+    def build_SLOPE(self, length: int | Iterable[int]) -> pd.DataFrame:
         """
         1. 說明: 計算價格斜率（線性回歸斜率或等價定義，依 pandas_ta）。
         2. inputs:
            - length(int): 回看期。
         3. return: DataFrame，欄名 'SLOPE_{length}'。
         """
-        s = ta.slope(self.ohlcv["close"], length=length)
-        return pd.DataFrame({f"SLOPE_{length}": s.astype(np.float32)}, index=self.df.index)
+        out = {}
+        for l in self._iter_params(length):
+            s = ta.slope(self.ohlcv["close"], length=l)
+            out[f"SLOPE_{l}"] = s.astype(np.float32)
+        return pd.DataFrame(out, index=self.df.index)
     
     def build_TTM_TRND(self, length: int = 6) -> pd.DataFrame:
         """
@@ -243,15 +178,18 @@ class IndicatorLibrary:
         s  = pd.Series(s, index=getattr(s, "index", self.df.index)).reindex(self.df.index).astype(np.float32)
         return s.rename(f"TTM_TRND_{length}").to_frame()
 
-    def build_DPO(self, length: int) -> pd.DataFrame:
+    def build_DPO(self, length: int | Iterable[int]) -> pd.DataFrame:
         """
         1. 說明: 計算去趨勢振盪（DPO）。
         2. inputs:
            - length(int): 期數。
         3. return: DataFrame，欄名 'DPO_{length}'。
         """
-        s = ta.dpo(self.ohlcv["close"], length=length, centered=False)
-        return pd.DataFrame({f"DPO_{length}": s.astype(np.float32)}, index=self.df.index)
+        out = {}
+        for l in self._iter_params(length):
+            s = ta.dpo(self.ohlcv["close"], length=l, centered=False)
+            out[f"DPO_{l}"] = s.astype(np.float32)
+        return pd.DataFrame(out, index=self.df.index)
 
     def build_AMATE_LR(self, fast: int, slow: int, mamode: int = 2) -> pd.DataFrame:
         """
@@ -267,25 +205,31 @@ class IndicatorLibrary:
         return pd.DataFrame({f"AMATe_LR_{fast}_{slow}_{mamode}": amat[tgt].astype(np.float32)}, index=self.df.index)
 
     # ========== Momentum / Oscillator ==========
-    def build_RSI(self, length: int) -> pd.DataFrame:
+    def build_RSI(self, length: int | Iterable[int]) -> pd.DataFrame:
         """
         1. 說明: 計算 RSI。
         2. inputs:
            - length(int): 期數。
         3. return: DataFrame，欄名 'RSI_{length}'。
         """
-        out = ta.rsi(self.ohlcv["close"], length=length)
-        return pd.DataFrame({f"RSI_{length}": out.astype(np.float32)}, index=self.df.index)
+        out = {}
+        for l in self._iter_params(length):
+            s = ta.rsi(self.ohlcv["close"], length=l)
+            out[f"RSI_{l}"] = s.astype(np.float32)
+        return pd.DataFrame(out, index=self.df.index)
 
-    def build_MOM(self, length: int) -> pd.DataFrame:
+    def build_MOM(self, length: int | Iterable[int]) -> pd.DataFrame:
         """
         1. 說明: 計算動能（MOM）。
         2. inputs:
            - length(int): 期數。
         3. return: DataFrame，欄名 'MOM_{length}'。
         """
-        out = ta.mom(self.ohlcv["close"], length=length)
-        return pd.DataFrame({f"MOM_{length}": out.astype(np.float32)}, index=self.df.index)
+        out = {}
+        for l in self._iter_params(length):
+            s = ta.mom(self.ohlcv["close"], length=l)
+            out[f"MOM_{l}"] = s.astype(np.float32)
+        return pd.DataFrame(out, index=self.df.index)
 
     def build_STOCH(self, k: int, d: int = 3, smooth_k: int = 3) -> pd.DataFrame:
         """
@@ -347,15 +291,18 @@ class IndicatorLibrary:
         s = ta.cci(self.ohlcv["high"], self.ohlcv["low"], self.ohlcv["close"], length=length, c=c)
         return pd.DataFrame({f"CCI_{length}_{c}": s.astype(np.float32)}, index=self.df.index)
 
-    def build_ZS(self, length: int) -> pd.DataFrame:
+    def build_ZS(self, length: int | Iterable[int]) -> pd.DataFrame:
         """
         1. 說明: 計算 z-score（以 close）。
         2. inputs:
            - length(int): 滑動視窗大小。
         3. return: DataFrame，欄名 'ZS_{length}'。
         """
-        s = ta.zscore(self.ohlcv["close"], length=length)
-        return pd.DataFrame({f"ZS_{length}": s.astype(np.float32)}, index=self.df.index)
+        out = {}
+        for l in self._iter_params(length):
+            s = ta.zscore(self.ohlcv["close"], length=l)
+            out[f"ZS_{l}"] = s.astype(np.float32)
+        return pd.DataFrame(out, index=self.df.index)
 
     def build_WILLR(self, length: int) -> pd.DataFrame:
         """
@@ -382,7 +329,7 @@ class IndicatorLibrary:
         ], axis=1).max(axis=1)
         return pd.DataFrame({"TRUERANGE_1": tr.astype(np.float32)}, index=self.df.index)
 
-    def build_RANGE(self, window: int, pct: bool = True) -> pd.DataFrame:
+    def build_RANGE(self, window: int | Iterable[int], pct: bool = True) -> pd.DataFrame:
         """
         1. 說明: 計算高低價區間的平均（可選百分比尺度）。
         2. inputs:
@@ -392,12 +339,15 @@ class IndicatorLibrary:
         """
         H, L, C = self.ohlcv["high"], self.ohlcv["low"], self.ohlcv["close"]
         hl = (H - L)
-        if pct:
-            base = C.abs().replace(0, np.nan)
-            s = (hl / base).rolling(window, min_periods=max(1, window//2)).mean()
-        else:
-            s = hl.rolling(window, min_periods=max(1, window//2)).mean()
-        return pd.DataFrame({f"RANGE_{window}": s.astype(np.float32)}, index=self.df.index)
+        out = {}
+        for w in self._iter_params(window):
+            if pct:
+                base = C.abs().replace(0, np.nan)
+                s = (hl / base).rolling(w, min_periods=max(1, w//2)).mean()
+            else:
+                s = hl.rolling(w, min_periods=max(1, w//2)).mean()
+            out[f"RANGE_{w}"] = s.astype(np.float32)
+        return pd.DataFrame(out, index=self.df.index)
 
     def build_ATR(self, length: int = 14, pct: bool = True) -> pd.DataFrame:
         """
@@ -595,12 +545,12 @@ class IndicatorLibrary:
     
     def build_fng(self) -> pd.DataFrame:
         """
-        1. 說明: 回傳已併入主表的 Fear & Greed 指數三欄（不在此處 shift）。
-        2. inputs: 無（需 self.df 內已有 'sent_fng','sent_fng_diff1','sent_fng_z7d'）。
+        1. 說明: 由原始 FNG 欄位計算差分與 7d z-score（不在此處 shift）。
+        2. inputs: 無（需 self.df 內已有 'sent_fng'）。
         3. return: DataFrame，欄名 'sent_fng','sent_fng_diff1','sent_fng_z7d'。
         """
         x = self.df
-        need = ["sent_fng", "sent_fng_diff1", "sent_fng_z7d"]
+        need = ["fng"]
         missing = [c for c in need if c not in x.columns]
         if missing:
             raise ValueError(
@@ -608,10 +558,15 @@ class IndicatorLibrary:
                 f"(或用 merge_fng_into_15m.py) 再呼叫 build_fng。"
             )
 
+        fng = pd.to_numeric(x["fng"], errors="coerce").astype("float32")
+        diff1 = fng.diff()
+        roll = fng.rolling("7d", min_periods=3)
+        z7d = (fng - roll.mean()) / roll.std()
+
         out = pd.DataFrame({
-            "sent_fng":        pd.to_numeric(x["sent_fng"],        errors="coerce").astype("float32"),
-            "sent_fng_diff1":  pd.to_numeric(x["sent_fng_diff1"],  errors="coerce").astype("float32"),
-            "sent_fng_z7d":    pd.to_numeric(x["sent_fng_z7d"],    errors="coerce").astype("float32"),
+            "sent_fng":        fng,
+            "sent_fng_diff1":  diff1.astype("float32"),
+            "sent_fng_z7d":    z7d.astype("float32"),
         }, index=self.df.index)
 
         return out
@@ -678,7 +633,7 @@ class IndicatorLibrary:
 
         return pd.DataFrame(features, index=self.df.index)
     
-    # === 新增於 IndicatorLibrary 內：VectorBT（pandas_ta / TA-Lib） ===
+    # === VectorBT（pandas_ta / TA-Lib） ===
     def build_VBT(self,
                 all: bool = False,
                 lib: str = "pandas_ta",
@@ -911,11 +866,7 @@ class IndicatorLibrary:
             return pd.DataFrame(index=self.df.index)
         return pd.concat(outs, axis=1).replace([np.inf, -np.inf], np.nan).astype("float32")
 
-    # ========== B) 兼容舊有 items（逐項指定） ==========
-    # 你原本的 VBT items 流程可放在這裡（略）。如果你已有，保留舊實作即可。
-    # raise NotImplementedError("VBT(items=...) 分支請沿用你原先的實作或告訴我替你補上。")
-
-    # === 新增於 IndicatorLibrary 內：Kats TsFeatures（滑窗抽取） ===
+    # === Kats TsFeatures（滑窗抽取） ===
     def build_TSF(self,
                 targets: List[Dict[str, Any]],
                 tsf_params: Dict[str, Any] | None = None) -> pd.DataFrame:
@@ -1061,384 +1012,3 @@ class IndicatorLibrary:
             "VBT":  lambda kw: self.build_VBT(**kw),     # vectorbt + (pandas_ta / TA-Lib)
             "TSF": lambda kw: self.build_TSF(**kw),
         }
-
-# =========================
-# 2) 特徵計算器：features → 計算
-# =========================
-class FeatureComputer:
-    def __init__(self, lib: IndicatorLibrary):
-        """
-        1. 說明: 初始化特徵計算器
-        2. inputs: lib(IndicatorLibrary): 指標庫實例（提供 builders）。
-        3. return: None
-        """
-        self.lib = lib
-
-    @staticmethod
-    def _normalize_feature_spec(item: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        1. 說明: 將 plan 中單一特徵規格標準化為 {name, enabled, kwargs, flip} 格式。
-        2. inputs: item(dict)
-        3. return: dict
-        """
-        if "name" in item:
-            spec = dict(item)
-        else:
-            # 允許 YAML 中以 `- alpha:` 形式定義（可能同層還有 enabled/paths 等欄位）
-            reserved = {"enabled", "kwargs", "flip"}
-            builder_keys = [k for k in item.keys() if k not in reserved]
-            if not builder_keys:
-                raise ValueError(f"特徵規格缺少 name: {item}")
-            builder = builder_keys[0]
-            value = item.get(builder)
-            spec = {k: v for k, v in item.items() if k != builder}
-            spec["name"] = builder
-
-            if value is not None:
-                if not isinstance(value, dict):
-                    raise ValueError(f"特徵規格格式錯誤（需為 dict）: {item}")
-                nested = dict(value)
-                nested_kwargs = dict(nested.pop("kwargs", {}) or {})
-                spec_kwargs = dict(spec.get("kwargs", {}) or {})
-                spec_kwargs.update(nested_kwargs)
-                for key, val in nested.items():
-                    if key in {"enabled", "flip"}:
-                        spec[key] = val
-                    else:
-                        spec_kwargs[key] = val
-                spec["kwargs"] = spec_kwargs
-
-        kwargs = dict(spec.get("kwargs", {}) or {})
-        extra_keys = [k for k in list(spec.keys()) if k not in {"name", "enabled", "kwargs", "flip"}]
-        for key in extra_keys:
-            kwargs[key] = spec.pop(key)
-        spec["kwargs"] = kwargs
-        spec.setdefault("enabled", True)
-        return spec
-
-    @classmethod
-    def _enabled_features(cls, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """
-        1. 說明: 從 plan 中篩出 enabled=True 的特徵規格，並轉為統一格式。
-        2. inputs: plan(dict)
-        3. return: List[dict]
-        """
-        feats = plan.get("features") or []
-        normalized: List[Dict[str, Any]] = []
-        for item in feats:
-            spec = cls._normalize_feature_spec(item)
-            if spec.get("enabled", False):
-                normalized.append(spec)
-        return normalized
-    
-    @staticmethod
-    def _maybe_flip(df: pd.DataFrame, flip: bool | str | int) -> pd.DataFrame:
-        """
-        1. 說明: 視設定將特徵整欄反向（乘以 -1）。對連續/符號型(-1/0/1)皆適用。
-        2. inputs:
-            df (DataFrame): 單一特徵(可多欄)已完成 shift(1) 後的輸出
-            flip (bool|str|int): True/'yes'/'on'/1 → 反向；其餘不動作
-        3. return:
-            DataFrame: 可能已被乘以 -1 的特徵表（dtype 保持 float32）
-        """
-        flag = False
-        if isinstance(flip, str):
-            flag = flip.strip().lower() in ("true","yes","y","1","on")
-        else:
-            flag = bool(flip)
-        if not flag:
-            return df
-        out = df.copy()
-        for c in out.columns:
-            out[c] = (-1.0) * pd.to_numeric(out[c], errors="coerce").astype("float32")
-        return out
-    
-
-    def _build_one(self, name: str, kwargs: Dict[str, Any], flip: bool | str | int = False) -> pd.DataFrame:
-        """
-        1. 說明: 呼叫對應 builder 產生單一特徵 DataFrame，做 shift(1) 防未來洩漏，並依需要反向。
-        2. inputs:
-            name(str): 指標名稱（對應 self.lib.builders 的 key）
-            kwargs(dict): 傳給該指標 builder 的參數
-            flip(bool|str|int): 若為真→將所有輸出欄位乘以 -1
-        3. return:
-            DataFrame: 已 shift(1) 並視需要反向的特徵表
-        """
-        key = str(name).upper()
-        if key not in self.lib.builders:
-            raise ValueError(f"Unknown indicator: {key}")
-        df = self.lib.builders[key](kwargs or {})
-        df = df.shift(1)
-        df = self._maybe_flip(df, flip)
-        return df
-
-    def _passthrough_columns(self, cfg: Dict[str, Any] | None) -> List[str]:
-        """
-        1. 說明: 依設定挑選 minute 級別（如 m_*）的直通欄位，作為額外保留的特徵。
-        2. inputs: cfg(dict|None)
-        3. return: List[str]
-        """
-        if cfg is None:
-            return []
-        prefixes = tuple(DEFAULT_MINUTE_PREFIXES)
-        min_feat = list((cfg.get("features", {}) or {}).get("min_trade_feat", []))
-        cols: List[str] = []
-        for c in self.lib.df.columns:
-            s = str(c)
-            if not s.startswith(prefixes):
-                continue
-            m = _M_PAT.match(s)
-            if not m:
-                continue
-            base = m.group(2)
-            if base in min_feat:
-                cols.append(s)
-        return cols
-
-    def passthrough_columns(self, cfg: Dict[str, Any] | None) -> List[str]:
-        """公開存取白名單分鐘欄位名稱。"""
-        return self._passthrough_columns(cfg)
-
-    @staticmethod
-    def _finalize(parts: List[pd.DataFrame], cfg: Dict[str, Any] | None) -> pd.DataFrame:
-        """
-        1. 說明: 拼接、清理（inf→NaN、astype float32、依設定 dropna）、檢查欄位重複。
-        2. inputs: parts(List[pd.DataFrame]), cfg(dict|None)
-        3. return: DataFrame
-        """
-        if not parts:
-            return pd.DataFrame()
-        X = pd.concat(parts, axis=1)
-        X = X.replace([np.inf, -np.inf], np.nan).astype("float32")
-        dropna = True if cfg is None else bool((cfg.get("features", {}) or {}).get("dropna", True))
-        if dropna:
-            X = X.dropna()
-        dups = X.columns[X.columns.duplicated()]
-        if len(dups):
-            raise ValueError(f"Duplicate feature names: {list(dups)}")
-        return X
-
-    def compute(self, plan: Dict[str, Any], cfg, *, load_if_exists: bool = True) -> pd.DataFrame:
-        """
-        1. 說明: 依 plan 計算全部啟用的特徵；統一 shift(1)；支援 flip；附帶分鐘直通特徵。
-        2. inputs: plan(dict), cfg(dict), load_if_exists(bool)
-        3. return: DataFrame（float32）
-        """
-        feat_list = self._enabled_features(plan)
-        if not feat_list:
-            raise ValueError("計畫沒有任何 enabled=True 的 features。")
-
-        parts: List[pd.DataFrame] = []
-        for item in tqdm(feat_list, desc="Building features", total=len(feat_list)):
-            name = str(item.get("name"))
-            kwargs = item.get("kwargs", {}) or {}
-            flip = item.get("flip", False)  # ← 新增：讀 flip
-            parts.append(self._build_one(name, kwargs, flip))
-
-        # 直通分鐘特徵（白名單）— 同步 shift(1)
-        passthrough_cols = self.passthrough_columns(cfg)
-        if passthrough_cols:
-            mdf = (
-                self.lib.df.loc[:, passthrough_cols]
-                .apply(pd.to_numeric, errors="coerce")
-                .astype("float32")
-                .shift(1)
-            )
-            parts.append(mdf)
-
-        return self._finalize(parts, cfg)
-
-    def _infer_columns_for_plan(self, plan: Dict[str, Any], cfg) -> List[str]:
-        """
-        1. 說明: 以實際 builders（只取欄名、不做整併）推導此 plan 的欄位集合；可含分鐘直通。
-        2. inputs: plan(dict), cfg(dict|None)
-        3. return: List[str]
-        """
-        feat_list = self._enabled_features(plan)
-        if not feat_list:
-            return []
-
-        cols: List[str] = []
-        for item in feat_list:
-            name = str(item.get("name"))
-            kwargs = item.get("kwargs", {}) or {}
-            feat = self._build_one(name, kwargs)
-            cols.extend(map(str, feat.columns))
-
-        include_passthrough = True
-        if cfg is not None:
-            include_passthrough = bool((cfg.get("features", {}) or {}).get("include_passthrough", True))
-        if include_passthrough:
-            cols.extend(self._passthrough_columns(cfg))
-
-        seen = set()
-        out: List[str] = []
-        for c in cols:
-            if c not in seen:
-                seen.add(c)
-                out.append(c)
-        return out
-    
-    def columns_for_plan(self, plan: Dict[str, Any], cfg=None) -> List[str]:
-        """
-        1. 說明: 取得此 plan 會產生的全部特徵欄位名稱（可含分鐘直通欄）。
-        2. inputs: plan(dict), cfg(dict|None)
-        3. return: List[str]
-        """
-        return self._infer_columns_for_plan(plan, cfg)
-
-    def columns_for_feature(self, name: str, kwargs: dict | None = None,
-                            plan: Dict[str, Any] | None = None, cfg=None) -> List[str]:
-        """
-        1. 說明: 回傳單一特徵規格在當前（或指定）plan 的欄位名稱集合。
-        2. inputs: name(str), kwargs(dict|None), plan(dict|None), cfg(dict|None)
-        3. return: List[str]
-        """
-        spec_plan = {"features": [{"name": name, "kwargs": kwargs or {}, "enabled": True}]}
-        return self._infer_columns_for_plan(spec_plan, cfg)
-
-
-# =========================
-# CLI: Precompute features to a file
-# =========================
-def _apply_nan_policy(df: pd.DataFrame, policy: str, *, name: str) -> pd.DataFrame:
-    """
-    依據 policy 處理 NaN：
-      - drop: 直接 dropna()
-      - linear_interp: 線性插值並補齊兩端
-      - none: 不處理
-    僅對數值欄位操作；時間欄保持原樣。
-    """
-    policy = (policy or "drop").strip().lower()
-    if policy not in {"drop", "linear_interp", "none"}:
-        raise ValueError(f"[nan_policy] 未知策略: {policy}")
-
-    if policy == "none":
-        return df
-
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    if policy == "drop":
-        cleaned = df.dropna()
-        dropped = len(df) - len(cleaned)
-        if dropped:
-            print(f"[nan_policy] drop: {name} 移除 {dropped} 列含 NaN")
-        return cleaned
-
-    # linear interpolation
-    interp = df.copy()
-    if numeric_cols.any():
-        interp[numeric_cols] = (
-            interp[numeric_cols]
-            .interpolate(method="linear", limit_direction="both")
-            .ffill()
-            .bfill()
-        )
-    return interp
-
-
-def main():
-    # 1. load cfg & data
-    cfg_path = r"feature_selection/features_computer/features_config.yaml"
-    with open(cfg_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    plan = cfg["features"]["plan"]
-    data_cfg = cfg["data"]
-    out_path = cfg["export"]["out"]
-
-    # 2. Normalize OHLCV & compute feature
-    df_raw = pd.read_csv(data_cfg["path"])
-    lib = IndicatorLibrary(df_raw=df_raw, freq_check=data_cfg["freq"], prefer_time_col=data_cfg["index_col"])
-    fc = FeatureComputer(lib)
-    passthrough_cols = fc.passthrough_columns(cfg)
-    X = fc.compute(plan, cfg)
-
-    # 3. Assemble final dataframe: time columns + OHLCV + features + 1-min info
-    idx = pd.DatetimeIndex(X.index)
-
-    # time columns（重新建立，避免與原表重名）
-    dt_naive = idx.tz_convert("UTC").tz_localize(None) if idx.tz is not None else idx
-    ts_ms = (idx.view("int64") // 1_000_000).astype("int64")
-    time_df = pd.DataFrame({
-        "datetime": dt_naive,
-        "timestamp": ts_ms,
-    }, index=idx)
-
-    # original OHLCV（未 shift，僅供標註/檢查；訓練時請勿選用）
-    ohlcv_cols = [c for c in ["open","high","low","close","volume"] if c in lib.df.columns]
-    ohlcv_df = lib.df.loc[idx, ohlcv_cols].astype("float32")
-
-    # all 1-min columns (prefix m_) — 也 shift(1) 以保證「所有訓練可用特徵」都不洩漏
-    if passthrough_cols:
-        minute_df = (
-            lib.df.loc[idx, passthrough_cols]
-            .apply(pd.to_numeric, errors="coerce")
-            .astype("float32")
-            .shift(1)
-        )
-    else:
-        minute_df = pd.DataFrame(index=idx)
-
-    # 避免重複欄位：將白名單分鐘特徵僅保留一次
-    X = X.drop(columns=passthrough_cols, errors="ignore")
-
-    # combine（15m 主檔）
-    out = pd.concat([time_df, ohlcv_df, X], axis=1)
-    micro = pd.concat([time_df, minute_df], axis=1) if not minute_df.empty else None
-
-    # NaN policy
-    nan_policy = (cfg.get("export", {}) or {}).get("nan_policy", "drop")
-    out = _apply_nan_policy(out, nan_policy, name="main")
-    if micro is not None:
-        micro = _apply_nan_policy(micro, nan_policy, name="micro")
-        # 若 drop 造成索引不一致，取交集
-        if not out.index.equals(micro.index):
-            common_idx = out.index.intersection(micro.index)
-            out = out.loc[common_idx]
-            micro = micro.loc[common_idx]
-
-    # Optional: quick validation of expected vs. actual feature columns
-    try:
-        expect_cols = FeatureComputer(lib).columns_for_plan(plan, cfg)
-        missing_cols = [c for c in expect_cols if c not in X.columns]
-        if missing_cols:
-            print(f"[WARN] {len(missing_cols)} feature columns missing in X (可能在 dropna 前全 NaN 或 builder 無輸出):\n  {missing_cols[:20]}{' ...' if len(missing_cols)>20 else ''}")
-    except Exception as e:
-        print(f"[INFO] columns_for_plan() check skipped: {e}")
-
-    # 寫檔前檢查不允許重複欄位（Parquet 嚴格）
-    dups = out.columns[out.columns.duplicated()]
-    if len(dups):
-        raise ValueError(f"Duplicate columns remain before export: {list(dups)}")
-
-    # 4. Export
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.suffix.lower() == ".parquet":
-        out.to_parquet(out_path, index=False)
-    elif out_path.suffix.lower() == ".csv":
-        out.to_csv(out_path, index=False)
-    else:
-        out = out.astype("float32")
-        out.to_parquet(out_path.with_suffix(".parquet"), index=False)
-
-    # 4-b) Export micro (1-min) features if available
-    if micro is not None and not micro.empty:
-        micro_dups = micro.columns[micro.columns.duplicated()]
-        if len(micro_dups):
-            raise ValueError(f"Duplicate columns in micro features before export: {list(micro_dups)}")
-
-        micro_path = out_path.with_name(f"{out_path.stem}_1min{out_path.suffix}")
-        if micro_path.suffix.lower() == ".parquet":
-            micro.to_parquet(micro_path, index=False)
-        elif micro_path.suffix.lower() == ".csv":
-            micro.to_csv(micro_path, index=False)
-        else:
-            micro.to_parquet(micro_path.with_suffix(".parquet"), index=False)
-        print(f"[OK] Exported micro features to: {micro_path}")
-
-    print(f"[OK] Exported precomputed features to: {out_path}")
-
-
-if __name__ == "__main__":
-    main()
