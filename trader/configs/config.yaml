@@ -16,6 +16,40 @@ data:
   backoff_base: 1.0
   backoff_max: 60.0
 
-trader:
-  type: "futures" # Options: "spot", "futures"
-  useTestnet: true
+# Trader configuration
+exchange:
+  id: binance              # 也可用 binanceusdm / binancecoinm（期貨）
+  market_type: future        # spot | future 
+  sandbox: true            # true = testnet / false = live
+  enable_rate_limit: true
+  timeout_ms: 30000
+  recv_window: 10000
+  adjust_for_time_difference: true
+
+  # Spot Testnet 官方 endpoints（必要時可換 api1.testnet...）
+  # 注意：ccxt 內部 urls 結構較複雜，因此這裡做「最小侵入」覆寫：只覆寫 exchange.urls['api']（你原 template 的做法）。
+  # 若你使用 binanceusdm 等 futures class，請改成對應 testnet endpoint（各市場不同）。
+  urls_override:
+    api: "https://testnet.binance.vision/api"
+
+trade:
+  enabled: true            # 交易總開關（false 直接拒絕下單）
+  allow_live: false        # 強制防呆：sandbox=false 時若 allow_live!=true 直接 raise
+  dry_run: false           # true：不真的送單，只印出會送的 payload
+  symbol_allowlist: ["BTC/USDT", "ETH/USDT"]
+  max_open_orders_per_symbol: 5 #限制單一 symbol 的 open orders 數量，避免策略異常時爆量掛單
+
+risk:
+  max_notional_per_order: 200        # 單筆最大名目（USDT）
+  min_free_quote_balance: 50         # 最低可用 quote（USDT）
+  max_slippage_bps_market: 30        # 市價單最大允許滑點（bps），以 mid price 粗估
+  require_post_only_for_limit: false # 若 true，限價單一律 postOnly
+
+futures:
+  leverage: 3                 # 期貨用；spot 會忽略
+  margin_mode: isolated       # isolated | cross
+  position_mode: one-way      # one-way | hedge（不同 binance futures 類型支援狀況不同）
+
+logging:
+  level: INFO
+  log_file: "./trader.log"
