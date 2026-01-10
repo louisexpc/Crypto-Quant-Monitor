@@ -5,12 +5,12 @@
 # 1. ---basic---
 seed: 42
 device: "cuda:0"
-project_name: BTC_xgboost_long_108
+project_name: BTC_test_long_108
 also_XGB: True
 
-# 2. ---Data---
+# 2. ---Data setting---
 data:
-  path: feature_selection/results/rank_biserial/short/rank_biserial_60_feat.csv   # 15-minute aggregated features
+  path: data/precomputed/btcusdt_15m_features/btcusdt_15m_features.csv   # 15-minute aggregated features
   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
   freq: "15min"                    # 供缺口提醒（不會自動補齊）
   columns:
@@ -19,13 +19,13 @@ data:
 
   # 1-min的短時間序列
   micro:
-    enabled: false
-    path: data/precomputed/btcusdt_15m_features_VBT_1min_z_norm.csv
+    enabled: true
+    path: data/precomputed/btcusdt_15m_features/btcusdt_1m_trades.csv
     window_len: 15                # 每根 15min bar 對應過去 15 個 1min    
 
 # 3. ---Cross-Validation---
 cv:                 
-  start_date: "2023-01-04"
+  start_date: "2023-01-05"
   end_date:   "2025-04-30"
   train_val_split: 0.8  # train/val
 
@@ -45,20 +45,19 @@ cv:
 sequence:
   seq_len: 144  
   stride: [1]
-  scaler: none  # [standard / robust / minmax / rolling / ewm / robust_rolling / none]
+  scaler: none  # 現在已經在產生feat時標準化 => 不需要 [standard / robust / minmax / rolling / ewm / robust_rolling / none]
   stride_anchor: 0
   min_frac: 0.2
   preload_to_gpu: true  
 
 # 5.TBM Label & sequence
-
 label:
   ret_shift: 4  # horizon
-  # reg
-  ret_type: fractionally   # "logret" | "fractionally"
-  fracdiff:
-    d: 0.4
-    thres: 1.0e-5
+  # # reg
+  # ret_type: fractionally   # "logret" | "fractionally"
+  # fracdiff:
+  #   d: 0.4
+  #   thres: 1.0e-5
 
   # cls
   mode: event_tbm   # event_tbm | vol
@@ -71,14 +70,13 @@ label:
   align_method: pad        # 若 15m 缺列再用 pad
 
 
-post_infer:
-  tbm_concat:
-    enabled: true                 # 設為 true 啟用 trial 完成後的全區間推論 + 寫回 TBM CSV
-    date_start: "2025-05-01"      # 推論起始
-    date_end:   "2025-10-25"      # 推論結束
-    output_column: "pred"          # 追加到 TBM CSV 的欄位名
-    csv_path_override: null        # 若不為空，覆蓋 cfg.label.tbm_csv_path
-    collapse_mask_enable: false     # 是否啟用 collapse_mask
+# 6. Pred tbm event
+post_infer:  
+  enabled: true                 # 設為 true 啟用 trial 完成後的全區間推論 + 寫回 TBM CSV
+  date_start: "2025-05-01"      # 推論起始
+  date_end:   "2025-10-20"      # 推論結束
+  csv_path_override: null        # 若不為空，覆蓋 cfg.label.tbm_csv_path
+  collapse_mask_enable: True     # 是否啟用 collapse_mask
 
 
 
@@ -90,7 +88,7 @@ train:
   lr: [1e-5]
   weight_decay: [1e-5]
   batch_size: 256
-  epochs: 300
+  epochs: 10
   grad_clip: [0.3]
 
   early_stopping_patience: 20
@@ -143,27 +141,7 @@ loss:
     reduction: "mean" # ['mean' | 'sum' | 'none']
     normalized: true  # 只用於mean
 
-# 3. collaplase guard
-guard:
-  enabled: false  
-  pos_threshold: 0.5  # 先用 0.5 起手；每個 epoch 驗證後 trainer 會呼叫 guard.set_pos_threshold(...)  
-  smoothing: 0.95     # EMA 平滑（越大越穩）— 少量 batch 場景建議 0.9~0.99
-  warmup_steps: 9     # 若每 epoch ≈3 步，可設 3*3=9；你的情況可用 6~12 區間  
-  entropy_hi: 0.60    # 僅在「高不確定」時才評估 PPR 是否異常（二分類熵上限 ~0.693）
-  ppr_warn_band: [0.05, 0.60]   # 告警帶／極端帶 + 耐心值（連續 N 步越界才算）
-  warn_patience: 40
-  ppr_extreme_band: [0.02, 0.98]
-  extreme_patience: 120  
-  cooldown_steps: 12  # 觸發後的冷卻步數（避免連環觸發）；抓 1~2 個 epoch  
-  cp_boost_factor: 1.25 # 自救策略：提高 CE 的信心懲罰、衰減學習率（不低於 min_lr）
-  lr_decay: 0.8
-  max_conf_penalty: 0.20
-  min_lr: 1.0e-6  
-  restore_on_trigger: true  # 觸發時回滾到當前最佳權重（你的 trainer 已實作 on_trigger）  
-  verbose: false  # 關閉冗長列印（仍會在 trainer 端看到節流後的 WARN／TRIGGER）
-
-
-# 4. reg to cls
+# 3. reg to cls
 regression_to_class:
   enabled: false
   method: opt_fbeta_on_pred     # 或 fixed_bps / abs_quantile_true / abs_quantile_pred / opt_fbeta_on_pred

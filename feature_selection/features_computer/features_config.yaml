@@ -35,7 +35,13 @@ export:
     rolling_window: 144     # rolling 往前算 z-score 的 window_size
 
   # 4. 缺值策略：drop | linear_interp | none
-  nan_policy: "linear_interp"                         
+  nan_policy: "linear_interp"                  
+  min_trade_feat:
+    - "trade_count_1m"
+    - "buy_volume_1m"
+    - "buy_trades_1m"
+    - "rv_var_1m"
+    - "hl_range_1m"       
 
 
 features:
@@ -254,14 +260,3 @@ features:
           # - data/alpha/pnl/best_evolved_alpha_from_predefined_3.json
           # - data/alpha/pnl/best_evolved_alpha_from_predefined_5.json
 
-  # ------------------------------------------------
-  # 1 min trades features (offline prepare)
-  # ------------------------------------------------
-  min_trade_feat:
-    - "vwap_1m"
-    - "trade_count_1m"
-    - "buy_volume_1m"
-    - "buy_trades_1m"
-    - "rv_var_1m"
-    - "hl_range_1m"
-    - "mean_intertrade_time_1m"

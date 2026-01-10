@@ -44,6 +44,11 @@ train/
 │   └── search/
 │       ├── objective.py
 │       └── space.py
+├── inference/
+│   └── predictor.py
+├── test_case/
+│   ├── predictor_testing.py
+│   └── predictor.yaml
 ├── training/
 │   ├── hooks.py
 │   ├── losses/
@@ -73,6 +78,7 @@ train/
 2. `train/pipeline/search/objective` 為 Optuna 目標函式，管理超參搜尋、fold 建立與 TrialRunner。
 3. `TrialRunner` 組合資料載入、模型建立與 trainer，收集每個 fold 的結果與產物。
 4. `train/evaluation` 封裝圖表與匯出邏輯，集中在 TrialRunner 內觸發，最後寫入 `runs/<project>/`。
+5. `train/inference/predictor.py`：獨立推論用的 Predictor，支援多 checkpoint 投票與 CSV 輸出（TrialRunner post-infer 也會呼叫）。
 
 
 ## 2. 模組說明
@@ -125,7 +131,7 @@ train/
 | `folds.py` | `FoldGenerator` 實作 Rolling / Purged K-Fold CV|
 | `labeling.py` | 依照 ohlcv 以及 cls / reg 產生對應 label|
 | `scalers.py` | 對feat進行標準化|
-| `dataloaders/base.py` | `load_precomputed_features`、`apply_scaling`、`build_loaders` 等共用函式。|
+| `dataloaders/base.py` | `load_precomputed_features`、`apply_scaling`、`build_loaders`、`flatten_micro_features`（1m→m0~m(window_len-1) 展平）等共用函式。|
 | `dataloaders/time_loader.py` | 依時間序列建立 `SeqDataset` 與 DataLoader。|
 | `dataloaders/event_loader.py` | 事件驅動 (TBM) loader，輸出 `EventDataset`。|
 | `dataset.time_dataset.py` | `SeqDataset`：time-driven|
@@ -206,8 +212,28 @@ train/
 | `reporters/regression_reporter.py` | 回歸散點/殘差圖、相關係數計算。|
 | `exporters/cv_summary.py` | 回報各 fold 指標平均，並輸出該次 trial 的 `cv_summary.json`。|
 | `exporters/best_yaml.py` | 匯出最佳 trial 的參數與設定。|
-| `exporters/tbm_exporter.py` | 將該次 trials 各個 folds 訓練出來隻模型，對 TBM 進行預測|
+| `exporters/tbm_exporter.py` | `TBMExporter`：單純將已有預測 DataFrame 輸出為 CSV。推論邏輯已移到 `train/inference/predictor.py`。|
 | `utils.py` | 舊 API 兼容函式（仍提供給部分腳本）。|
+
+### 7. `inference/`
+```
+├── inference/
+│   └── predictor.py
+```
+| 檔案 | 功能 |
+| ---- | ---- |
+| `predictor.py` | 輕量推論器：讀 precomputed features（含 1m 展平）、多 checkpoint 投票 (`predict_vote`) 或單 checkpoint (`predict`)，並回傳含 `pred_i`/`pred_vote_*` 欄位的 DataFrame。TrialRunner 的 post-infer 亦呼叫此模組。|
+
+### 8. `test_case/`
+```
+├── test_case/
+│   ├── predictor_testing.py
+│   └── predictor.yaml
+```
+| 檔案 | 功能 |
+| ---- | ---- |
+| `predictor_testing.py` | 最小化範例：載入 15m + 1m 預算特徵，呼叫 `Predictor.predict_vote`，並用 `TBMExporter` 輸出 CSV。|
+| `predictor.yaml` | 測試用設定（包含 `post_infer.tbm_concat.model_paths`），可直接指定 checkpoint 路徑與推論日期區間。|
 
 
 ## 3. Pipeline 詳細流程
@@ -230,8 +256,8 @@ train/
    - `make_folds(df, cfg)` 使用 `train.data.folds.FoldGenerator` 建立 Rolling / Purged K-Fold。
 5. **TrialRunner 執行一次 Trial** (`TrialRunner.run`)  
     - 判斷任務 (`get_task_type`) 後，依 `label.mode` 呼叫 `make_time_loaders_for_fold` 或 `make_event_loaders_for_fold`：
-      - 時間驅動：自動取用特徵表所有數值欄位，再經 `apply_scaling` → `SeqDataset` → DataLoader。  
-      - 事件驅動：自動取用數值欄位，`align_times` + `EventDataset` 建立批次資料。  
+      - 時間驅動：自動取用特徵表所有數值欄位，必要時展平 1m micro（`flatten_micro_features` 產生 m0~m(window_len-1)），再經 `apply_scaling` → `SeqDataset` → DataLoader。  
+      - 事件驅動：同樣先展平 1m micro，再以 `align_times` + `EventDataset` 建立批次資料。  
    - `train.models.model_factory.build_model(cfg, n_features, feat_cols)` 建立模型。  
    - `train.training.trainers.utils.get_trainer(cfg)` 取得對應 `train_one_fold` 實作。
 6. **單 fold 訓練與指標計算**  
@@ -246,7 +272,7 @@ train/
    - `_compute_cv_avgs` → `save_cv_summary`、`_tag_trial_dir`、`_dump_reproducible_cfg`。
 8. **搜尋結束後的匯出**  
    - `objective` 將 `TrialOutputs.mean_score` 傳給 Optuna
-   - `train.evaluation.exporters.tbm_exporter.export_tbm_predictions_for_trial` 產生預測之 TBM 結果。
+   - 若 `post_infer.tbm_concat.enabled=True`，`TrialRunner._maybe_export_tbm` 會讀取 15m(+1m 展平) 特徵、用 `train/inference/predictor.py` 對當次 trial 的 checkpoints 做投票推論，再透過 `TBMExporter` 輸出 `tbm_with_pred_*.csv`。
 
 
 #### Pipeline structure

@@ -75,7 +75,6 @@ class FeatureComputer:
                 normalized.append(spec)
         return normalized
 
-    @staticmethod
     def _build_one(self, name: str, kwargs: Dict[str, Any]) -> pd.DataFrame:
         key = str(name).upper()
         if not self.lib or key not in self.lib.builders:
@@ -270,6 +269,12 @@ class FeatureComputer:
 
         df_trades_feat = None
         if trades_norm is not None:
+            # 只保留設定指定的 1m 欄位（如 min_trade_feat）；未設定則保留全部。
+            keep_cols = (self.export_cfg.get("min_trade_feat") or None)
+            if keep_cols:
+                keep_cols = [c for c in keep_cols if c in trades_norm.columns]
+                trades_norm = trades_norm.loc[:, keep_cols]
+
             idx_t = pd.DatetimeIndex(trades_norm.index)
             if idx_t.tz is None:
                 idx_t = idx_t.tz_localize("UTC")
