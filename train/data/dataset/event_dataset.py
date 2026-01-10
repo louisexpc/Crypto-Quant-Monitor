@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Literal, Dict
+from typing import List, Optional, Tuple, Literal, Dict, Union
 
 import numpy as np
 import pandas as pd
@@ -68,7 +68,7 @@ class EventDataset(Dataset):
 
     2. inputs:
         - feat_df: pd.DataFrame（index=DatetimeIndex）
-        - tbm_csv_path: str（TBM CSV 路徑，至少含 t0/label/side）
+        - tbm_csv_path: str（TBM CSV 路徑，至少含 t0/label/side）或 tbm_df: DataFrame
         - seq_len: int = 144
         - feature_cols: Optional[List[str]] = None（None 則自動取數值欄）
         - keep_sides: {"both","long","short"} = "both"
@@ -85,7 +85,8 @@ class EventDataset(Dataset):
     def __init__(
         self,
         feat_df: pd.DataFrame,
-        tbm_csv_path: str,
+        tbm_csv_path: Optional[str] = None,
+        tbm_df: Optional[pd.DataFrame] = None,
         *,
         seq_len: int = 144,
         feature_cols: Optional[List[str]] = None,
@@ -117,12 +118,23 @@ class EventDataset(Dataset):
             raise ValueError("No valid feature columns selected for EventDataset")
 
         # 2) 讀取 TBM 事件（t1 欄可選擇性存在；先探測欄位再 parse_dates）
-        if not os.path.exists(tbm_csv_path):
-            raise FileNotFoundError(f"TBM label CSV not found: {tbm_csv_path}")
-
-        cols_head = pd.read_csv(tbm_csv_path, nrows=0).columns
-        parse_cols = ["t0"] + (["t1"] if "t1" in cols_head else [])
-        tbm = pd.read_csv(tbm_csv_path, parse_dates=parse_cols)
+        if tbm_df is None:
+            if tbm_csv_path is None:
+                raise ValueError("EventDataset requires tbm_df or tbm_csv_path.")
+            if not os.path.exists(tbm_csv_path):
+                raise FileNotFoundError(f"TBM label CSV not found: {tbm_csv_path}")
+            cols_head = pd.read_csv(tbm_csv_path, nrows=0).columns
+            parse_cols = ["t0"] + (["t1"] if "t1" in cols_head else [])
+            tbm = pd.read_csv(tbm_csv_path, parse_dates=parse_cols)
+        else:
+            tbm = tbm_df.copy()
+            if "t0" not in tbm.columns:
+                raise ValueError("tbm_df must contain column 't0'.")
+            if "t1" not in tbm.columns:
+                tbm["t1"] = pd.NaT
+            # 確保 t0/t1 轉為 datetime
+            tbm["t0"] = pd.to_datetime(tbm["t0"], errors="coerce", utc=False)
+            tbm["t1"] = pd.to_datetime(tbm["t1"], errors="coerce", utc=False)
 
         req = {"t0", "label", "side"}
         missing = req - set(tbm.columns)

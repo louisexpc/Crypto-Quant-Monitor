@@ -70,35 +70,49 @@ class Predictor:
     # ----------------------------
     # public API
     # ----------------------------
-    def predict(self, df: pd.DataFrame, model_path: PathLike) -> pd.DataFrame:
+    def predict(
+        self,
+        df: pd.DataFrame,
+        tbm_df: pd.DataFrame,
+        model_path: PathLike,
+        date_start: Optional[pd.Timestamp] = None,
+        date_end: Optional[pd.Timestamp] = None,
+    ) -> pd.DataFrame:
         """
         1. 說明:
             單一 checkpoint 推論：回傳「date window 內」的 TBM events df，並填上 pred 欄位。
-            - 事件來源：cfg.label.tbm_csv_path（或 cfg.post_infer.tbm_concat.csv_path_override）
-            - 推論區間：cfg.post_infer.tbm_concat.date_start/date_end
+            - 事件來源：呼叫端提供的 tbm_df（需含 t0/side/label，__rid 若缺會自動補）
+            - 推論區間：date_start/date_end（若未提供，取事件/特徵可用時間交集）
         2. inputs:
             - df: precomputed features（時間 index，numeric columns）
+            - tbm_df: TBM 事件 DataFrame
             - model_path: checkpoint 檔案路徑（.pt/.pth/.ckpt）
+            - date_start/date_end: 推論時間窗（可選）
         3. return:
             - out_df: 含 __rid 與單模型預測欄位的 DataFrame
         """
-        pack = self._build_infer_pack(df)
+        pack = self._build_infer_pack(df, tbm_df, date_start=date_start, date_end=date_end)
         pred_df = self._predict_on_pack(pack, Path(model_path), suffix=None)
         return pred_df
 
     def predict_vote(
         self,
         df: pd.DataFrame,
+        tbm_df: pd.DataFrame,
         model_paths_or_dir: Union[PathLike, Sequence[PathLike]],
+        date_start: Optional[pd.Timestamp] = None,
+        date_end: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
         """
         1. 說明:
             多模型投票：會跑多輪推論（模型數 = 找到的 checkpoint 數），回傳帶 vote 欄位的 df。
         2. inputs:
             - df: precomputed features（時間 index，numeric columns）
+            - tbm_df: TBM 事件 DataFrame
             - model_paths_or_dir:
                 - (a) checkpoint 檔案路徑列表
                 - (b) 目錄：自動遞迴搜尋常見 best checkpoint 檔
+            - date_start/date_end: 推論時間窗（可選）
         3. return:
             - out_df: 含 pred_i + pred_vote 的 DataFrame
         """
@@ -106,7 +120,7 @@ class Predictor:
         if len(model_paths) == 0:
             raise ValueError("[Predictor] No checkpoint found for predict_vote().")
 
-        pack = self._build_infer_pack(df)
+        pack = self._build_infer_pack(df, tbm_df, date_start=date_start, date_end=date_end)
         prefix = "pred"
 
         out_df = pack.tbm_out.copy()
@@ -149,27 +163,50 @@ class Predictor:
     # ----------------------------
     # core building blocks
     # ----------------------------
-    def _build_infer_pack(self, feat_df: pd.DataFrame) -> _InferPack:
+    def _build_infer_pack(
+        self,
+        feat_df: pd.DataFrame,
+        tbm_df: pd.DataFrame,
+        date_start: Optional[pd.Timestamp] = None,
+        date_end: Optional[pd.Timestamp] = None,
+    ) -> _InferPack:
         """
         1. 說明:
             用 cfg 的 TBM CSV + date window + keep_sides，把推論 dataset/dataloader 建好（一次就好）。
             這份 pack 可以被多個 checkpoint 共用，避免每個模型都重建 dataset。
         2. inputs:
             - feat_df: precomputed features df（時間 index）
+            - tbm_df: TBM events df（需含 t0/side/label；__rid 若缺會自動補）
+            - date_start/date_end: 推論窗口，若 None 會取 tbm/feat 的時間交集
         3. return:
             - _InferPack
         """
         feat_df = self._sanitize_feat_df(feat_df)
 
-        tbm_path = self._resolve_tbm_csv_path()
-        date_start, date_end = self._resolve_infer_window()
+        tbm_all = tbm_df.copy()
+        if "t0" not in tbm_all.columns:
+            raise ValueError("[Predictor] tbm_df must contain column 't0'.")
+        if "side" not in tbm_all.columns:
+            raise ValueError("[Predictor] tbm_df must contain column 'side'.")
+        if "label" not in tbm_all.columns:
+            raise ValueError("[Predictor] tbm_df must contain column 'label'.")
 
-        tbm_all = pd.read_csv(tbm_path, parse_dates=["t0"])
         if "__rid" not in tbm_all.columns:
             tbm_all["__rid"] = np.arange(len(tbm_all), dtype=np.int64)
 
         t0u_all = ensure_utc_index(tbm_all["t0"])
-        mask_date = (t0u_all >= date_start) & (t0u_all <= date_end)
+        feat_idx_all = ensure_utc_index(feat_df.index)
+        if len(t0u_all) == 0:
+            raise ValueError("[Predictor] tbm_df is empty.")
+
+        ds = self._to_utc_ts(date_start) if date_start is not None else None
+        de = self._to_utc_ts(date_end) if date_end is not None else None
+        if ds is None:
+            ds = max(t0u_all.min(), feat_idx_all.min())
+        if de is None:
+            de = min(t0u_all.max(), feat_idx_all.max())
+
+        mask_date = (t0u_all >= ds) & (t0u_all <= de)
 
         # 輸出底稿：date window 內的事件（即使 non-keep_sides 也保留，方便對齊你原本行為）
         tbm_out = tbm_all.loc[mask_date].copy()
@@ -206,7 +243,7 @@ class Predictor:
 
         ds = EventDataset(
             feat_view,
-            tbm_path,
+            tbm_df=tbm_all,
             seq_len=L,
             feature_cols=feat_cols_numeric,
             keep_sides=keep_sides,
@@ -252,8 +289,8 @@ class Predictor:
             dl=dl,
             rid_by_sample=rid_by_sample,
             feature_cols=feat_cols_numeric,
-            date_start=date_start,
-            date_end=date_end,
+            date_start=ds,
+            date_end=de,
         )
 
     def _predict_on_pack(self, pack: _InferPack, model_path: Path, suffix: Optional[str] = None) -> pd.DataFrame:
@@ -379,45 +416,20 @@ class Predictor:
 
         return df
 
-    def _resolve_tbm_csv_path(self) -> str:
+    @staticmethod
+    def _to_utc_ts(ts: Any) -> pd.Timestamp:
         """
         1. 說明:
-            取得 TBM CSV 路徑：優先 post_infer.override（直屬），其次 label.tbm_csv_path。
+            將任意時間轉為 UTC tz-aware Timestamp。
         2. inputs:
-            - None
+            - ts: 可轉為 pandas Timestamp 的物件
         3. return:
-            - tbm_csv_path (str)
+            - pd.Timestamp (tz-aware, UTC)
         """
-        post_root = (self.cfg.get("post_infer", {}) or {})
-        post = post_root if isinstance(post_root, dict) else {}
-        override = post.get("csv_path_override", None)
-        if override not in (None, "", "None", "none", "NULL", "null"):
-            return str(override)
-        return str((self.cfg.get("label", {}) or {}).get("tbm_csv_path"))
-
-    def _resolve_infer_window(self) -> Tuple[pd.Timestamp, pd.Timestamp]:
-        """
-        1. 說明:
-            從 cfg.post_infer 取推論日期區間，轉為 UTC Timestamp。
-        2. inputs:
-            - None
-        3. return:
-            - (date_start_utc, date_end_utc)
-        """
-        post_root = (self.cfg.get("post_infer", {}) or {})
-        post = post_root if isinstance(post_root, dict) else {}
-
-        s = pd.Timestamp(post.get("date_start"))
-        e = pd.Timestamp(post.get("date_end"))
-        if s.tzinfo is None:
-            s = s.tz_localize("UTC")
-        else:
-            s = s.tz_convert("UTC")
-        if e.tzinfo is None:
-            e = e.tz_localize("UTC")
-        else:
-            e = e.tz_convert("UTC")
-        return s, e
+        ts_obj = pd.Timestamp(ts)
+        if ts_obj.tzinfo is None:
+            return ts_obj.tz_localize("UTC")
+        return ts_obj.tz_convert("UTC")
 
     def _resolve_amp(self) -> Tuple[Optional[torch.dtype], bool]:
         """

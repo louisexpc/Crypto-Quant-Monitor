@@ -541,6 +541,7 @@ class TrialRunner:
                 debug_lines += [f"date_range=[{ds},{de}]", f"tbm_src={out_csv}", f"save_to={save_csv}"]
 
                 # 準備特徵（與 loader/tbm_exporter 同步展平邏輯）
+                tbm_df = pd.read_csv(out_csv, parse_dates=["t0"])
                 feat_df = load_precomputed_features(path=cfg["data"]["path"])
                 micro_cfg = (cfg.get("data", {}) or {}).get("micro", {}) or {}
                 micro_df = None
@@ -584,7 +585,13 @@ class TrialRunner:
                     debug_lines.append("skip_export=no_checkpoints")
                 else:
                     predictor = Predictor(cfg=cfg)
-                    pred_df = predictor.predict_vote(feat_df, model_paths_or_dir=model_paths)
+                    pred_df = predictor.predict_vote(
+                        feat_df,
+                        tbm_df=tbm_df,
+                        model_paths_or_dir=model_paths,
+                        date_start=ds,
+                        date_end=de,
+                    )
                     exporter = TBMExporter(cfg)
                     exporter.export_csv(pred_df, save_to_path=str(save_csv))
                     print(f"[PostInfer] Saved TBM with predictions: {save_csv}")

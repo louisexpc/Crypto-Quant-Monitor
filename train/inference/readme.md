@@ -1,57 +1,49 @@
 # Predictor (Inference) 指南
 
 ## 簡介
-`train/inference/predictor.py` 提供輕量推論器，直接吃預算好的 15m 特徵（可選 1m micro 展平），載入訓練時存下的 checkpoint，產出帶預測欄位的 TBM DataFrame：
+`train/inference/predictor.py` 提供輕量推論器，直接吃預算好的 15m 特徵（可選 1m micro 展平）與 TBM DataFrame，載入訓練時存下的 checkpoint，產出帶預測欄位的 TBM DataFrame：
 
-- `predict(df, model_path)`: 單一 checkpoint，輸出欄位 `pred`、`pred_p1`。
-- `predict_vote(df, model_paths_or_dir)`: 多 checkpoint 投票，輸出 `pred_i`（各 fold）、`pred_vote_votes_total`、`pred_vote_margin`、`pred_vote`。
+- `predict(df, tbm_df, model_path, date_start=None, date_end=None)`: 單一 checkpoint，輸出欄位 `pred`、`pred_p1`。
+- `predict_vote(df, tbm_df, model_paths_or_dir, date_start=None, date_end=None)`: 多 checkpoint 投票，輸出 `pred_i`（各 fold）、`pred_vote_votes_total`、`pred_vote_margin`、`pred_vote`。
 - 不做 scaler/標準化，假設特徵已在 precompute 階段完成。
 
-TrialRunner 的 post-infer（若 `post_infer.tbm_concat.enabled=True`）會自動調用這支 Predictor。
+TrialRunner 的 post-infer（若 `post_infer.enabled=True`）會自動調用這支 Predictor。
 
 ## 輸入需求
 - **特徵檔**：15m 預算特徵 DataFrame；若有 1m micro，需先展平為 `m0_...~m(window_len-1)_...`。在 `trial_runner` / `predictor_testing.py` 會用 `flatten_micro_features` 處理，手動呼叫時請先套用相同邏輯並裁剪到 `[cv_start, ts_end]`。
-- **TBM CSV**：由 `cfg.label.tbm_csv_path`（或 `post_infer.csv_path_override`）讀取，至少含 `t0`、`side`、`label`；`__rid` 若缺會自動補。
+- **TBM 事件**：呼叫端提供 `tbm_df`（至少含 `t0`、`side`、`label`，`__rid` 缺省會自動補），可由 `label.tbm_csv_path` 讀入。
 - **Checkpoint**：訓練時保存的 `model_state.pt`，內含 `state_dict`、`feature_columns`（可選）、`model_cfg`、`best_val_thresh`、`temperature`。
 
 ## 必要/選用的設定鍵位
 ```yaml
-device: "cuda:0"
+device: str
 data:
-  path: ...
-  micro:
-    enabled: true
-    path: ...
-    window_len: 15
-
+  path: str
+  micro: # (optional)
+    enabled: bool # (optional)
+    path: str # (optional)
+    window_len: int # (optional)
 cv:
-  start_date: "YYYY-MM-DD"
-  end_date: "YYYY-MM-DD"
-
+  start_date: str
+  end_date: str
 sequence:
-  seq_len: 144 # 往前看幾根 15 min 的 k bar
-
+  seq_len: int # 往前看幾根 15 min 的 k bar
 label:
-  tbm_csv_path: ...
-  keep_sides: "<side>"   # long | short | both
-  align_method: pad
-
+  tbm_csv_path: str # (optional，若外部直接提供 tbm_df 可省略)
+  keep_sides: str   # long | short | both
+  align_method: str
 post_infer:
-  enabled: true
-  date_start: "YYYY-MM-DD"
-  date_end: "YYYY-MM-DD"
-  collapse_mask_enable: true
-
-# model type
+  enabled: bool
+  date_start: str
+  date_end: str
+  collapse_mask_enable: bool # (optional)
 model:
-  name: "TwoStreamHybrid"
-  num_classes: 2
-
-# (optional) 使用與 train 相同的 dtype/bs
-train:
-  batch_size: 256
-  amp: true
-  amp_dtype: "bf16"
+  name: str
+  num_classes: int
+train: # (optional) 使用與 train 相同的 dtype/bs
+  batch_size: int # (optional)
+  amp: bool # (optional)
+  amp_dtype: str # (optional)
 
 ```
 
@@ -79,12 +71,20 @@ if micro_cfg.get("enabled"):
         window_len=int(micro_cfg.get("window_len", 15)),
     )
 
+tbm_df = pd.read_csv(cfg["label"]["tbm_csv_path"], parse_dates=["t0"])
+
 model_paths = [
     Path("runs/.../fold_0/model_state.pt"),
     Path("runs/.../fold_1/model_state.pt"),
 ]
 
-pred = Predictor(cfg).predict_vote(feat_df, model_paths)
+pred = Predictor(cfg).predict_vote(
+    feat_df,
+    tbm_df=tbm_df,
+    model_paths_or_dir=model_paths,
+    date_start=cfg["post_infer"]["date_start"],
+    date_end=cfg["post_infer"]["date_end"],
+)
 # pred 內含 pred_0/pred_1/.../pred_vote_* 欄位，可自行輸出 CSV
 ```
 

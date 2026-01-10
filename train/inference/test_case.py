@@ -168,6 +168,20 @@ class EventInferenceRunner:
             raise ValueError("Feature dataframe is empty after applying time bounds.")
         return feat_df
 
+    def _load_tbm_df(self) -> pd.DataFrame:
+        """
+        1. 說明:
+            載入 TBM CSV（含 t0/side/label），原樣交給 Predictor 處理 __rid 與時間窗口。
+        2. inputs:
+            - None
+        3. return:
+            - pd.DataFrame: TBM 事件表。
+        """
+        tbm_path = (self.cfg.get("label", {}) or {}).get("tbm_csv_path")
+        if not tbm_path:
+            raise ValueError("label.tbm_csv_path is required to load TBM CSV.")
+        return pd.read_csv(tbm_path, parse_dates=["t0"])
+
     def run(self) -> str:
         """
         1. 說明:
@@ -178,8 +192,18 @@ class EventInferenceRunner:
             - str: 寫出的 CSV 路徑。
         """
         feat_df = self._prepare_features()
+        tbm_df = self._load_tbm_df()
         predictor = Predictor(cfg=self.cfg)
-        pred_df = predictor.predict_vote(feat_df, model_paths_or_dir=self.model_paths)
+        post_cfg = (self.cfg.get("post_infer", {}) or {})
+        date_start = post_cfg.get("date_start")
+        date_end = post_cfg.get("date_end")
+        pred_df = predictor.predict_vote(
+            feat_df,
+            tbm_df=tbm_df,
+            model_paths_or_dir=self.model_paths,
+            date_start=date_start,
+            date_end=date_end,
+        )
 
         exporter = TBMExporter(self.cfg)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
