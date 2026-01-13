@@ -19,7 +19,7 @@ feature_selections
 ./crypto_quant_monitor.egg-info
 
 /utils
-*.json
+# *.json
 feature_select/results
 train/results/*
 *.csv

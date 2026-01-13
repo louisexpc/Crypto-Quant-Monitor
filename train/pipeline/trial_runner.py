@@ -18,7 +18,8 @@ from train.pipeline.search.space import (
 # -- single-fold trainer factory --
 from train.training.trainers.utils import get_trainer
 from train.evaluation.exporters.cv_summary import save_cv_summary
-from train.evaluation.exporters.tbm_exporter import export_tbm_predictions_for_trial
+from train.evaluation.exporters.tbm_exporter import TBMExporter
+from train.inference.predictor import Predictor
 from train.evaluation.utils import save_fold_metrics
 from train.evaluation.reporters.classification_reporter import ClassificationReporter
 from train.evaluation.reporters.regression_reporter import RegressionReporter
@@ -26,6 +27,7 @@ from train.evaluation.reporters.regression_reporter import RegressionReporter
 # -- 3) Loader：優先新 -> 退回舊 --
 from train.data.dataloaders.time_loader import make_time_loaders_for_fold  # type: ignore
 from train.data.dataloaders.event_loader import make_event_loaders_for_fold  # type: ignore
+from train.data.dataloaders.base import load_precomputed_features, flatten_micro_features
 from train.models.model_factory import build_model
 
 
@@ -146,11 +148,17 @@ class TrialRunner:
                 if result is not None:
                     checkpoint_payload = result.get("state_dict")
                 if checkpoint_payload:
-                    checkpoint_path = fold_dir / "model_state.pt"
+                    checkpoint_path = fold_dir / f"model_state_{i}.pt"
+                    best_thr = result.get("best_val_thresh", None)
+                    temperature = result.get("temperature", None)
                     meta = {
                         "state_dict": checkpoint_payload,
-                        "model_name": cfg["model"].get("name"),
                         "feature_columns": result.get("_feature_columns"),
+                        "model_cfg": cfg.get("model"),
+                        "temperature": float(temperature) if temperature is not None else None,
+                        "best_val_thresh": float(best_thr) if best_thr is not None else None,
+                        "amp": (cfg.get("train", {}) or {}).get("amp"),
+                        "amp_dtype": (cfg.get("train", {}) or {}).get("amp_dtype"),
                     }
                     torch.save(meta, checkpoint_path)
                     model_ref = checkpoint_path
@@ -182,7 +190,7 @@ class TrialRunner:
         self._print_cv(task_type, val_avg, test_avg, len(fold_results))
 
         # === Optional: TBM 併回 ===
-        self._maybe_export_tbm(cfg, df, folds, fold_models_for_infer, trial_dir, task_type)
+        self._maybe_export_tbm(cfg, folds, fold_models_for_infer, trial_dir, task_type)
 
         # === 保存特徵欄位 ===
         try:
@@ -496,7 +504,6 @@ class TrialRunner:
     def _maybe_export_tbm(
         self,
         cfg: Dict[str, Any],
-        df,  # for index
         folds: List[Dict[str, Any]],
         fold_models_for_infer: List[Tuple[Any, Dict[str, Any], Dict[str, Any]]],
         trial_dir: Path,
@@ -504,11 +511,11 @@ class TrialRunner:
     ) -> None:
         """
         1. 說明: 依設定執行 TBM 併回匯出（僅分類任務）
-        2. inputs: cfg, df, folds, fold_models_for_infer, trial_dir, task_type
+        2. inputs: cfg, folds, fold_models_for_infer, trial_dir, task_type
         3. return: None
         """
         try:
-            post_infer = (cfg.get("post_infer", {}) or {}).get("tbm_concat", {}) or {}
+            post_infer = cfg.get("post_infer", {}) or {}
             debug_lines = [
                 f"task_type={task_type}",
                 f"post_infer_enabled={bool(post_infer.get('enabled', False))}",
@@ -521,43 +528,74 @@ class TrialRunner:
                     with open(trial_dir / "post_infer_debug.txt", "w", encoding="utf-8") as dfp:
                         dfp.write("\n".join(debug_lines))
                     return
-                ds = str(post_infer.get("date_start", "2023-01-01"))
-                de = str(post_infer.get("date_end", "2025-08-01"))
-                out_col = str(post_infer.get("output_column", "pred"))
+                ds = str(post_infer["date_start"])
+                de = str(post_infer["date_end"])
                 out_csv = str(post_infer.get("csv_path_override") or cfg.get("label", {}).get("tbm_csv_path"))
                 trial_name = trial_dir.name
                 match = re.match(r"^(trial_\d+)", trial_name)
                 trial_token = match.group(1) if match else trial_name
-                keep_sides = str(cfg.get("label", {}).get("keep_sides", "both")).lower()
-                lookback_val = cfg.get("label", {}).get("lookback", "unknown")
-                try:
-                    lookback_token = f"{int(lookback_val)}"
-                except (TypeError, ValueError):
-                    lookback_token = str(lookback_val)
+                keep_sides = str(cfg["label"]["keep_sides"]).lower()
+                lookback = cfg["label"]["lookback"]
+                lookback_token = f"{int(lookback)}"
                 save_csv = trial_dir / f"{trial_token}_{keep_sides}_{lookback_token}.csv"
                 debug_lines += [f"date_range=[{ds},{de}]", f"tbm_src={out_csv}", f"save_to={save_csv}"]
 
-                export_tbm_predictions_for_trial(
-                    cfg=cfg,
-                    df_index=pd.DatetimeIndex(df.index),
-                    folds=folds,
-                    fold_models=fold_models_for_infer,
-                    trial_dir=trial_dir,
-                    date_start=ds,
-                    date_end=de,
-                    src_tbm_csv_path=out_csv,
-                    save_to_path=str(save_csv),
-                    output_column=out_col,
-                    threshold_override=(
-                        post_infer.get("threshold_override")
-                        if isinstance(post_infer.get("threshold_override", None), (int, float))
-                        else None
-                    ),
-                    decision_mode="both",
-                    collapse_mask_enable=bool(post_infer.get("collapse_mask_enable", True)),
-                )
-                print(f"[PostInfer] Saved TBM with predictions: {save_csv}")
-                debug_lines.append("status=ok")
+                # 準備特徵（與 loader/tbm_exporter 同步展平邏輯）
+                tbm_df = pd.read_csv(out_csv, parse_dates=["t0"])
+                feat_df = load_precomputed_features(path=cfg["data"]["path"])
+                micro_cfg = (cfg.get("data", {}) or {}).get("micro", {}) or {}
+                micro_df = None
+                micro_end = None
+                if micro_cfg.get("enabled") and micro_cfg.get("path"):
+                    micro_df = load_precomputed_features(path=micro_cfg["path"])
+                    if len(micro_df.index):
+                        micro_end = pd.DatetimeIndex(micro_df.index).max()
+
+                def _to_utc(ts_like):
+                    ts = pd.Timestamp(ts_like)
+                    if ts.tzinfo is None:
+                        return ts.tz_localize("UTC")
+                    return ts.tz_convert("UTC")
+
+                cv_start = _to_utc(cfg["cv"]["start_date"])
+                ts_end_param = _to_utc(de)
+                ts_end_candidates = [ts_end_param, pd.DatetimeIndex(feat_df.index).max()]
+                if micro_end is not None:
+                    ts_end_candidates.append(micro_end)
+                ts_end = min(ts_end_candidates)
+
+                if micro_df is not None:
+                    window_len = int(micro_cfg.get("window_len", 15))
+                    feat_df = flatten_micro_features(
+                        feat_df=feat_df,
+                        micro_df=micro_df,
+                        cv_start=cv_start,
+                        ts_end=ts_end,
+                        window_len=window_len,
+                    )
+
+                feat_df = feat_df.loc[(feat_df.index >= cv_start) & (feat_df.index <= ts_end)]
+
+                # 收集 checkpoint 路徑（僅保留有路徑的）
+                model_paths = []
+                for model_ref, _fold, _res in fold_models_for_infer:
+                    if isinstance(model_ref, (str, Path)):
+                        model_paths.append(Path(model_ref))
+                if not model_paths:
+                    debug_lines.append("skip_export=no_checkpoints")
+                else:
+                    predictor = Predictor(cfg=cfg)
+                    pred_df = predictor.predict_vote(
+                        feat_df,
+                        tbm_df=tbm_df,
+                        model_paths_or_dir=model_paths,
+                        date_start=ds,
+                        date_end=de,
+                    )
+                    exporter = TBMExporter(cfg)
+                    exporter.export_csv(pred_df, save_to_path=str(save_csv))
+                    print(f"[PostInfer] Saved TBM with predictions: {save_csv}")
+                    debug_lines.append("status=ok")
 
             # 記錄 debug
             with open(trial_dir / "post_infer_debug.txt", "w", encoding="utf-8") as dfp:

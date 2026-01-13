@@ -19,7 +19,7 @@ import os
 from train.pipeline.search.objective import objective
 from train.core.context import set_seed
 from train.core.config_loader import load_cfg
-from train.data.dataloaders.base import load_precomputed_features, reindex_to_full_grid, clip_df_by_start_date
+from train.data.dataloaders.base import load_precomputed_features, reindex_to_full_grid
 
 
 __all__ = [
@@ -41,9 +41,6 @@ def prepare_dataframe(cfg: dict) -> pd.DataFrame:
     freq = (cfg.get("data", {}) or {}).get("freq")
     if freq and not feat_df.empty:
         feat_df = reindex_to_full_grid(feat_df, str(freq))
-    feat_df = clip_df_by_start_date(feat_df, cfg)
-
-    # 沿用舊行為：只取 index 骨架給 make_folds 用
     df = pd.DataFrame(index=feat_df.index)
     df = df[~df.index.duplicated(keep="last")]
     return df
@@ -122,7 +119,7 @@ def _apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[
     return cfg
 
 
-def run_single(cfg_path: str, *, cfg: dict | None = None):
+def run(cfg_path: str, *, cfg: dict | None = None):
     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
     cfg = cfg or load_cfg(cfg_path)
     set_seed(int(cfg.get("seed", 42)))
@@ -167,4 +164,4 @@ if __name__ == "__main__":
 
     cfg = load_cfg(args.config)
     cfg = _apply_cli_overrides(cfg, args)
-    run_single(args.config, cfg=cfg)
+    run(args.config, cfg=cfg)
