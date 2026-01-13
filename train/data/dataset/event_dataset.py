@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Literal, Dict, Union
+from typing import List, Optional, Tuple, Literal, Dict
 
 import numpy as np
 import pandas as pd
