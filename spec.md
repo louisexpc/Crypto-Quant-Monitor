@@ -79,3 +79,9 @@
             #TODO
 
     ```
+
+1. event 的 t0 是最新的 => 抓 feat_df 的要抓 t0-1
+2. given 一個 time window (重寫 dataset / loader) => pred label
+3. Predictor 物件的 init 就先讀取 model 到 mem (建立兩個 predictor 物件 long/short)
+4. return tuple (inference time / pred_int)
+5. feat_selector 拆成獨立模組，trade先不要。

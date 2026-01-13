@@ -12,11 +12,7 @@ try:
 except ImportError:  # pragma: no cover - tqdm optional
     pass
 
-try:
-    from tqdm.auto import tqdm
-except ImportError:  # pragma: no cover - tqdm optional
-    def tqdm(iterable=None, **kwargs):
-        return iterable if iterable is not None else []
+from tqdm.auto import tqdm
 
 # =========================
 # 1) 指標庫：負責把已規格化的 df → 各種特徵

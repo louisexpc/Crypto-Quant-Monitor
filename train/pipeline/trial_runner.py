@@ -148,16 +148,17 @@ class TrialRunner:
                 if result is not None:
                     checkpoint_payload = result.get("state_dict")
                 if checkpoint_payload:
-                    checkpoint_path = fold_dir / "model_state.pt"
+                    checkpoint_path = fold_dir / f"model_state_{i}.pt"
                     best_thr = result.get("best_val_thresh", None)
                     temperature = result.get("temperature", None)
                     meta = {
                         "state_dict": checkpoint_payload,
-                        "model_name": cfg["model"].get("name"),
-                        "model_cfg": cfg.get("model"),
                         "feature_columns": result.get("_feature_columns"),
+                        "model_cfg": cfg.get("model"),
+                        "temperature": float(temperature) if temperature is not None else None,
                         "best_val_thresh": float(best_thr) if best_thr is not None else None,
-                        "temperature": float(temperature) if temperature is not None else 1.0,
+                        "amp": (cfg.get("train", {}) or {}).get("amp"),
+                        "amp_dtype": (cfg.get("train", {}) or {}).get("amp_dtype"),
                     }
                     torch.save(meta, checkpoint_path)
                     model_ref = checkpoint_path
@@ -514,8 +515,7 @@ class TrialRunner:
         3. return: None
         """
         try:
-            post_root = cfg.get("post_infer", {}) or {}
-            post_infer = post_root.get("tbm_concat", {}) or {}
+            post_infer = cfg.get("post_infer", {}) or {}
             debug_lines = [
                 f"task_type={task_type}",
                 f"post_infer_enabled={bool(post_infer.get('enabled', False))}",

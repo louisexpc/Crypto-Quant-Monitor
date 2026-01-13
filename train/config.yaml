@@ -5,12 +5,12 @@
 # 1. ---basic---
 seed: 42
 device: "cuda:0"
-project_name: BTC_test_long_108
-also_XGB: True
+project_name: BTC_tbm_short_v2
+also_XGB: False
 
 # 2. ---Data setting---
 data:
-  path: data/precomputed/btcusdt_15m_features/btcusdt_15m_features.csv   # 15-minute aggregated features
+  path: data/precomputed/btcusdt_15m_features_rb120/btcusdt_15m_features.csv # 15-minute aggregated features
   index_col: timestamp          # timestamp 或 datetime，對齊 Indicators
   freq: "15min"                    # 供缺口提醒（不會自動補齊）
   columns:
@@ -19,7 +19,7 @@ data:
 
   # 1-min的短時間序列
   micro:
-    enabled: true
+    enabled: False
     path: data/precomputed/btcusdt_15m_features/btcusdt_1m_trades.csv
     window_len: 15                # 每根 15min bar 對應過去 15 個 1min    
 
@@ -66,8 +66,8 @@ label:
 
   tbm_csv_path: data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv
   lookback: 108
-  keep_sides: short       # 或 short；若 csv 可能同一 t0 有雙邊，請先選邊
-  align_method: pad        # 若 15m 缺列再用 pad
+  keep_sides: short        # long | short 
+  align_method: pad        
 
 
 # 6. Pred tbm event
@@ -85,14 +85,14 @@ post_infer:
 # ==================================================
 # 1. basic
 train:
-  lr: [1e-5]
+  lr: [1e-6, 1e-4]
   weight_decay: [1e-5]
   batch_size: 256
-  epochs: 10
+  epochs: 150
   grad_clip: [0.3]
 
   early_stopping_patience: 20
-  warmup_epochs: 5
+  warmup_epochs: 10
 
   amp: true
   amp_dtype: "bf16"       # "none" / "fp16" / "bf16" / "auto"
@@ -116,7 +116,7 @@ train:
 
 
   # ---- 連續懲罰（避免塌縮只判單類）----
-  dist_align_weight: 0.3              # 分佈對齊 KL 懲罰權重（建議 0.1~0.5 起試）
+  dist_align_weight: 0.0              # 分佈對齊 KL 懲罰權重（建議 0.1~0.5 起試）
   dist_prior: train                   # [train | uniform] 先驗分佈來源
   confidence_penalty: 0.0           # 置信度懲罰（鼓勵高熵，建議 1e-3~1e-2）
 
@@ -166,7 +166,7 @@ objective:
 
 # 3. search 次數 | 時長
 search:
-  n_trials: 1
+  n_trials: 10
   timeout: 10    # 小時
   sampler: tpe
   pruner: median
@@ -180,7 +180,7 @@ search:
 # =========================
 model:
   name: "TwoStreamHybrid"   # TwoStreamHybrid / TemporalTransformer
-  d_model: [32]
+  d_model: [32, 48, 64]
   n_heads: [2]
   n_layers: [1]
   mlp_ratio: 2.0
@@ -194,7 +194,7 @@ model:
 
   # ==== Two-Stream 新增 ====
   minute_steps: 15              # 每根 15m bar 含 15 個 1m 切片
-  minute_hidden: [32, 48, 64]
+  minute_hidden: [16]
   minute_layers: 2
   minute_dropout: [0, 0.1]
 

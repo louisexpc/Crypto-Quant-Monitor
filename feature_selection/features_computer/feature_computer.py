@@ -2,6 +2,8 @@
 from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Sequence
+from datetime import datetime
+import json
 import shutil
 import yaml
 import numpy as np
@@ -24,6 +26,8 @@ class FeatureComputer:
         self.export_cfg = cfg.get("export", {}) or {}
         self.plan = (cfg.get("features", {}) or {}).get("plan", {}) or {}
         self.lib: IndicatorLibrary | None = None
+        self.select_feat_path = self.data_cfg.get("selected_feat_path")
+        self._whitelist_cache: set[str] | None = None
 
     # ------------------------------------------------------------
     # 輔助：feature plan
@@ -93,6 +97,124 @@ class FeatureComputer:
         if len(dups):
             raise ValueError(f"Duplicate feature names: {list(dups)}")
         return X
+
+    def _load_whitelist(self) -> set[str] | None:
+        """讀取白名單 txt（若未設定則回傳 None）。"""
+        if self._whitelist_cache is not None:
+            return self._whitelist_cache
+        if not self.select_feat_path:
+            return None
+        path = Path(self.select_feat_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Whitelist file not found: {path}")
+        with path.open("r", encoding="utf-8") as f:
+            names = [line.strip() for line in f if line.strip()]
+        whitelist = set(names)
+        if not whitelist:
+            raise ValueError(f"Whitelist file is empty: {path}")
+        self._whitelist_cache = whitelist
+        return whitelist
+
+    def _filter_feat_list_by_whitelist(
+        self,
+        feat_list: List[Dict[str, Any]],
+        whitelist: set[str],
+        base_df: pd.DataFrame,
+        probe_rows: int = 200,
+    ) -> List[Dict[str, Any]]:
+        """
+        僅保留可能產出白名單欄位的 builder，避免交易時計算不必要的特徵。
+        採樣少量資料取得欄名；若遇例外則保守地保留該 builder。
+        """
+        if not whitelist:
+            return feat_list
+
+        sample_df = base_df.head(probe_rows)
+        sample_lib = IndicatorLibrary(sample_df)
+
+        kept: List[Dict[str, Any]] = []
+        for item in feat_list:
+            name = str(item.get("name"))
+            kwargs = item.get("kwargs", {}) or {}
+            try:
+                key = name.upper()
+                if key not in sample_lib.builders:
+                    kept.append(item)
+                    continue
+                df_sample = sample_lib.builders[key](kwargs)
+                cols = list(df_sample.columns)
+            except Exception:
+                # 為避免漏算必要特徵，遇到錯誤直接保留
+                kept.append(item)
+                continue
+            if any(c in whitelist for c in cols):
+                kept.append(item)
+
+        if not kept:
+            raise ValueError("Whitelist 過濾後沒有可計算的特徵，請檢查白名單或計畫設定。")
+        return kept
+
+    @staticmethod
+    def _to_jsonable(obj: Any) -> Any:
+        """將部分 pandas/numpy/Path 物件轉為可 JSON 序列化的基本型別。"""
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, np.generic):
+            return obj.item()
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        if isinstance(obj, dict):
+            return {k: FeatureComputer._to_jsonable(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [FeatureComputer._to_jsonable(v) for v in obj]
+        return obj
+
+    def _manifest_entries(
+        self,
+        df_part: pd.DataFrame,
+        name: str,
+        kwargs: Dict[str, Any],
+        src_item: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """為單一 builder 輸出的欄位建立 manifest 記錄。"""
+        src_id = src_item.get("id") or src_item.get("display_name") or src_item.get("name")
+        kw_jsonable = self._to_jsonable(kwargs)
+        entries = []
+        for col in df_part.columns:
+            entries.append(
+                {
+                    "column": col,
+                    "family": str(name),
+                    "kwargs": kw_jsonable,
+                    "source_item": src_id,
+                }
+            )
+        return entries
+
+    def _export_manifest(self, entries: List[Dict[str, Any]]) -> Path | None:
+        """
+        將 manifest 寫入檔案；需 export.manifest_enabled=True 才會輸出。
+        """
+        if not self.export_cfg.get("manifest_enabled", False):
+            return None
+
+        manifest_path = (self.export_cfg.get("manifest_path") or None)
+        if manifest_path is None:
+            out_dir = self.export_cfg.get("out_dir")
+            if out_dir:
+                manifest_path = Path(out_dir) / "manifest.json"
+            else:
+                return None
+
+        path = Path(manifest_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "items": entries,
+        }
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return path
 
     # ------------------------------------------------------------
     # 輔助：rolling z-normalization
@@ -214,6 +336,7 @@ class FeatureComputer:
         回傳 (15m 特徵表, trades 特徵表|None)。
         若呼叫者提供 df_raw_ohlcv/df_raw_trades 則使用之，否則依 cfg 讀檔。
         """
+        # 1. 處理 ohlcv & fng
         base_df, trades_norm = self._load_base_df(df_raw_ohlcv, df_raw_trades)
         self.lib = IndicatorLibrary(base_df)
 
@@ -221,11 +344,19 @@ class FeatureComputer:
         if not feat_list:
             raise ValueError("計畫沒有任何 enabled=True 的 features。")
 
+        # 若有白名單，先過濾掉不會產生目標欄位的 builder，減少計算量
+        whitelist = self._load_whitelist()
+        if whitelist:
+            feat_list = self._filter_feat_list_by_whitelist(feat_list, whitelist, base_df)
+
         parts: List[pd.DataFrame] = []
+        manifest_entries: List[Dict[str, Any]] = []
         for item in tqdm(feat_list, desc="Building features", total=len(feat_list)):
             name = str(item.get("name"))
             kwargs = item.get("kwargs", {}) or {}
-            parts.append(self._build_one(name, kwargs))
+            df_part = self._build_one(name, kwargs)
+            parts.append(df_part)
+            manifest_entries.extend(self._manifest_entries(df_part, name, kwargs, item))
 
         feat_df = self._finalize(parts)
 
@@ -242,6 +373,20 @@ class FeatureComputer:
         elif nan_policy not in {"none", ""}:
             raise ValueError(f"[nan_policy] 未知策略: {nan_policy}")
         feat_df = feat_df.astype("float32")
+
+        # 若有白名單，僅保留白名單特徵，並同步縮減 manifest
+        if whitelist:
+            keep_cols = [c for c in feat_df.columns if c in whitelist]
+            if not keep_cols:
+                raise ValueError(
+                    f"No columns matched whitelist ({self.select_feat_path}); whitelist size={len(whitelist)}"
+                )
+            feat_df = feat_df.loc[:, keep_cols]
+            keep = set(feat_df.columns)
+            manifest_entries = [m for m in manifest_entries if m["column"] in keep]
+
+        # 輸出 manifest（若設定）
+        self._export_manifest(manifest_entries)
 
         # 時間欄 + 未 shift 原始 OHLCV + 特徵
         idx = pd.DatetimeIndex(feat_df.index)
@@ -267,6 +412,7 @@ class FeatureComputer:
         )
         df_ohlcv_feat = self._apply_rolling_norm(df_ohlcv_feat)
 
+        # 2. 處理 trades feat
         df_trades_feat = None
         if trades_norm is not None:
             # 只保留設定指定的 1m 欄位（如 min_trade_feat）；未設定則保留全部。

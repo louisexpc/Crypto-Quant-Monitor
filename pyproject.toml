@@ -12,4 +12,4 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["train*", "feature_selection*"]                 # 只封裝 train/ 這棵樹（你也可擴到其它子包）
+include = ["train*", "feature_selection*", "trader*"]                 # 只封裝 train/ 這棵樹（你也可擴到其它子包）
