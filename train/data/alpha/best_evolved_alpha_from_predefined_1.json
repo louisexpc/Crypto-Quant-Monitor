@@ -1,0 +1,55 @@
+{
+  "tree": {
+    "type": "OpNode",
+    "operator": "*",
+    "arity": 2,
+    "left": {
+      "type": "Leaf",
+      "value": 7.343119457379839
+    },
+    "right": {
+      "type": "OpNode",
+      "operator": "correlation",
+      "arity": 2,
+      "left": {
+        "type": "OpNode",
+        "operator": "inverse",
+        "arity": 2,
+        "left": {
+          "type": "Leaf",
+          "value": "high"
+        },
+        "right": {
+          "type": "Leaf",
+          "value": 1
+        }
+      },
+      "right": {
+        "type": "OpNode",
+        "operator": "sigmoid",
+        "arity": 2,
+        "left": {
+          "type": "Leaf",
+          "value": "obv"
+        },
+        "right": {
+          "type": "Leaf",
+          "value": 2.124026492471829
+        }
+      }
+    }
+  },
+  "metrics": {
+    "fitness": 1.0,
+    "ic": null,
+    "sharpe": null
+  },
+  "meta": {
+    "created_at": "2025-11-03 19:32:30",
+    "fitness_type": null,
+    "operator_set": null,
+    "depth_limit": null,
+    "signature": "b2f238e798377ba3ca0991a1761a547c"
+  },
+  "formula_str": "(7.34312 * correlation(inverse(high, 1), sigmoid(obv, 2.12403)))"
+}

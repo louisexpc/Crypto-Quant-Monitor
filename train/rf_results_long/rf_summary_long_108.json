@@ -1,0 +1,32 @@
+{
+  "feature_mode": "stat",
+  "params": {
+    "n_estimators": 1200,
+    "max_depth": null,
+    "max_features": "sqrt",
+    "min_samples_leaf": 1,
+    "class_weight": "balanced_subsample",
+    "n_jobs": -1,
+    "random_state": 42,
+    "oob_score": false
+  },
+  "val_acc": 0.5074626865671642,
+  "test_acc": 0.5454545454545454,
+  "confusion_matrix": [
+    [
+      108,
+      0
+    ],
+    [
+      100,
+      12
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n         0.0     0.5192    1.0000    0.6835       108\n         1.0     1.0000    0.1071    0.1935       112\n\n    accuracy                         0.5455       220\n   macro avg     0.7596    0.5536    0.4385       220\nweighted avg     0.7640    0.5455    0.4341       220\n",
+  "artifacts": {
+    "confusion_matrix_png": "./rf_results_long/confusion_matrix_long_108.png",
+    "classification_report_png": "./rf_results_long/classification_report_long_108.png",
+    "feature_importances_png": "./rf_results_long/feature_importances_long_108.png"
+  },
+  "timestamp": "20251106_010142"
+}
