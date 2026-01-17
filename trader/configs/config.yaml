@@ -1,55 +1,84 @@
-exchange:
-  id: 'binance'           # 交易所 ID，從 binance 改為 mexc
-  default_type: 'swap' # 市場類型，'spot' (現貨) 或 'swap' (永續合約)
-data:
-  symbols: ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-  interval: "15m" # Options: "1m", "5m", "15m", "1h", "4h", "1d"
-  market: "futures" # Options: "spot", "futures"
-  lookback: 100
-  features:
-    long_feature_cfg_path: "configs/feature_108_long.yaml"
-    short_feature_cfg_path: "configs/feature_108_short.yaml"
-  redis_url: "redis://localhost:6379"
-  # rumtime option
-  queue_max: 200000
-  health_timeout: 30.0
-  backoff_base: 1.0
-  backoff_max: 60.0
 
-# Trader configuration
+
+symbol: "BTCUSDT"
+redis_url: "redis://localhost:6379"
+
+
+
+
+
+# -----------------------------
+# Deep Learning configuration
+# -----------------------------
+feature:
+  config_path : "indicators/feature.yaml" # 指標設定檔路徑，具體設定見 indicators/feature.yaml
+predictor:
+  config_path : "predictor/predictor.yaml" # 預測器設定檔路徑，具體設定見 predictor/predictor.yaml
+
+# -----------------------------
+# SNR Strategy configuration
+# -----------------------------
+strategy:
+  config_path : "strategy/strategy.yaml" # 策略設定檔路徑，具體設定見 strategy/snr_strategy.yaml
+# -----------------------------
+# Exchange configuration
+# -----------------------------
 exchange:
-  id: binance              # 也可用 binanceusdm / binancecoinm（期貨）
-  market_type: future        # spot | future 
-  sandbox: true            # true = testnet / false = live
+  # 建議：
+  # - spot：binance + spot testnet
+  # - U 本位永續：binanceusdm（若要用 set_leverage / set_margin_mode / set_position_mode 等期貨專屬能力）
+  id: "binance"                 # "binance" | "binanceusdm" | "binancecoinm" ...
+  market_type: "future"         # "spot" | "future"
+  sandbox: true                  # true = testnet / false = live
   enable_rate_limit: true
   timeout_ms: 30000
   recv_window: 10000
   adjust_for_time_difference: true
 
-  # Spot Testnet 官方 endpoints（必要時可換 api1.testnet...）
-  # 注意：ccxt 內部 urls 結構較複雜，因此這裡做「最小侵入」覆寫：只覆寫 exchange.urls['api']（你原 template 的做法）。
-  # 若你使用 binanceusdm 等 futures class，請改成對應 testnet endpoint（各市場不同）。
-  urls_override:
-    api: "https://testnet.binance.vision/api"
+  # 若要連 Binance Spot Testnet：
+  # https://testnet.binance.vision/
+  # 若要連 Binance USD-M Futures Testnet：
+  # https://testnet.binancefuture.com/
+  # 重要：不同 exchange class 的 urls 結構可能不同；請以你使用的 class 為準。
+  # urls_override:
+  #   api: "https://testnet.binance.vision/api"
 
+# -----------------------------
+# Trader configuration
+# -----------------------------
 trade:
-  enabled: true            # 交易總開關（false 直接拒絕下單）
-  allow_live: false        # 強制防呆：sandbox=false 時若 allow_live!=true 直接 raise
-  dry_run: false           # true：不真的送單，只印出會送的 payload
-  symbol_allowlist: ["BTC/USDT", "ETH/USDT"]
-  max_open_orders_per_symbol: 5 #限制單一 symbol 的 open orders 數量，避免策略異常時爆量掛單
+  enabled: true                   # 交易總開關（false 直接拒絕送單/撤單）
+  allow_live: false               # sandbox=false 時若 allow_live!=true 會直接阻擋（硬防呆）
+  dry_run: false                  # true：不真的送單，只印出 payload 並回傳 mock
+  symbol_allowlist: ["BTC/USDT"]
+  max_open_orders_per_symbol: 5
 
-risk:
-  max_notional_per_order: 200        # 單筆最大名目（USDT）
-  min_free_quote_balance: 50         # 最低可用 quote（USDT）
-  max_slippage_bps_market: 30        # 市價單最大允許滑點（bps），以 mid price 粗估
-  require_post_only_for_limit: false # 若 true，限價單一律 postOnly
+  risk:
+    # Common
+    max_notional_per_order: 200          # 單筆最大名目（USDT）
+    min_free_quote_balance: 50           # 最低可用 quote（USDT）
+    max_slippage_bps_market: 30          # 市價單最大允許滑點（bps），以 mid price 粗估
+    require_post_only_for_limit: false   # 若 true，限價單一律 postOnly
 
-futures:
-  leverage: 3                 # 期貨用；spot 會忽略
-  margin_mode: isolated       # isolated | cross
-  position_mode: one-way      # one-way | hedge（不同 binance futures 類型支援狀況不同）
+    # Futures specific (粗估保證金)
+    # required_margin_est = notional / configured_leverage
+    # required_margin_est * (1 + buffer_ratio) <= free_quote 才允許開倉
+    futures_initial_margin_buffer_ratio: 0.10
 
-logging:
-  level: INFO
-  log_file: "./trader.log"
+  futures:
+    leverage: 3                   # 期貨用；spot 會忽略
+    margin_mode: "isolated"       # "isolated" | "cross"
+    position_mode: "one-way"      # "one-way" | "hedge"
+
+  # 可選：統一下單 sizing 的預設值（你也可以在策略端自行計算再呼叫 create_order_by_budget）
+  position_sizing:
+    quote: "USDT"
+    price_source: "mid"           # "mid" | "ticker_last"
+
+  logging:
+    level: "INFO"
+    log_file: "./trader.log"
+
+  network:
+    max_retry: 3
+    base_sleep_sec: 0.5

@@ -7,8 +7,8 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, List
 
-from trader.indicators.feature_computer import FeatureComputer
-from trader.predictor.predictor import Predictor
+from indicators.feature_computer import FeatureComputer
+from predictor.predictor import Predictor
 
 
 def _load_yaml(path: Path) -> Dict[str, Any]:

@@ -1,23 +1,24 @@
 time:
   columns: ["datetime", "timestamp"]   # 從這些欄位擇一作為時間索引；若皆缺，需已有 DatetimeIndex
-  freq: "15min"                        # 等距檢查用；不自動補齊
+  freq: "15m"                        # 等距檢查用；不自動補齊
 
 ohlcv_required: ["open", "high", "low", "close", "volume", "fng"]
 
+#交易聚合
 trades:
   enabled: False
   window_len: 15                       # 每根 15m bar 參考過去 15 根 1m 視窗（t-1 以前）
 
 feat_plan:
-  long_feat_path: "trader/indicators/feat_cfg/long_feat.yaml"
-  short_feat_path: "trader/indicators/feat_cfg/short_feat.yaml"
+  long_feat_path: "/indicators/feat_cfg/long_feat.yaml"
+  short_feat_path: "/indicators/feat_cfg/short_feat.yaml"
 
-manifest_path: "trader/indicators/config/manifest.json"   # optional: training manifest for reference
+manifest_path: "/indicators/config/manifest.json"   # optional: training manifest for reference
 
 # 長/短單白名單（若空則計算全部啟用特徵）
 selected_feat_path:
-  long: "trader/indicators/config/rank_biserial_120_feats_long.txt"
-  short: "trader/indicators/config/rank_biserial_120_feats_short.txt"
+  long: "/indicators/config/rank_biserial_120_feats_long.txt"
+  short: "/indicators/config/rank_biserial_120_feats_short.txt"
 
 feat_normalization:
   enabled: True                       # 若要 rolling z-score，改為 true

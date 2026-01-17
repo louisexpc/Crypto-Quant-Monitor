@@ -6,7 +6,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from trader.indicators.indicators_lib import IndicatorLibrary
+from indicators.indicators_lib import IndicatorLibrary
 
 
 class FeatureComputer:

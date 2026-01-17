@@ -1,36 +1,108 @@
 # ./app/data_collector.py
+from dataclasses import dataclass
 import ccxt
 import pandas as pd
 import os
 import requests
 import logging
+from typing import Literal
+
+import yaml
+
+@dataclass(frozen=True)
+class ExchangeConfig:
+    id: str = 'binance'
+    market_type: Literal['spot', 'future'] = 'future'
+    sandbox: bool = True                  # true = testnet / false = live
+    enable_rate_limit: bool = True
+    timeout_ms: int = 30000
+    recv_window: int = 10000
+    adjust_for_time_difference: bool = True
+    urls_override: dict | None = None     # e.g., {'api': 'https://testnet.binance.vision/api'}
+
 class ExchangeDataCollector:
-    def __init__(self, exchange_config: dict):
+    def __init__(self,api_key, api_secret, exchange_config: ExchangeConfig):
         """
         通用數據採集器，根據傳入的配置初始化交易所。
-        :param exchange_config: 包含 id 和 default_type 的字典。
+        :param exchange_config: ExchangeConfig 實例。
         """
-        self.exchange_id = exchange_config.get('id', 'binance')
-        self.default_type = exchange_config.get('default_type', 'spot')
-        self.logger = logging.getLogger(self.__class__.__name__)
-        try:
-            exchange_class = getattr(ccxt, self.exchange_id)
-            self.exchange = exchange_class({
-                'apiKey': os.getenv(f"{self.exchange_id.upper()}_API_KEY"),
-                'secret': os.getenv(f"{self.exchange_id.upper()}_SECRET_KEY"),
-                'options': {
-                    'defaultType': self.default_type,
-                },
-                'enableRateLimit': True,
-            })
-            self.logger.info(f"Successfully connected to {self.exchange_id.upper()} ({self.default_type} market).")
-        except AttributeError:
-            self.logger.critical(f"Exchange with ID '{self.exchange_id}' not found in ccxt.")
-            raise
-        except Exception as e:
-            self.logger.critical(f"Failed to initialize {self.exchange_id.upper()} exchange: {e}", exc_info=True)
-            raise
+        self.tradeConfig = exchange_config
+        self.apiKey = api_key
+        self.apiSecret = api_secret
 
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.exchange = self._init_exchange()
+
+    # -------------------------
+    # Exchange initialization
+    # -------------------------
+    def _init_exchange(self):
+        """
+        - 建立 ccxt exchange instance 並套用常用參數（rate limit/timeout/recvWindow/options/defaultType）。
+        - 若 exchange.sandbox=true，會呼叫 set_sandbox_mode(True)，並允許用 urls_override 覆寫 base api endpoint。
+
+        Returns :
+          - exchange: ccxt exchange instance（例如 ccxt.binance(...)）
+
+        Hint : 
+          - hint 2: defaultType 會根據 market_type = spot/future 設定。
+          - hint 3: Spot testnet 常用 urls_override.api = "https://testnet.binance.vision/api"
+        """
+
+        options = {
+            "defaultType": "spot" if self.tradeConfig.market_type == "spot" else "future",
+            "adjustForTimeDifference": self.tradeConfig.adjust_for_time_difference,
+        }
+
+        exchange_class = getattr(ccxt, self.tradeConfig.id)
+        exchange = exchange_class({
+            "apiKey": self.apiKey,
+            "secret": self.apiSecret,
+            "enableRateLimit": self.tradeConfig.enable_rate_limit,
+            "timeout": self.tradeConfig.timeout_ms,
+            "recvWindow": self.tradeConfig.recv_window,
+            "options": options,
+        })
+
+        if self.tradeConfig.sandbox:
+            exchange.set_sandbox_mode(True)
+
+            urls_override = self.tradeConfig.urls_override or {}
+            if "api" in urls_override:
+                exchange.urls = exchange.urls or {}
+                exchange.urls["api"] = urls_override["api"]
+                self.logger.info(f"Override exchange.urls['api'] => {urls_override['api']}")
+
+        self.logger.info(
+            f"Exchange initialized: id={self.tradeConfig.id}, market_type={self.tradeConfig.market_type}, sandbox={self.tradeConfig.sandbox}"
+        )
+        return exchange
+    # -------------------------
+    # Data Fetching API
+    # -------------------------
+    def fetch_ohlcv_fng(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
+        """
+        同時獲取指定交易對和時間週期的 OHLCV 數據與 Fear & Greed Index 數據，並合併成一個 DataFrame。
+        Args:
+            - symbol (str): 交易對符號，例如 "BTCUSDT"
+            - timeframe (str): K 線時間週期，例如 "15m"
+            - limit (int): 要獲取的 K 線數量
+        Returns:
+            - pd.DataFrame | None: 合併後的 DataFrame，若失敗則回傳 None
+        """
+        ohlcv_df = self.fetch_ohlcv(symbol, timeframe, limit)
+        if ohlcv_df is None:
+            self.logger.error(f"Failed to fetch OHLCV data for {symbol} on {timeframe}.")
+            return None
+        range_days = (ohlcv_df.index[-1] - ohlcv_df.index[0]).days + 1
+        fng_limit = max(10, range_days)  # 至少抓 10 筆 FNG，以涵蓋整個 OHLCV 範圍
+        fng_df = self.fetch_FNG(limit=fng_limit)  # FNG 指數通常每日更新，這裡取最近 fng_limit 筆
+        if fng_df is None:
+            self.logger.error("Failed to fetch FNG data.")
+            return None
+
+        merged_df = self._merge_ohlcv_fng(ohlcv_df, fng_df, fill_method="ffill")
+        return merged_df
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
         """獲取指定交易對和時間週期的 OHLCV 數據"""
         try:
@@ -62,6 +134,12 @@ class ExchangeDataCollector:
         獲取 Fear & Greed Index 數據
         Args:
             - limit (int): 要獲取的數據點數量(FNG 指數通常每日更新)
+        Returns:
+            - pd.DataFrame: 包含 FNG 數據的 DataFrame
+                - cols: ['fng','timestamp']
+                - timestamp: Asia/Taipei datetime
+                - fng: numeric
+
         """
         url = f"https://api.alternative.me/fng/?limit={limit}&format=json"
         j = requests.get(url, timeout=30).json()
@@ -76,38 +154,24 @@ class ExchangeDataCollector:
         unit_for_to_datetime = "ms" if max_val > 1e11 else "s"
 
         df = df.assign(timestamp_num=ts_num).dropna(subset=["timestamp_num"]).copy()
-        df["timestamp"] = pd.to_datetime(df["timestamp_num"].astype("int64"), unit=unit_for_to_datetime, utc=True)
+        df["timestamp"] = pd.to_datetime(df["timestamp_num"].astype("int64"), unit=unit_for_to_datetime, utc=True).dt.tz_convert('Asia/Taipei')
 
         df = df.sort_values("timestamp")
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        # rename "value" column to "fng"
+        df = df.rename(columns={"value": "fng"})
         if limit > 0 and "time_until_update" in df.columns and "value_classification" in df.columns:
             df = df.drop(columns=["time_until_update", "value_classification"]).reset_index(drop=True)
 
-        df = df.set_index("timestamp").sort_index()
-
-        # 重採樣 15min
-        fng_15m = df[["value"]].resample("15min").ffill().rename(columns={"value": "sent_fng"})
-        fng_15m["sent_fng_diff1"] = fng_15m["sent_fng"].diff()
-
-        roll = 96 * 7  # 15min bars per day = 96 -> 96*7 = 672
-        mean = fng_15m["sent_fng"].rolling(roll, min_periods=24).mean()
-        std = fng_15m["sent_fng"].rolling(roll, min_periods=24).std()
-        fng_15m["sent_fng_z7d"] = (fng_15m["sent_fng"] - mean) / (std + 1e-6)
-
-        out = fng_15m.copy()
-
-        # --- 這裡是關鍵：把 index 轉成跟 OHLCV 相同的時區（Asia/Taipei） ---
-        out.index = out.index.tz_convert("Asia/Taipei")
-
-        # 建立 datetime 欄位（直接用 index，且為 tz-aware）
-        out["datetime"] = out.index  # 已經是 timezone-aware datetimes
-
-        # 建立 unix timestamp（秒為單位）
-        out["timestamp"] = (out.index.astype("int64") // 10**9).astype("int64")
-
-        out = out[["datetime", "timestamp", "sent_fng", "sent_fng_diff1", "sent_fng_z7d"]]
-        return out
-    def merge_ohlcv_fng(self, ohlcv_df: pd.DataFrame, fng_df: pd.DataFrame, fill_method: str = "ffill") -> pd.DataFrame:
+        df = df.set_index("timestamp",drop=False)
+        df = df.dropna(subset=["timestamp_num"],inplace=False)
+        return df
+    def _merge_ohlcv_fng(
+        self,
+        ohlcv_df: pd.DataFrame,
+        fng_df: pd.DataFrame,
+        fill_method: str = "ffill",
+    ) -> pd.DataFrame:
         """
         將 OHLCV DataFrame 與 FNG DataFrame 合併，並處理同名欄位衝突與時區對齊。
 
@@ -124,53 +188,47 @@ class ExchangeDataCollector:
         fng = fng_df.copy()
 
         # 2) 確保兩邊 index 為 tz-aware 且同一時區 (Asia/Taipei)
-        def _ensure_tz(df):
+        def _ensure_tz(df: pd.DataFrame) -> pd.DataFrame:
             if df.index.tz is None:
                 return df.tz_localize("Asia/Taipei")
-            else:
-                return df.tz_convert("Asia/Taipei")
+            return df.tz_convert("Asia/Taipei")
 
         ohlcv = _ensure_tz(ohlcv)
         fng = _ensure_tz(fng)
 
         # 3) 移除 fng 中會與 ohlcv 衝突的欄位（通常不需要 'timestamp' / 'datetime'）
-        #    我們保留 fng 的指標欄位 (fng, fng_diff1, fng_z7d)
         conflict_cols = [c for c in fng.columns if c in ohlcv.columns]
         if conflict_cols:
-            # 只要把衝突欄位從 fng 移除（因為它們跟 index 重複或是語意相同）
             fng = fng.drop(columns=conflict_cols, errors="ignore")
         for col in ["datetime", "timestamp"]:
             if col in fng.columns:
                 fng = fng.drop(columns=[col])
 
-        # 4) 以 ohlcv 的 index 為基準 join（left join），把 fng 貼上
-        merged = ohlcv.join(fng, how="left")
+        # 4) 僅保留你需要的 FNG 欄位（可自行擴充）
+        keep_cols = [c for c in ["fng"] if c in fng.columns]
+        fng = fng[keep_cols]
 
-        # 5) 若需要，對 fng 欄位做 forward-fill
+        # 5) 關鍵：把 fng 的 index 併入時間軸，再 ffill，最後切回 ohlcv index
+        #    這樣 ohlcv 即使沒有對應到 fng 的 timestamp，也能吃到「上一筆已知值」
+        fng = fng.sort_index()
+        fng = fng[~fng.index.duplicated(keep="last")]  # 避免同一 timestamp 重複造成不確定性
+
+        union_idx = ohlcv.index.union(fng.index).sort_values()
+        fng_aligned = fng.reindex(union_idx)
+
         if fill_method == "ffill":
-            for col in ["fng", "fng_diff1", "fng_z7d"]:
-                if col in merged.columns:
-                    merged[col] = merged[col].fillna(method="ffill")
+            fng_aligned = fng_aligned.ffill()
 
+        # 切回 ohlcv 時間點：每根 K 線都會拿到當下(或最近過去)的 fng 值
+        fng_aligned = fng_aligned.reindex(ohlcv.index)
+
+        # 6) join 回去
+        merged = ohlcv.join(fng_aligned, how="left")
         return merged
 
-
-def main():
-    exchange_config = {
-        'id': 'binance',
-        'default_type': 'swap'
-    }
-    collector = ExchangeDataCollector(exchange_config)
-    ohlcv_df = collector.fetch_ohlcv("BTCUSDT", "15m", 100)
-    ohlcv_df.to_csv("btc_usdt_15m.csv")
-
-    fng = collector.fetch_FNG(10)
-   
-    fng.to_csv("fng_sample.csv", index=False)
-
-    merged_df = collector.merge_ohlcv_fng(ohlcv_df, fng)
-    print(merged_df.head(5))
+def load_config(config_path: str) -> dict:
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+    return config
     
-    merged_df.to_csv("merged_ohlcv_fng.csv",index=False)
-if __name__ == "__main__":
-    main()
+

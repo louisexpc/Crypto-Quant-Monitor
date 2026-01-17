@@ -9,10 +9,11 @@ import pandas as pd
 import torch
 from torch import amp, nn
 
-from trader.predictor.model import build_model
+from predictor.model import build_model
 import re
 
-
+from typing import Literal
+import logging
 # ------------------------------------------------------------
 # Predictor (inference-only)
 # ------------------------------------------------------------
@@ -28,7 +29,7 @@ class Predictor:
         - Predictor instance
     """
 
-    def __init__(self, cfg: Dict[str, Any], side: str):
+    def __init__(self, cfg: Dict[str, Any], side: Literal["long", "short"]):
         if side == "long":
             model_path_list = cfg["model_path_list"]["long"]
         elif side == "short":
@@ -49,7 +50,7 @@ class Predictor:
         self.models: List[nn.Module] = []
         self.model_meta: List[Dict[str, Any]] = []
         self.feature_columns: List[str] = []
-
+        self.logger = logging.getLogger(self.__class__.__name__)
         for i, mp in enumerate(model_path_list):
             ckpt_path = Path(mp)
             if not ckpt_path.is_file():
@@ -86,7 +87,7 @@ class Predictor:
                     raise ValueError(f"[ckpt {ckpt_path}] feature_columns mismatch across checkpoints.")
                 # 若 amp 設定不同，沿用第一個 ckpt 的設定並提醒
                 if bool(amp_cfg) != self.amp_enabled or str(amp_dtype_cfg) != str(self.amp_dtype).lower():
-                    print(f"[Predictor][WARN] amp config mismatch in {ckpt_path}; using first ckpt's amp settings.")
+                    self.logger.warning(f"amp config mismatch in {ckpt_path}; using first ckpt's amp settings.")
 
             state_dict = ckpt.get("state_dict", ckpt)
             model_cfg = ckpt.get("model_cfg", ckpt.get("model", {})) or {}

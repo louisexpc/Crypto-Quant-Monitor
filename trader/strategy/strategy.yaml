@@ -1,0 +1,17 @@
+# snr_strategy.yaml
+SNRStrategy:
+  symbol: "BTC/USDT"
+  timeframe: "1h"
+  # 你的原始 denoise 參數：volume 必須 >= volume_ema 才允許產生 level / signal
+  volume_ema_window: 10
+
+  # production 必備：避免 levels 無限成長
+  max_levels: 5000
+
+  # production 必備：重連 replay / 重啟補資料時避免重複處理 & 重複 emit
+  dedup:
+    enabled: true
+
+  # 可選：下單冷卻（bar 數）
+  execution:
+    cooldown_bars: 0

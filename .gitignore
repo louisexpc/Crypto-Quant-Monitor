@@ -25,3 +25,6 @@ train/results/*
 *.csv
 *.pth
 train/research_problem.MD
+.python-version
+
+trader/trader/
