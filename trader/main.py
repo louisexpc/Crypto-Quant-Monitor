@@ -375,15 +375,7 @@ class TradingBot:
         self._stop_event.set()
 
     async def run_forever(self):
-        """Start daemon: listen to WS close events and run pipeline once per trigger.
-
-        Responsibilities handled here:
-        - WS reconnection (handled inside listener)
-        - single-flight execution guard (async lock)
-        - idempotency (last_processed, persisted)
-        - backfill on missed triggers (based on trigger interval)
-        - REST finalize retry (wait for REST data to catch up)
-        """
+        self.logger.info("Starting TradingBot daemon...")
         listener = BinanceFuturesKlineListener(
             symbol=self.symbol,
             interval=self.trigger_interval,
@@ -395,13 +387,61 @@ class TradingBot:
         loop = asyncio.get_running_loop()
         self._install_signal_handlers(loop)
 
+        agen = listener.closed_kline_events()
+
+        # NOTE: 不要用 wait_for 包 __anext__；timeout 會 cancel __anext__，可能導致 async generator 終止
+        next_evt_task = asyncio.create_task(agen.__anext__())
+        stop_task = asyncio.create_task(self._stop_event.wait())
+
         try:
-            async for evt in listener.closed_kline_events():
-                if self._stop_event.is_set():
+            while True:
+                done, pending = await asyncio.wait(
+                    {next_evt_task, stop_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if stop_task in done:
+                    self.logger.info("Stop event set; shutting down daemon loop...")
+                    # best-effort cancel pending next event
+                    if not next_evt_task.done():
+                        next_evt_task.cancel()
                     break
-                await self._on_kline_closed(evt)
+
+                if next_evt_task in done:
+                    try:
+                        evt = next_evt_task.result()
+                    except StopAsyncIteration:
+                        self.logger.warning("Listener event stream ended (StopAsyncIteration).")
+                        break
+                    except Exception:
+                        self.logger.exception("Listener event stream crashed.")
+                        break
+
+                    # prepare next event task BEFORE handling current (avoid gaps)
+                    next_evt_task = asyncio.create_task(agen.__anext__())
+
+                    if self._stop_event.is_set():
+                        self.logger.info("Stop requested; skip handling new event.")
+                        break
+
+                    await self._on_kline_closed(evt)
+
         finally:
+            # cleanup tasks
+            try:
+                if not stop_task.done():
+                    stop_task.cancel()
+            except Exception:
+                pass
+            try:
+                if next_evt_task and not next_evt_task.done():
+                    next_evt_task.cancel()
+            except Exception:
+                pass
+
             await listener.stop()
+            self.logger.info("TradingBot daemon stopped.")
+
 
     def _install_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
         """
@@ -573,6 +613,10 @@ def setup_logging(log_dir: Path):
     console.setLevel(logging.INFO)
     console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logging.getLogger("").addHandler(console)
+    # NOTE: silence noisy websockets DEBUG logs; keep our bot logs at DEBUG.
+    logging.getLogger("websockets").setLevel(logging.INFO)
+    logging.getLogger("websockets.client").setLevel(logging.INFO)
+
 
 
 def main():

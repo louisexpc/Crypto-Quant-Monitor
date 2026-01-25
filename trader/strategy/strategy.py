@@ -46,12 +46,12 @@ class Candle:
       - close_time: K 線收盤時間（本次改動後的唯一識別與比較基準）
     """
     close_time: pd.Timestamp 
-    open_time: Optional[pd.Timestamp] = None
     open: float
     high: float
     low: float
     close: float
     volume: float
+    open_time: Optional[pd.Timestamp] = None
     
 
 
