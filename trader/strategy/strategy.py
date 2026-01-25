@@ -40,16 +40,19 @@ def parse_timeframe_to_timedelta(timeframe: Literal["15m", "30m", "1h", "4h", "1
 class Candle:
     """
     Production feed candle（已收線事件才會送入策略）
+
     注意：
-      - open_time: 你已明確規定 production 一律提供「開盤時間」
-      - 本 module 全程用 open_time 作為 candle 唯一識別與比較基準
+      - open_time: K 線開盤時間（保留欄位，用於 debug / 回測對齊）
+      - close_time: K 線收盤時間（本次改動後的唯一識別與比較基準）
     """
-    open_time: pd.Timestamp
+    close_time: pd.Timestamp 
+    open_time: Optional[pd.Timestamp] = None
     open: float
     high: float
     low: float
     close: float
     volume: float
+    
 
 
 @dataclass(frozen=True)
@@ -74,7 +77,8 @@ class Level:
 
         # 狀態追蹤
         self.is_valid = True
-        # created_at 明確定義為：產生該 SNR 水平的「後一根 K 線」的時間（= current candle open_time）
+        # created_at 明確定義為：產生該 SNR 水平的「後一根 K 線」的時間（= current candle close_time）
+        # NOTE: 2026-01 - 對齊 data engine：以 close_time 作為唯一識別
         self.created_at: pd.Timestamp = created_at
         self.flipped_at: Optional[pd.Timestamp] = None
         self.last_tested_at: Optional[pd.Timestamp] = None
@@ -126,6 +130,7 @@ class EMAState:
 class SNRCfg:
     symbol: str = "BTC/USDT"
     timeframe: str = "1h"
+    lookback_bars: int = 100
     volume_ema_window: int = 10
     max_levels: int = 5000
     dedup: Dict[str, Any] = None
@@ -185,8 +190,9 @@ class SNRLiveStrategy:
         # 用 CandleState 保留「該根 close 當下的 vol_ema」，以做到零偏差 gating
         self.prev_state: Optional[CandleState] = None
 
-        # 去重：以 candle 開盤時間作為唯一識別（你已規定 production 提供 open_time）
-        self._last_processed_open_time: Optional[pd.Timestamp] = None
+        # 去重：本次改用 candle 收盤時間（close_time）作為唯一識別（對齊 data engine / WS trigger）
+        # NOTE: 變數名稱維持不改（最小修改），但其語意已改為「last processed close_time」。
+        self._last_processed_close_time: Optional[pd.Timestamp] = None
 
         # dedup emit：避免 replay 同一根 candle 的重複 emit
         self._last_emitted_key: Optional[Tuple] = None
@@ -205,8 +211,9 @@ class SNRLiveStrategy:
 
         Args:
           - history_df: OHLCV DataFrame
-            - index: candle 開盤時間（pd.Timestamp）
-            - columns: open/high/low/close/volume（大小寫需自行對齊）
+            - index: candle closed datetime (Asia/Taipei)
+            - columns: timestamp/open/high/low/close/volume（大小寫需自行對齊）
+                - timestamp (ms): close 時間戳記
 
         Return:
           - return : None
@@ -216,9 +223,9 @@ class SNRLiveStrategy:
 
         df = history_df.sort_index()
 
-        for open_time, row in df.iterrows():
+        for close_datetime, row in df.iterrows():
             candle = Candle(
-                open_time=pd.Timestamp(open_time),
+                close_time=pd.Timestamp(row['timestamp'], unit='ms', tz='Asia/Taipei'),
                 open=float(row["open"]),
                 high=float(row["high"]),
                 low=float(row["low"]),
@@ -236,7 +243,7 @@ class SNRLiveStrategy:
         production 主入口：只在 candle closed 時呼叫（你已保證事件特性）
 
         Args:
-          - candle: 已收線 Candle（open_time 為該 candle 開盤時間）
+          - candle: 已收線 Candle（策略判斷/去重以 close_time 為準）
 
         Return:
           - return : List[Dict[str, Any]]
@@ -261,9 +268,11 @@ class SNRLiveStrategy:
         """
         # -------- (0) idempotency / dedup processing --------
         if self.dedup_enabled:
-            if self._last_processed_open_time is not None and candle.open_time <= self._last_processed_open_time:
+            # NOTE: 2026-01 - 對齊 data engine：以 close_time 作為去重與順序比較基準
+            candle_close_time = candle.close_time
+            if self._last_processed_close_time is not None and candle_close_time <= self._last_processed_close_time:
                 return []
-            self._last_processed_open_time = candle.open_time
+            self._last_processed_close_time = candle_close_time
 
         self._bar_counter += 1
 
@@ -301,7 +310,8 @@ class SNRLiveStrategy:
         # dedup emit：避免同一根 candle 被重放造成重複 signal
         if self.dedup_enabled and signals:
             sig0 = signals[0]
-            key = (candle.open_time, sig0.get("level_price"), sig0.get("signal_type"))
+            # NOTE: 2026-01 - key 改用 close_time，避免 open_time 與 WS trigger key 不一致
+            key = (candle.close_time, sig0.get("level_price"), sig0.get("signal_type"))
             if self._last_emitted_key == key:
                 return []
             self._last_emitted_key = key
@@ -346,13 +356,13 @@ class SNRLiveStrategy:
         if prev_dir == -curr_dir and abs(prev_body - curr_body) <= max(prev_body, curr_body) * 0.25:
             price = (prev.close + curr.open) / 2
             level_type = "resistance" if prev_dir == 1 else "support"
-            self.levels.append(Level(price, level_type, "SNR1", curr.open_time))
+            self.levels.append(Level(price, level_type, "SNR1", curr.close_time))  # NOTE: 2026-01 - created_at 改用 close_time
 
         # SNR2: 同方向（且非 0）
         if prev_dir == curr_dir and curr_dir != 0:
             price = (prev.close + curr.open) / 2
             level_type = "support" if curr_dir == 1 else "resistance"
-            self.levels.append(Level(price, level_type, "SNR2", curr.open_time))
+            self.levels.append(Level(price, level_type, "SNR2", curr.close_time))  # NOTE: 2026-01 - created_at 改用 close_time
 
     def _update_existing_levels(self, candle: Candle) -> None:
         """
@@ -389,7 +399,7 @@ class SNRLiveStrategy:
 
             if is_broken_up or is_broken_down:
                 level.type = "support" if is_broken_up else "resistance"
-                level.flipped_at = candle.open_time
+                level.flipped_at = candle.close_time  # NOTE: 2026-01 - flipped_at 改用 close_time
                 level.is_valid = True
                 continue
 
@@ -399,7 +409,7 @@ class SNRLiveStrategy:
             is_tested_by_wick = (low <= level.price <= high) and same_side_body
 
             if is_tested_by_wick:
-                level.last_tested_at = candle.open_time
+                level.last_tested_at = candle.close_time  # NOTE: 2026-01 - last_tested_at 改用 close_time
                 level.is_valid = False
 
     def _check_signal_on_candle(self, curr_state: CandleState) -> List[Dict[str, Any]]:
@@ -424,7 +434,7 @@ class SNRLiveStrategy:
 
             # 0910 Update: 最後一根 K 線交易量必須高於其 EMA
             was_tested_by_this_candle = (
-                level.last_tested_at == candle.open_time and
+                level.last_tested_at == candle.close_time and  # NOTE: 2026-01 - 以 close_time 判斷是否為本根測試
                 candle.volume >= curr_vol_ema
             )
             if not was_tested_by_this_candle:
@@ -446,7 +456,7 @@ class SNRLiveStrategy:
                 # Signal Candle：產生該 SNR 水平的「後一根 K 線」的時間
                 "signal_candle_time": level.created_at,
                 # Test Trigger Candle：完成最後「測試」動作的 K 線（即當前 K 線）
-                "test_trigger_time": candle.open_time,
+                "test_trigger_time": candle.close_time,  # NOTE: 2026-01 - 改用 close_time
                 "level_price": level.price,
                 "level_current_type": level.type,
                 "level_snr_type": level.snr_type,

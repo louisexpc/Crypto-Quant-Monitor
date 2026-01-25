@@ -89,6 +89,10 @@ class ExchangeDataCollector:
             - limit (int): 要獲取的 K 線數量
         Returns:
             - pd.DataFrame | None: 合併後的 DataFrame，若失敗則回傳 None
+                - timestamp (ms): close 時間戳記
+                - datetime (Asia/Taipei): close 時間, index 
+                - open, high, low, close, volume: OHLCV 資料
+                - fng: Fear & Greed Index 數值
         """
         ohlcv_df = self.fetch_ohlcv(symbol, timeframe, limit)
         if ohlcv_df is None:
@@ -230,5 +234,18 @@ def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as file:
         config = yaml.safe_load(file)
     return config
-    
+
+def test():
+    # 測試用例
+    config = ExchangeConfig()
+    collector = ExchangeDataCollector(
+        api_key=os.getenv("API_KEY", ""),
+        api_secret=os.getenv("API_SECRET", ""),
+        exchange_config=config
+    )
+    ohlcv_fng_df = collector.fetch_ohlcv_fng(symbol='BTC/USDT', timeframe='15m', limit=100)
+    print(ohlcv_fng_df.head())
+    ohlcv_fng_df.to_csv("ohlcv_fng_output.csv", index=False)
+if __name__ == "__main__":
+    test()
 

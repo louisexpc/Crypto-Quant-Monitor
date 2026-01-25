@@ -82,3 +82,12 @@ trade:
   network:
     max_retry: 3
     base_sleep_sec: 0.5
+# -----------------------------
+# daemon configuration
+# -----------------------------
+daemon:
+  pidfile: "./runtime/trader.pid"             # PID 檔案路徑
+  state_path: "./runtime/trader_state.json"   # Trader 狀態: 持久化檔案路徑
+  trigger_interval: "1h"                      # WS Listen Kbar
+  finalize_max_retry: 5                    # finalize 時最大重試次數
+  finalize_retry_sleep_sec: 2                  # finalize 時重試間隔秒數

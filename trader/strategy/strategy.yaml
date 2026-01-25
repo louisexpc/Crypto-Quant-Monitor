@@ -2,6 +2,8 @@
 SNRStrategy:
   symbol: "BTC/USDT"
   timeframe: "1h"
+  lookback_bars: 100
+  # NOTE: 2026-01 - 策略內部已改以 candle close time 作為去重/信號時間基準（與 data engine 對齊）
   # 你的原始 denoise 參數：volume 必須 >= volume_ema 才允許產生 level / signal
   volume_ema_window: 10
 
