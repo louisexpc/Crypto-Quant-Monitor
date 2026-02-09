@@ -1,5 +1,6 @@
 # ./app/data_collector.py
 from dataclasses import dataclass
+import re
 import ccxt
 import pandas as pd
 import os
@@ -8,7 +9,6 @@ import logging
 from typing import Literal
 
 import yaml
-
 @dataclass(frozen=True)
 class ExchangeConfig:
     id: str = 'binance'
@@ -19,6 +19,7 @@ class ExchangeConfig:
     recv_window: int = 10000
     adjust_for_time_difference: bool = True
     urls_override: dict | None = None     # e.g., {'api': 'https://testnet.binance.vision/api'}
+
 
 class ExchangeDataCollector:
     def __init__(self,api_key, api_secret, exchange_config: ExchangeConfig):
@@ -78,6 +79,33 @@ class ExchangeDataCollector:
         )
         return exchange
     # -------------------------
+    # Time helpers (DTO normalization)
+    # -------------------------
+    _TZ = "Asia/Taipei"
+
+    @staticmethod
+    def _timeframe_to_ms(timeframe: Literal['1m', '5m', '15m', '30m', '1h', '4h', '12h', '1d', '1w']) -> int:
+        """Convert ccxt timeframe string (e.g. '15m', '1h') into milliseconds."""
+        tf = str(timeframe).strip()
+        m = re.fullmatch(r"(\d+)([smhdw])", tf)
+        if not m:
+            raise ValueError(f"Unsupported timeframe format: {timeframe!r} (expected like '15m', '1h', '1d')")
+        n = int(m.group(1))
+        unit = m.group(2)
+        mult = {
+            "s": 1000,
+            "m": 60 * 1000,
+            "h": 60 * 60 * 1000,
+            "d": 24 * 60 * 60 * 1000,
+            "w": 7 * 24 * 60 * 60 * 1000,
+        }[unit]
+        return n * mult
+
+    @classmethod
+    def _to_taipei_dt(cls, ts_ms: pd.Series) -> pd.Series:
+        """UTC ms -> tz-aware datetime (Asia/Taipei)."""
+        return pd.to_datetime(ts_ms.astype("int64"), unit="ms", utc=True).dt.tz_convert(cls._TZ)
+    # -------------------------
     # Data Fetching API
     # -------------------------
     def fetch_ohlcv_fng(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
@@ -89,8 +117,8 @@ class ExchangeDataCollector:
             - limit (int): 要獲取的 K 線數量
         Returns:
             - pd.DataFrame | None: 合併後的 DataFrame，若失敗則回傳 None
-                - timestamp (ms): close 時間戳記
-                - datetime (Asia/Taipei): close 時間, index 
+                - timestamp (ms): open 時間戳記
+                - datetime (Asia/Taipei): open 時間, index
                 - open, high, low, close, volume: OHLCV 資料
                 - fng: Fear & Greed Index 數值
         """
@@ -108,67 +136,119 @@ class ExchangeDataCollector:
         merged_df = self._merge_ohlcv_fng(ohlcv_df, fng_df, fill_method="ffill")
         return merged_df
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame | None:
-        """獲取指定交易對和時間週期的 OHLCV 數據"""
+        """獲取指定交易對和時間週期的 OHLCV 數據（DTO schema normalized）
+
+        回傳 DataFrame（index 改為 **Kline open datetime (Asia/Taipei)**）：
+
+        - index: datetime (Asia/Taipei) = kline_open_datetime
+        - timestamp (ms): kline_open_timestamp_ms（作為 open ts）
+        - kline_open_timestamp_ms: Kline 開盤 timestamp (ms)
+        - kline_open_datetime: Kline 開盤 datetime (Asia/Taipei)
+        - kline_close_timestamp_ms: Kline 收盤 timestamp (ms)
+        - kline_close_datetime: Kline 收盤 datetime (Asia/Taipei)
+        - open, high, low, close, volume: OHLCV
+
+        Note:
+        - ccxt.fetch_ohlcv 回傳的第一欄 timestamp 為「Kline open time」(ms)；此處會另外計算 close time。
+        """
         try:
             self.logger.info(f"Fetching {limit} klines for {symbol} on {timeframe} timeframe.")
             ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            
+
             if not ohlcv:
                 self.logger.warning(f"No data returned for {symbol} on {timeframe}.")
                 return None
 
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert('Asia/Taipei')
-            df.set_index('datetime', inplace=True)
-            
+            # ccxt: [open_time_ms, open, high, low, close, volume]
+            df = pd.DataFrame(ohlcv, columns=["open_time_ms", "open", "high", "low", "close", "volume"])
+
+            # --- DTO fields ---
+            df["kline_open_timestamp_ms"] = pd.to_numeric(df["open_time_ms"], errors="coerce").astype("Int64")
+            if df["kline_open_timestamp_ms"].isna().any():
+                raise ValueError("OHLCV contains invalid open_time_ms")
+
+            tf_ms = self._timeframe_to_ms(timeframe)
+            df["kline_close_timestamp_ms"] = (df["kline_open_timestamp_ms"].astype("int64") + tf_ms).astype("int64")
+
+            df["kline_open_datetime"] = self._to_taipei_dt(df["kline_open_timestamp_ms"].astype("int64"))
+            df["kline_close_datetime"] = self._to_taipei_dt(df["kline_close_timestamp_ms"])
+
+            # timestamp: use kline open time (ms)
+            df["timestamp"] = df["kline_open_timestamp_ms"]
+
+            # index = open datetime (Asia/Taipei)
+            df = df.set_index("kline_open_datetime", drop=False)
+            df.index = df.index.rename("datetime")
+
+            # cleanup / stable column order (optional)
+            df = df.drop(columns=["open_time_ms"])
+            ordered = [
+                "timestamp",
+                "kline_open_timestamp_ms",
+                "kline_open_datetime",
+                "kline_close_timestamp_ms",
+                "kline_close_datetime",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+            ]
+            df = df[[c for c in ordered if c in df.columns]]
+
             self.logger.info(f"Successfully fetched {len(df)} records for {symbol} on {timeframe} in UTC+8.")
             return df
+
         except ccxt.NetworkError as e:
             self.logger.error(f"Network error while fetching {symbol}: {e}")
         except ccxt.ExchangeError as e:
             self.logger.error(f"Exchange error while fetching {symbol}: {e}")
         except Exception as e:
             self.logger.error(f"An unexpected error occurred while fetching {symbol}: {e}", exc_info=True)
-        
+
         return None
-    def fetch_FNG(self, limit: int = 10)->pd.DataFrame:
+    def fetch_FNG(self, limit: int = 10) -> pd.DataFrame:
         """
         API Docs: https://alternative.me/crypto/fear-and-greed-index/
-        獲取 Fear & Greed Index 數據
-        Args:
-            - limit (int): 要獲取的數據點數量(FNG 指數通常每日更新)
-        Returns:
-            - pd.DataFrame: 包含 FNG 數據的 DataFrame
-                - cols: ['fng','timestamp']
-                - timestamp: Asia/Taipei datetime
-                - fng: numeric
+        獲取 Fear & Greed Index（FNG）數據（DTO schema normalized）
 
+        回傳 DataFrame（index 與 timestamp 欄位皆為 **FNG datetime (Asia/Taipei)**）：
+
+        - index: timestamp (Asia/Taipei)
+        - timestamp: 同 index（Asia/Taipei datetime）
+        - fng: numeric
+        - fng_timestamp_ms: 將 API 的 timestamp 統一正規化為 ms（int64）
+        - fng_value_classification: (optional) API 回傳的分類字串（若存在）
+        - fng_time_until_update: (optional) API 回傳的下次更新倒數（若存在）
         """
         url = f"https://api.alternative.me/fng/?limit={limit}&format=json"
         j = requests.get(url, timeout=30).json()
         df = pd.DataFrame(j["data"])
 
-        # 轉 numeric + 判斷秒/毫秒（簡化）
-        ts_num = pd.to_numeric(df["timestamp"], errors="coerce")
+        # timestamp: API 可能回傳秒或毫秒（此處統一轉成 ms）
+        ts_num = pd.to_numeric(df.get("timestamp"), errors="coerce")
         if ts_num.isna().all():
             raise ValueError("No valid numeric timestamps returned from FNG API")
 
         max_val = ts_num.max()
-        unit_for_to_datetime = "ms" if max_val > 1e11 else "s"
+        is_ms = bool(max_val > 1e11)
+        ts_ms = ts_num.astype("int64") if is_ms else (ts_num.astype("int64") * 1000)
 
-        df = df.assign(timestamp_num=ts_num).dropna(subset=["timestamp_num"]).copy()
-        df["timestamp"] = pd.to_datetime(df["timestamp_num"].astype("int64"), unit=unit_for_to_datetime, utc=True).dt.tz_convert('Asia/Taipei')
+        df["fng_timestamp_ms"] = ts_ms
+        df["timestamp"] = pd.to_datetime(df["fng_timestamp_ms"], unit="ms", utc=True).dt.tz_convert(self._TZ)
+
+        # value -> fng
+        df["fng"] = pd.to_numeric(df.get("value"), errors="coerce")
+
+        # keep optional metadata if present (rename for clarity)
+        if "value_classification" in df.columns:
+            df = df.rename(columns={"value_classification": "fng_value_classification"})
+        if "time_until_update" in df.columns:
+            df = df.rename(columns={"time_until_update": "fng_time_until_update"})
 
         df = df.sort_values("timestamp")
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        # rename "value" column to "fng"
-        df = df.rename(columns={"value": "fng"})
-        if limit > 0 and "time_until_update" in df.columns and "value_classification" in df.columns:
-            df = df.drop(columns=["time_until_update", "value_classification"]).reset_index(drop=True)
+        df = df.set_index("timestamp", drop=False)
 
-        df = df.set_index("timestamp",drop=False)
-        df = df.dropna(subset=["timestamp_num"],inplace=False)
         return df
     def _merge_ohlcv_fng(
         self,

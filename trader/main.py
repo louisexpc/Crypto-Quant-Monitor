@@ -119,15 +119,19 @@ def _extract_latest_ts_ms(df) -> Optional[int]:
     This helper is used ONLY for REST-finalize retry (to wait until REST data
     has caught up after a WS close event). It does not affect idempotency keys.
 
-    Priority:
+        Priority:
 
-      1) df['timestamp'] column (seconds or ms; best-effort)
-      2) df.index (usually datetime in Asia/Taipei tz)
+            1) df['kline_close_timestamp_ms'] column
+            2) df['timestamp'] column (seconds or ms; best-effort)
+            3) df.index (usually datetime in Asia/Taipei tz)
     """
     if df is None or len(df) == 0:
         return None
 
     try:
+        if "kline_close_timestamp_ms" in df.columns:
+            return int(df["kline_close_timestamp_ms"].iloc[-1])
+
         if "timestamp" in df.columns:
             x = int(df["timestamp"].iloc[-1])
             # heuristic: treat 13-digit as ms, 10-digit as seconds
@@ -145,12 +149,12 @@ def _extract_latest_ts_ms(df) -> Optional[int]:
     except Exception:
         return None
 
-def _timestamp_to_datetime(raw_ts : int) -> pd.Timestamp:
+def _timestamp_to_datetime(raw_ts: int) -> pd.Timestamp:
     """Convert milliseconds timestamp to pandas Timestamp in Asia/Taipei timezone."""
-    # NOTE: data_collector 的 timestamp 可能是秒(10位)或毫秒(13位)，這裡做最小推斷以避免型態錯亂
+    # NOTE: 兼容秒(10位)或毫秒(13位)時間戳
     unit = "ms" if int(raw_ts) > 10_000_000_000 else "s"
-    close_time = pd.to_datetime(int(raw_ts), unit=unit, utc=True).tz_convert("Asia/Taipei")
-    return close_time
+    dt = pd.to_datetime(int(raw_ts), unit=unit, utc=True).tz_convert("Asia/Taipei")
+    return dt
 
 class TradingBot:
     """Trading bot entry point (daemon mode).
@@ -317,17 +321,20 @@ class TradingBot:
         
         if self.current_trigger_close_ts_ms is None:
             raise ValueError("current_trigger_close_ts_ms is not set.")
-        elif self.current_trigger_close_ts_ms is not None and self.strategy_history_df['timestamp'].iloc[-1] < self.current_trigger_close_ts_ms:
+        elif (
+            self.current_trigger_close_ts_ms is not None
+            and self.strategy_history_df["kline_close_timestamp_ms"].iloc[-1] < self.current_trigger_close_ts_ms
+        ):
             raise ValueError("strategy_history_df does not contain data up to current_trigger_close_ts_ms.")
 
         
         latest_candle = Candle(
-            close_time=_timestamp_to_datetime(self.strategy_history_df['timestamp'].iloc[-1]),
-            open=self.strategy_history_df['open'].iloc[-1],
-            high=self.strategy_history_df['high'].iloc[-1],
-            low=self.strategy_history_df['low'].iloc[-1],
-            close=self.strategy_history_df['close'].iloc[-1],
-            volume=self.strategy_history_df['volume'].iloc[-1]
+            close_time=_timestamp_to_datetime(self.strategy_history_df["kline_close_timestamp_ms"].iloc[-1]),
+            open=self.strategy_history_df["open"].iloc[-1],
+            high=self.strategy_history_df["high"].iloc[-1],
+            low=self.strategy_history_df["low"].iloc[-1],
+            close=self.strategy_history_df["close"].iloc[-1],
+            volume=self.strategy_history_df["volume"].iloc[-1],
         )
         #回合結束:  Remove strategy_history_df
         self.strategy_history_df = None
@@ -337,7 +344,6 @@ class TradingBot:
             self.logger.info(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
             return
         elif self.run_mode == "LIVE_TRADE":
-            self.strategy_manager.on_candle_close(latest_candle)
             signals = self.strategy_manager.on_candle_close(latest_candle)
             if not signals:
                 self.logger.info(f"[LIVE_TRADE] No trading signals generated for candle close_time={latest_candle.close_time}")
@@ -567,8 +573,15 @@ class TradingBot:
                 # Prepare runtime fields for user-implemented run()
                 # 截斷 DataFrame 至 trigger_close_ts_ms, 保證策略狀態更新一致性
                 self.current_trigger_close_ts_ms = int(trigger_close_ts_ms)
-                self.strategy_history_df = strategy_history_df[strategy_history_df['timestamp'] <= trigger_close_ts_ms].copy()
-                self.logger.debug(f"截斷測試 ({trigger_close_ts_ms == strategy_history_df['timestamp'].iloc[-1]}): current_trigger_close_ts_ms={self.current_trigger_close_ts_ms}, strategy_history_df latest timestamp={_extract_latest_ts_ms(self.strategy_history_df)}")
+                self.strategy_history_df = strategy_history_df[
+                    strategy_history_df["kline_close_timestamp_ms"] <= trigger_close_ts_ms
+                ].copy()
+                self.logger.debug(
+                    "截斷測試 (%s): current_trigger_close_ts_ms=%s, strategy_history_df latest close ts=%s",
+                    trigger_close_ts_ms == strategy_history_df["kline_close_timestamp_ms"].iloc[-1],
+                    self.current_trigger_close_ts_ms,
+                    _extract_latest_ts_ms(self.strategy_history_df),
+                )
 
                 # Execute user logic in a thread to keep event loop responsive.
                 await asyncio.to_thread(self.run)

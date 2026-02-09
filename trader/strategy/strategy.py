@@ -211,9 +211,9 @@ class SNRLiveStrategy:
 
         Args:
           - history_df: OHLCV DataFrame
-            - index: candle closed datetime (Asia/Taipei)
-            - columns: timestamp/open/high/low/close/volume（大小寫需自行對齊）
-                - timestamp (ms): close 時間戳記
+                        - index: candle open datetime (Asia/Taipei)
+                        - columns: kline_open_timestamp_ms/kline_close_timestamp_ms/open/high/low/close/volume
+                                - kline_close_timestamp_ms (ms): close 時間戳記
 
         Return:
           - return : None
@@ -223,14 +223,15 @@ class SNRLiveStrategy:
 
         df = history_df.sort_index()
 
-        for close_datetime, row in df.iterrows():
+        for _open_datetime, row in df.iterrows():
             candle = Candle(
-                close_time=pd.Timestamp(row['timestamp'], unit='ms', tz='Asia/Taipei'),
+                close_time=pd.Timestamp(row["kline_close_timestamp_ms"], unit="ms", tz="Asia/Taipei"),
                 open=float(row["open"]),
                 high=float(row["high"]),
                 low=float(row["low"]),
                 close=float(row["close"]),
                 volume=float(row["volume"]),
+                open_time=pd.Timestamp(row["kline_open_timestamp_ms"], unit="ms", tz="Asia/Taipei"),
             )
             self._process_candle_close(candle, emit_signal=False)
 
