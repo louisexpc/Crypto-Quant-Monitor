@@ -168,7 +168,8 @@ class ExchangeDataCollector:
                 raise ValueError("OHLCV contains invalid open_time_ms")
 
             tf_ms = self._timeframe_to_ms(timeframe)
-            df["kline_close_timestamp_ms"] = (df["kline_open_timestamp_ms"].astype("int64") + tf_ms).astype("int64")
+            # Binance close time is (Open + Interval - 1ms)
+            df["kline_close_timestamp_ms"] = (df["kline_open_timestamp_ms"].astype("int64") + tf_ms - 1).astype("int64")
 
             df["kline_open_datetime"] = self._to_taipei_dt(df["kline_open_timestamp_ms"].astype("int64"))
             df["kline_close_datetime"] = self._to_taipei_dt(df["kline_close_timestamp_ms"])

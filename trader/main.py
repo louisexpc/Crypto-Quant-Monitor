@@ -20,6 +20,8 @@ from predictor.predictor import Predictor
 from strategy.strategy import SNRLiveStrategy, SNRCfg, Candle
 
 dotenv.load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
+
 
 
 class ProcessGuard:
@@ -520,11 +522,11 @@ class TradingBot:
             elif ts == target_close_ts_ms:
                 self.run_mode = "LIVE_TRADE"  # live trade mode
             else:
-                self.logger.error(f"In Backfill, ts and close ts_ms mismatch: ts={ts}, target_close_ts_ms={target_close_ts_ms}")
+                self.logger.error(f"In Backfill, ts and close ts_ms mismatch: ts={ts}, target_close_ts_ms={target_close_ts_ms}; datetime={_timestamp_to_datetime(ts)} vs {_timestamp_to_datetime(target_close_ts_ms)}; this should not happen.")
                 break
             ok = await self._run_once_with_finalize_retry(ts)
             if not ok:
-                self.logger.warning("Run failed at ts=%d; stop backfill chain", ts)
+                self.logger.warning("Run failed at ts=%d datetime=%s; stop backfill chain", ts, _timestamp_to_datetime(ts))
                 break
 
             # Commit idempotency only after successful run.
@@ -593,9 +595,11 @@ class TradingBot:
                 self.logger.exception("TradingBot.run() is not implemented.")
                 return False
             except Exception:
+                
                 self.logger.exception(
-                    "run_once failed: ts=%d attempt=%d/%d",
+                    "run_once failed: ts=%d datetime=%s attempt=%d/%d",
                     trigger_close_ts_ms,
+                    _timestamp_to_datetime(trigger_close_ts_ms),
                     attempt,
                     max_retry,
                 )

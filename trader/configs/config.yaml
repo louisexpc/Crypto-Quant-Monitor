@@ -11,15 +11,15 @@ redis_url: "redis://localhost:6379"
 # Deep Learning configuration
 # -----------------------------
 feature:
-  config_path : "indicators/feature.yaml" # 指標設定檔路徑，具體設定見 indicators/feature.yaml
+  config_path : "./indicators/feature.yaml" # 指標設定檔路徑，具體設定見 indicators/feature.yaml
 predictor:
-  config_path : "predictor/predictor.yaml" # 預測器設定檔路徑，具體設定見 predictor/predictor.yaml
+  config_path : "./predictor/predictor.yaml" # 預測器設定檔路徑，具體設定見 predictor/predictor.yaml
 
 # -----------------------------
 # SNR Strategy configuration
 # -----------------------------
 strategy:
-  config_path : "strategy/strategy.yaml" # 策略設定檔路徑，具體設定見 strategy/snr_strategy.yaml
+  config_path : "./strategy/strategy.yaml" # 策略設定檔路徑，具體設定見 strategy/snr_strategy.yaml
 # -----------------------------
 # Exchange configuration
 # -----------------------------
