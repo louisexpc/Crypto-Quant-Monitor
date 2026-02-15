@@ -355,7 +355,8 @@ class TradingBot:
 
             # signal deduplication
             before_dedup_count = len(signals)
-            signals = set(signal.get("test_trigger_time") for signal in signals if signal.get("test_trigger_time") in {"Long", "Short"})
+            unique_trigger_times = set()
+            signals = [sig for sig in signals if sig['test_trigger_time'] not in unique_trigger_times and not unique_trigger_times.add(sig['test_trigger_time'])]
             after_dedup_count = len(signals)
             if after_dedup_count < before_dedup_count:
                 self.logger.warning(f"[LIVE_TRADE] Deduplicated signals: before={before_dedup_count}, after={after_dedup_count}")
