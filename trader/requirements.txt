@@ -10,4 +10,5 @@ websockets
 aioredis 
 asyncio 
 python-binance==1.0.30
-pytorch
+torch
+TA-Lib
