@@ -25,3 +25,5 @@ train/results/*
 *.csv
 *.pth
 train/research_problem.MD
+
+trader/trader/*
