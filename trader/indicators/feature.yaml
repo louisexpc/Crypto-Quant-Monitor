@@ -13,7 +13,7 @@ feat_plan:
   long_feat_path: "./indicators/config/long_config.yaml"
   short_feat_path: "./indicators/config/short_config.yaml"
 
-manifest_path: "/indicators/config/manifest.json"   # optional: training manifest for reference
+manifest_path: "./indicators/config/manifest.json"   # optional: training manifest for reference
 
 # 長/短單白名單（若空則計算全部啟用特徵）
 selected_feat_path:

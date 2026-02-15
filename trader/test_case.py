@@ -1,192 +1,87 @@
-from __future__ import annotations
-
-import yaml
-import pandas as pd
-import numpy as np
 import argparse
+import os
 from pathlib import Path
-from typing import Any, Dict, List
 
+import dotenv
+import yaml
+
+# Module imports (do not modify other modules)
+from utils.data_collector import ExchangeDataCollector, ExchangeConfig
 from indicators.feature_computer import FeatureComputer
 from predictor.predictor import Predictor
+from typing import Tuple
+dotenv.load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def _load_yaml(path: Path) -> Dict[str, Any]:
-    """
-    1. 說明:
-        讀取 YAML 檔案並回傳 dict。
-    2. inputs:
-        - path: 檔案路徑
-    3. return:
-        - dict: 解析後內容
-    """
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+def load_config(config_path: str) -> dict:
+    with open(config_path, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file)
 
 
-def _side_is_long(x: Any) -> bool:
-    """
-    1. 說明:
-        將 side 欄位判斷是否為 long。
-    2. inputs:
-        - x: 任意 side 值
-    3. return:
-        - bool: True 表示 long
-    """
-    s = str(x).strip().lower()
-    if s in {"long", "buy", "l", "+1", "1"}:
-        return True
-    try:
-        return float(s) == 1.0
-    except Exception:
-        return False
+def _init_exchange_data_collector(config: dict, api_key: str, api_secret: str) -> ExchangeDataCollector:
+    exchange_cfg = config.get("exchange", None)
+    if not exchange_cfg:
+        raise ValueError("Exchange configuration not found in config file.")
+    return ExchangeDataCollector(api_key, api_secret, ExchangeConfig(**exchange_cfg))
 
 
-def _to_utc_ts(ts_like: Any) -> pd.Timestamp:
-    """
-    1. 說明:
-        將任意時間轉為 UTC tz-aware Timestamp。
-    2. inputs:
-        - ts_like: 可轉為 Timestamp 的物件
-    3. return:
-        - pd.Timestamp (UTC)
-    """
-    ts = pd.Timestamp(ts_like)
-    if ts.tzinfo is None:
-        return ts.tz_localize("UTC")
-    return ts.tz_convert("UTC")
+def _init_feature_computer(config: dict) -> Tuple[FeatureComputer, int]:
+    feature_cfg_path = Path(config["feature"].get("config_path", ""))
+    if not feature_cfg_path.exists():
+        raise FileNotFoundError("Feature configuration path not found in config file.")
+    feature_cfg = load_config(feature_cfg_path)
+    feat_normalization_bars = feature_cfg.get("feat_normalization", {}).get("rolling_window", 144)
+    return FeatureComputer(feature_cfg), feat_normalization_bars
 
 
-def _prepare_feat_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    1. 說明:
-        調整特徵配置中的路徑，確保存在本地。
-    2. inputs:
-        - cfg: 原始 compute_config dict
-    3. return:
-        - dict: 調整後的配置
-    """
-    cfg = dict(cfg)
-    plan = cfg.get("feat_plan", {}) or {}
-    lp_default = Path("trader/indicators/config/long_feat.yaml")
-    sp_default = Path("trader/indicators/config/short_config.yaml")
-
-    lp = Path(plan.get("long_feat_path", lp_default))
-    sp = Path(plan.get("short_feat_path", sp_default))
-
-    if not lp.exists():
-        lp = lp_default
-    if not sp.exists():
-        sp = sp_default
-    plan["long_feat_path"] = str(lp)
-    plan["short_feat_path"] = str(sp)
-    cfg["feat_plan"] = plan
-    return cfg
-
-
-def _parse_args() -> argparse.Namespace:
-    """
-    1. 說明:
-        解析 CLI 參數：start/end 日期可選。
-    2. inputs:
-        - None
-    3. return:
-        - argparse.Namespace
-    """
-    parser = argparse.ArgumentParser(description="Trader indicator + predictor test case")
-    parser.add_argument("--start", type=str, default=None, help="Filter label t0 >= start (inclusive)")
-    parser.add_argument("--end", type=str, default=None, help="Filter label t0 <= end (inclusive)")
-    return parser.parse_args()
+def _init_long_short_predictor(config: dict) -> tuple[Predictor, Predictor, int]:
+    predictor_cfg_path = Path(config["predictor"].get("config_path", ""))
+    if not predictor_cfg_path.exists():
+        raise FileNotFoundError("Predictor configuration path not found in config file.")
+    predictor_cfg = load_config(predictor_cfg_path)
+    predictor_bars = predictor_cfg.get("seq_len", 144)
+    return Predictor(predictor_cfg, "long"), Predictor(predictor_cfg, "short"), predictor_bars
 
 
 def main() -> None:
-    """
-    1. 說明:
-        測試流程：讀取 raw OHLCV+FNG，計算 long 特徵，對 long TBM 事件取 seq_len 視窗並用多模型投票推論。
-    2. inputs:
-        - None
-    3. return:
-        - None
-    """
-    base_dir = Path(__file__).resolve().parent
+    api_key = os.getenv("API_KEY")
+    api_secret = os.getenv("API_SECRET")
+    if not api_key or not api_secret:
+        raise ValueError("API_KEY and API_SECRET must be set in environment variables")
 
-    # 1) 讀取配置
-    compute_cfg = _prepare_feat_cfg(_load_yaml(base_dir / "indicators" / "config" / "compute_config.yaml"))
-    predictor_cfg = _load_yaml(base_dir / "predictor" / "predictor.yaml")
-    side = "long"
-    # 2) 準備原始資料與特徵計算器
-    raw_path = Path("data/derived/ohlcv_fng_15m.csv")
-    raw_df = pd.read_csv(raw_path)
-    fc = FeatureComputer(compute_cfg)
-    time_cols = compute_cfg.get("time", {}).get("columns", ["datetime", "timestamp"])
-    raw_df = fc._normalize_time_index(raw_df, time_cols)  # 轉成 UTC DatetimeIndex 以便切片
+    parser = argparse.ArgumentParser(description="Test data_collector/feature_computer/predictor pipeline")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to the configuration YAML file")
+    parser.add_argument("--symbol", type=str, default="BTCUSDT", help="Trading symbol")
+    parser.add_argument("--timeframe", type=str, default="15m", help="Kline timeframe")
+    parser.add_argument("--lookback", type=int, default=120, help="Number of bars to fetch")
+    args = parser.parse_args()
 
-    # 3) 讀取 label，篩 long 事件
-    label_path = Path("data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv")
-    labels_df = pd.read_csv(label_path, parse_dates=["t0"])
-    labels_df["t0"] = pd.to_datetime(labels_df["t0"], utc=True)
-    labels_df = labels_df[labels_df["side"].apply(_side_is_long)].copy()
-    labels_df = labels_df.sort_values("t0")
-    args = _parse_args()
-    if args.start:
-        start_utc = _to_utc_ts(args.start)
-        labels_df = labels_df[labels_df["t0"] >= start_utc]
-    if args.end:
-        end_utc = _to_utc_ts(args.end)
-        labels_df = labels_df[labels_df["t0"] <= end_utc]
+    config = load_config(args.config)
 
-    # 4) 逐事件切片 (warmup_len + seq_len) 計算特徵，再取末段 seq_len 推論
-    seq_len = int(predictor_cfg["seq_len"])
-    norm_cfg = compute_cfg.get("feat_normalization", {}) or {}
-    warmup_len = int(norm_cfg.get("rolling_window", 0) or 0) if norm_cfg.get("enabled", False) else 0
-    context_len = warmup_len + seq_len
-    freq = pd.Timedelta(compute_cfg.get("time", {}).get("freq", "15min"))
-    predictor = Predictor(predictor_cfg, side)
+    
 
-    pred_rows: List[Dict[str, Any]] = []
-    for _, row in labels_df.iterrows():
-        t0 = row["t0"]
-        end_time = t0 - freq  # 使用 t0 前一根為序列終點
-        start_time = end_time - freq * (context_len - 1)
-        raw_window = raw_df.loc[(raw_df.index >= start_time) & (raw_df.index <= end_time)]
-        if len(raw_window) < context_len:
-            continue
+    data_collector = _init_exchange_data_collector(config, api_key, api_secret)
+    feature_computer, feat_normalization_bars = _init_feature_computer(config)
+    long_predictor, short_predictor, predictor_bars = _init_long_short_predictor(config)
 
-        feat_full = fc.compute(raw_window, side="long")
-        feat_window = feat_full.tail(seq_len)
-        if len(feat_window) != seq_len:
-            continue
-        if not np.isfinite(feat_window.to_numpy()).all():
-            continue
+    total_lookbacks = feat_normalization_bars + predictor_bars
 
-        inf_time, pred_bool = predictor.predict_vote(feat_window)
-        win_start = feat_window.index.min()
-        win_end = feat_window.index.max()
-        pred_rows.append(
-            {
-                "t0": t0,
-                "side": row.get("side"),
-                "label": row.get("label", None),
-                "pred": int(pred_bool),
-                "inference_time": inf_time,
-            }
-        )
-        print(
-            f"[Predict] window={win_start} ~ {win_end}, t0={t0}, side={row.get('side')}, "
-            f"pred={int(pred_bool)}, inference_time={inf_time:.6f}s"
-        )
+    model_df = data_collector.fetch_ohlcv_fng(args.symbol, args.timeframe, total_lookbacks)
+    print(f"[Debug] Fetched {len(model_df)} rows of data with cols: {len(model_df.columns)} for symbol {args.symbol} with timeframe {args.timeframe}")
+    long_feature = feature_computer.compute(model_df, "long")
+    print(f"[Debug] Computed long features with shape: {long_feature.shape},chunk shape: {long_feature.iloc[-predictor_bars:].shape}")
+    long_consume_time, can_long_entry = long_predictor.predict(long_feature.iloc[-predictor_bars:])
+    print(f"long consume time: {long_consume_time:.4f} seconds, can long entry: {can_long_entry}")
+    short_feature = feature_computer.compute(model_df, "short")
+    print(f"[Debug] Computed short features with shape: {short_feature.shape},chunk shape: {short_feature.iloc[-predictor_bars:].shape}")
+    # 從 latest bar 往前數 predictor_bars 
+    short_consume_time, can_short_entry = short_predictor.predict(short_feature.iloc[-predictor_bars:])
 
-    pred_out = pd.DataFrame(pred_rows)
-    out_path = base_dir / "test_case_pred.csv"
-    pred_out.to_csv(out_path, index=False)
-    print(f"[OK] saved predictions -> {out_path}")
+
+
+    print(f"short consume time: {short_consume_time:.4f} seconds, can short entry: {can_short_entry}")
 
 
 if __name__ == "__main__":
     main()
-
-"""
-python trader/test_case.py\
-    --start 2024-01-01\
-    --end 2024-06-30
-"""

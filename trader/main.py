@@ -269,6 +269,7 @@ class TradingBot:
         if not predictor_cfg_path.exists():
             raise FileNotFoundError("Predictor configuration path not found in config file.")
         self.predictor_cfg = load_config(predictor_cfg_path)
+        self.predictor_bars = self.predictor_cfg.get("seq_len", 144)
         return Predictor(self.predictor_cfg, "long"), Predictor(self.predictor_cfg, "short")
 
     def _init_trader(self):
@@ -351,22 +352,55 @@ class TradingBot:
                 self.logger.info(f"[LIVE_TRADE] No trading signals generated for candle close_time={latest_candle.close_time}")
                 return
             model_df = self.data_collector.fetch_ohlcv_fng(self.symbol, self.barTimeframe, self.lookback_bars)
+
+            # signal deduplication
+            before_dedup_count = len(signals)
+            signals = set(signal.get("test_trigger_time") for signal in signals if signal.get("test_trigger_time") in {"Long", "Short"})
+            after_dedup_count = len(signals)
+            if after_dedup_count < before_dedup_count:
+                self.logger.warning(f"[LIVE_TRADE] Deduplicated signals: before={before_dedup_count}, after={after_dedup_count}")
+
             for signal in signals:
                 signal_type = signal.get("signal_type", "UNKNOWN")
+                consume_time = None
+                can_long_entry, can_short_entry = False, False
+                prediction_success = False
                 if signal_type == "Long":
-                    long_feature = self.feature_computer.compute(model_df,"long")
-                    consume_time, can_long_entry  = self.long_predictor.predict(long_feature)
+                    try:
+                        long_feature = self.feature_computer.compute(model_df,"long")
+                        consume_time, can_long_entry  = self.long_predictor.predict(long_feature.iloc[-self.predictor_bars:])
+                        prediction_success = True
+                    except Exception as e:
+                        self.logger.exception(f"[LIVE_TRADE] Long prediction failed for candle close_time={latest_candle.close_time}: {e}")
+                        
                 elif signal_type == "Short":
-                    short_feature = self.feature_computer.compute(model_df,"short")
-                    consume_time , can_short_entry = self.short_predictor.predict(short_feature)
+                    try:
+                        short_feature = self.feature_computer.compute(model_df,"short")
+                        consume_time , can_short_entry = self.short_predictor.predict(short_feature.iloc[-self.predictor_bars:])
+                        prediction_success = True
+                    except Exception as e:
+                        self.logger.exception(f"[LIVE_TRADE] Short prediction failed for candle close_time={latest_candle.close_time}: {e}")
+                        
                 else:
                     self.logger.warning(f"[LIVE_TRADE] Unknown signal type: {signal_type}")
                     continue
-                if (signal_type == "Long" and can_long_entry) or (signal_type == "Short" and can_short_entry):
-                    # 下單邏輯，先以 log 處理
-                    self.logger.info(f"[LIVE_TRADE] Executing {signal_type} trade for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
-                else:
-                    self.logger.info(f"[LIVE_TRADE] Prediction did not allow {signal_type} entry for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
+
+                # 下單邏輯，如果 predict 出錯， fallback 回基礎信號，先以 log 處理
+                if (signal_type == "Long"):
+                    if (can_long_entry):
+                        self.logger.info(f"[LIVE_TRADE] Executing Long trade for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
+                    elif(not can_long_entry and prediction_success):
+                        self.logger.info(f"[LIVE_TRADE] Long prediction did not allow entry for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
+                    else:
+                        self.logger.warning(f"[LIVE_TRADE] Long signal generated but prediction failed for candle close_time={latest_candle.close_time}; no entry executed.")
+                elif (signal_type == "Short"):
+                    if (can_short_entry):
+                        self.logger.info(f"[LIVE_TRADE] Executing Short trade for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
+                    elif(not can_short_entry and prediction_success):
+                        self.logger.info(f"[LIVE_TRADE] Short prediction did not allow entry for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
+                    else:
+                        self.logger.warning(f"[LIVE_TRADE] Short signal generated but prediction failed for candle close_time={latest_candle.close_time}; no entry executed.")
+
         return
 
 
