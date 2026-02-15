@@ -1,0 +1,17 @@
+device: cuda:0
+model_path_list: 
+  long:
+    - ./predictor/model_path/long/model_state_0.pt
+    - ./predictor/model_path/long/model_state_1.pt
+    - ./predictor/model_path/long/model_state_2.pt
+    - ./predictor/model_path/long/model_state_3.pt
+    - ./predictor/model_path/long/model_state_4.pt
+  short:
+    - ./predictor/model_path/short/model_state_0.pt
+    - ./predictor/model_path/short/model_state_1.pt
+    - ./predictor/model_path/short/model_state_2.pt
+    - ./predictor/model_path/short/model_state_3.pt
+    - ./predictor/model_path/short/model_state_4.pt
+    
+# 用於預測的 k bar 根數
+seq_len: 144

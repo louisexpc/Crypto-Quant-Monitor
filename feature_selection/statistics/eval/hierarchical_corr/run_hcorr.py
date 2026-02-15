@@ -229,7 +229,7 @@ def _export_selected_features(cfg: Dict, representatives: Iterable[str], run_dir
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("-c", "--config", type=str, default="hierarchical_corr/config.yaml")
+    ap.add_argument("-c", "--config", type=str, default="feature_selection/statistics/eval/hierarchical_corr/config.yaml")
     args = ap.parse_args()
     cfg = _load_cfg(args.config)
 

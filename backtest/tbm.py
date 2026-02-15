@@ -1,23 +1,37 @@
+from attr import dataclass
 import numpy as np
 import pandas as pd
-from analysis import Level, StrategyAnalyzer
+from strategy.strategy import Candle, SNRLiveStrategy,SNRCfg, parse_timeframe_to_timedelta
 from tqdm import tqdm
 from typing import Tuple, Dict, Any, Optional
 from pathlib import Path
+from dataclasses import dataclass
+from pydantic import Field    
 
-def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT", timeframe:str = "1h", volume_ema_window:int = 10) -> pd.DataFrame:
+def load_yaml_config(cfg_path:str) -> SNRCfg:
+    import yaml
+    with open(cfg_path, 'r') as f:
+        cfg_dict = yaml.safe_load(f)
+    return SNRCfg(**cfg_dict['SNRStrategy'])
+
+@dataclass(frozen=True)
+
+class SignalRecord:
+    event_id: int
+    t0: pd.Timestamp = Field(..., description="Signal trigger time")
+    side: int = Field(..., description="Signal direction, +1 for Long, -1 for Short")
+    entry_price: float = Field(..., description="Entry price, typically the open price of the next bar after signal trigger")
+
+def generate_signals(df: pd.DataFrame, cfg_path:str) -> pd.DataFrame:
     """
-    根據策略 Moduel StrategyAnalyzer 產生交易訊號。
+    根據策略 Moduel SNRLiveStrategy 產生交易訊號。
     Args:
         df: pd.DataFrame, 包含以下欄位，index 為 DatetimeIndex（K 棒開盤時間）且需遞增：
             open  (float)
             high  (float)
             low   (float)
             volume(float) : 可選，若無則視為 1.0
-        lookback: int, 用於判斷訊號的歷史 K 棒數量（含當前 K 棒）
-        symbol: str, 交易標的名稱，傳給 StrategyAnalyzer 使用
-        timeframe: str, K 棒時間框架，傳給 StrategyAnalyzer 使用
-        volume_ema_window: int, 計算成交量 EMA 的視窗大小，傳給 StrategyAnalyzer 使用
+        cfg_path: str, 策略配置文件路徑，傳給 SNRLiveStrategy 使用
 
     Returns: 
         events: pd.DataFrame, 包含以下欄位：
@@ -25,50 +39,67 @@ def generate_signals(df: pd.DataFrame, lookback: int = 36, symbol:str = "BTCUSDT
             t0       (Timestamp)   : test_trigger_time from StrategyAnalyzer (進場在下一根 K 棒開盤)
             side     (int)         : signal_type from StrategyAnalyzer, +1 or -1
             entry_price (float)       : test_trigger_price from StrategyAnalyzer (進場價格為下一根 K 棒開盤價)
-
-
     """
-    df = df.copy()
-    records: list[Dict[str, Any]] = []
-    for i in tqdm(range(lookback - 1, len(df)), desc="Generating signals"):
-        window_df = df.iloc[i - lookback + 1 : i + 1]
-        try:
-            analyzer = StrategyAnalyzer(window_df, symbol=symbol, timeframe=timeframe, volume_ema_window=volume_ema_window)
-            sigs = analyzer.analyze()  # ← 只判斷最後一根是否觸發
-        except Exception:
-            continue
+    cfg = load_yaml_config(cfg_path)
+    snr = SNRLiveStrategy(cfg)
 
-        if not sigs:
-            continue
+    timeframe_delta = parse_timeframe_to_timedelta(cfg.timeframe)
 
-        for sig in sigs:
-            t = sig.get("test_trigger_time")
-            entry_bar_idx = df.index.get_loc(t) + 1
-            if entry_bar_idx >= len(df):
-                continue
-            entry_bar = df.iloc[entry_bar_idx]
+    df['kline_close_timestamp_ms'] = df.apply(lambda row: row['timestamp']+timeframe_delta.total_seconds()*1000, axis=1)
+    df['kline_open_timestamp_ms'] = df['timestamp']
 
-            if entry_bar is None:
-                continue
-            
-            records.append({
-                "event_id": len(records),
-                "t0": df.index[entry_bar_idx],   # 進場在下一根 K 棒開盤
-                "entry_price": entry_bar.loc['open'],  # 進場價格為下一根 K 棒開盤價
-                "side": sig.get("signal_type"),  # 'Long' / 'Short'
-            })
+    history_ohlcv = df.copy()
+    history_ohlcv = history_ohlcv.iloc[:cfg.lookback_bars+1]  # 只取前 lookback_barsk + 1 根 K 棒（包含當前）
+    snr.bootstrap_from_df(history_ohlcv)
 
-    raw_signals_df = pd.DataFrame.from_records(records) if records else pd.DataFrame()
+    records: list[SignalRecord] = []
+    
+
+    for idx in tqdm(range(cfg.lookback_bars+2, len(df)), desc="Generating signals"):
+        ohlcv = df.iloc[idx]
+        candle = Candle(
+            open=ohlcv['open'],
+            high=ohlcv['high'],
+            low=ohlcv['low'],
+            close=ohlcv['close'] ,
+            volume=ohlcv['volume'],
+            close_time=pd.Timestamp(ohlcv['kline_close_timestamp_ms'], unit='ms', tz="UTC").tz_convert("Asia/Taipei"),
+            open_time=pd.Timestamp(ohlcv['kline_open_timestamp_ms'], unit='ms', tz="UTC").tz_convert("Asia/Taipei")
+        )
+        sigs = snr.on_candle_close(candle)
+        if sigs:
+            # 根據 test_trigger_time 去重
+            unique_trigger_times = set()
+            # print(f"Bar {idx} - {candle.close_time} - Generated {len(sigs)} signals before deduplication.")
+            sigs = [sig for sig in sigs if sig['test_trigger_time'] not in unique_trigger_times and not unique_trigger_times.add(sig['test_trigger_time'])]
+            # print(f"Bar {idx} - {candle.close_time} - {len(sigs)} signals after deduplication.")
+            for sig in sigs:
+                entry_bar_idx = idx + 1
+                if entry_bar_idx >= len(df):
+                    continue
+                entry_bar = df.iloc[entry_bar_idx]
+
+                if entry_bar is None:
+                    continue
+                
+                records.append(SignalRecord(
+                    event_id=len(records),
+                    t0=sig['test_trigger_time'],   # signal 觸發時間
+                    entry_price=entry_bar.loc['open'],  # signal 觸發時間下一根 K 棒的開盤價
+                    side=1 if sig.get("signal_type") == "Long" else -1
+                ))
+
+    raw_signals_df = pd.DataFrame([r.__dict__ for r in records]) if records else pd.DataFrame()
 
     if(raw_signals_df.empty):
         return raw_signals_df
-    raw_signals_df['side'] = raw_signals_df['side'].map({"Long":1, "Short": -1})
+    raw_signals_df['side'] = raw_signals_df['side'].map({1:1, -1: -1})
     raw_signals_df = (
         raw_signals_df
         .sort_values(['t0','side'])
         .reset_index(drop=True)
     )
-    raw_signals_df.to_csv("../data/debug_raw_signals.csv", index=False)
+    raw_signals_df.to_csv("raw_signals.csv", index=False)
     return raw_signals_df
 
 
@@ -365,11 +396,7 @@ def triple_barrier_labels(
             out.at[eid, 't1'] = idx[end_i]   # 最後檢查到的時間
             out.at[eid, 'label'] = np.nan    # 永續，不計到期
         
-        # if side == -1:
-        #     print(f"空單結果: {eid}\nentry time=\t{t0}\nexit time=\t{out.at[eid, 't1']}\nO={O}\npt={pt_price}\nsl={sl_price}\nvol={sig}")
-        if out.at[eid, 't1'] == out.at[eid, 't0'] and (hit_pt and hit_sl):
-            print(f"事件 {eid} 的 t1 == t0\nt1: {out.at[eid, 't1']}\nt0: {out.at[eid, 't0']}\nStatus: hit_pt:{hit_pt} ; hit_sl:{hit_sl}\n觸發 low timeframe check:{hit_pt and hit_sl}")
-        
+
     return out[['t0','side','entry_price','t1','label','pt','sl','vol']]
 
 
@@ -467,13 +494,19 @@ def worker_task(up_mult, dn_mult, vol_method, horizon, vol_halflife, ambiguous):
 
 
 def main():
-    lookback = 108  # 用於產生 raw_signals 的 lookback
-    df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv", parse_dates=['datetime'], index_col='datetime')
-    low_timeframe_df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", parse_dates=['datetime'], index_col='datetime')
+
+    df = pd.read_csv(
+        "/home/louisexpc/Crypto-Quant-Monitor/crawler/ohlcv/data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", 
+        index_col='datetime', parse_dates=['datetime']
+    )
+    low_timeframe_df = pd.read_csv(
+        "/home/louisexpc/Crypto-Quant-Monitor/crawler/ohlcv/data/binanceusdm_swap_BTC-USDT-USDT_5m.csv", 
+        index_col='datetime', parse_dates=['datetime']
+
+    )
     df = df.sort_index()
     low_timeframe_df = low_timeframe_df.sort_index()
-    raw_signals_df = generate_signals(df=df, lookback=lookback, symbol="BTCUSDT", timeframe="1h", volume_ema_window=10)  # 範例
-
+    raw_signals_df = pd.read_csv("raw_signals.csv")
     outpath = Path("labels_output")
     outpath.mkdir(parents=True, exist_ok=True)
 
@@ -485,6 +518,7 @@ def main():
     ambiguous = "nan"
 
     # 建立所有參數組合
+    lookback = 100
     param_list = []
     for lookback in [lookback]:  # 這裡的 lookback 目前沒用到，因為 raw_signals 已產生
         for up in up_mults:
@@ -537,29 +571,24 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_1h.csv", parse_dates=['datetime'], index_col='datetime')
-    # low_timeframe_df = pd.read_csv("../data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", parse_dates=['datetime'], index_col='datetime')
-    # df = df.sort_index()
-    # low_timeframe_df = low_timeframe_df.sort_index()
+    # df_15m = pd.read_csv(
+    #     "/home/louisexpc/Crypto-Quant-Monitor/crawler/ohlcv/data/binanceusdm_swap_BTC-USDT-USDT_15m.csv", 
+    #     index_col='datetime', parse_dates=['datetime']
+    # )
+    # config_path = "./strategy/strategy.yaml"
+    # generate_signals(df=df_15m, cfg_path=config_path)
+    
+    # df_5m = pd.read_csv(
+    #     "/home/louisexpc/Crypto-Quant-Monitor/crawler/ohlcv/data/binanceusdm_swap_BTC-USDT-USDT_5m.csv", 
+    #     index_col='datetime', parse_dates=['datetime']
 
-    # lookback = 36
-    # vol_method = "atr"  # "ewma" or "atr"
-    # raw_signals_df =generate_signals(
-    #     df = df,
-    #     lookback = lookback,
-    #     symbol = "BTCUSDT",
-    #     timeframe = "1h",
-    #     volume_ema_window = 10,
     # )
-   
+
+    # raw_signals = pd.read_csv("raw_signals.csv")
     # labels_df = triple_barrier_labels(
-    #     df=df,
-    #     low_timeframe_df=low_timeframe_df,
-    #     raw_signals=raw_signals_df,
-    #     up_mult=2.5, dn_mult=2.0,
-    #     horizon=0,                 # 0 or <=0 代表「掃到資料尾、不設到期」
-    #     vol_method=vol_method, vol_halflife=14,
-    #     ambiguous="nan",           # 同根雙觸發→丟棄
+    # df=df_15m,
+    # low_timeframe_df=df_5m,
+    # raw_signals=raw_signals,
     # )
-    # labels_df.to_csv(f"../data/BTC-USDT_1h_{vol_method}_lookback{lookback}_label.csv", index=False)
-    # analysis_label(labels_df)
+    # labels_df.to_csv("labels.csv", index=False)
+

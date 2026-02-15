@@ -1,0 +1,93 @@
+
+
+symbol: "BTCUSDT"
+redis_url: "redis://localhost:6379"
+
+
+
+
+
+# -----------------------------
+# Deep Learning configuration
+# -----------------------------
+feature:
+  config_path : "./indicators/feature.yaml" # 指標設定檔路徑，具體設定見 indicators/feature.yaml
+predictor:
+  config_path : "./predictor/predictor.yaml" # 預測器設定檔路徑，具體設定見 predictor/predictor.yaml
+
+# -----------------------------
+# SNR Strategy configuration
+# -----------------------------
+strategy:
+  config_path : "./strategy/strategy.yaml" # 策略設定檔路徑，具體設定見 strategy/snr_strategy.yaml
+# -----------------------------
+# Exchange configuration
+# -----------------------------
+exchange:
+  # 建議：
+  # - spot：binance + spot testnet
+  # - U 本位永續：binanceusdm（若要用 set_leverage / set_margin_mode / set_position_mode 等期貨專屬能力）
+  id: "binance"                 # "binance" | "binanceusdm" | "binancecoinm" ...
+  market_type: "future"         # "spot" | "future"
+  sandbox: true                  # true = testnet / false = live
+  enable_rate_limit: true
+  timeout_ms: 30000
+  recv_window: 10000
+  adjust_for_time_difference: true
+
+  # 若要連 Binance Spot Testnet：
+  # https://testnet.binance.vision/
+  # 若要連 Binance USD-M Futures Testnet：
+  # https://testnet.binancefuture.com/
+  # 重要：不同 exchange class 的 urls 結構可能不同；請以你使用的 class 為準。
+  # urls_override:
+  #   api: "https://testnet.binance.vision/api"
+
+# -----------------------------
+# Trader configuration
+# -----------------------------
+trade:
+  enabled: true                   # 交易總開關（false 直接拒絕送單/撤單）
+  allow_live: false               # sandbox=false 時若 allow_live!=true 會直接阻擋（硬防呆）
+  dry_run: false                  # true：不真的送單，只印出 payload 並回傳 mock
+  symbol_allowlist: ["BTC/USDT"]
+  max_open_orders_per_symbol: 5
+
+  risk:
+    # Common
+    max_notional_per_order: 200          # 單筆最大名目（USDT）
+    min_free_quote_balance: 50           # 最低可用 quote（USDT）
+    max_slippage_bps_market: 30          # 市價單最大允許滑點（bps），以 mid price 粗估
+    require_post_only_for_limit: false   # 若 true，限價單一律 postOnly
+
+    # Futures specific (粗估保證金)
+    # required_margin_est = notional / configured_leverage
+    # required_margin_est * (1 + buffer_ratio) <= free_quote 才允許開倉
+    futures_initial_margin_buffer_ratio: 0.10
+
+  futures:
+    leverage: 3                   # 期貨用；spot 會忽略
+    margin_mode: "isolated"       # "isolated" | "cross"
+    position_mode: "one-way"      # "one-way" | "hedge"
+
+  # 可選：統一下單 sizing 的預設值（你也可以在策略端自行計算再呼叫 create_order_by_budget）
+  position_sizing:
+    quote: "USDT"
+    price_source: "mid"           # "mid" | "ticker_last"
+
+  logging:
+    level: "INFO"
+    log_file: "./trader.log"
+
+  network:
+    max_retry: 3
+    base_sleep_sec: 0.5
+# -----------------------------
+# daemon configuration
+# -----------------------------
+daemon:
+  pidfile: "./runtime/trader.pid"             # PID 檔案路徑
+  state_path: "./runtime/trader_state.json"   # Trader 狀態: 持久化檔案路徑
+  trigger_interval: "1h"                      # WS Listen Kbar
+  finalize_max_retry: 5                    # finalize 時最大重試次數
+  finalize_retry_sleep_sec: 2                  # finalize 時重試間隔秒數

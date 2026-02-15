@@ -41,7 +41,7 @@ def _as_float(x, name="value", default=None):
     raise TypeError(f"[trainer_base] {name} expects a float or list/tuple, got {type(x)}")
 
 # =========================================================
-# 高速批次迭代（GPU 預載資料集直切）
+# GPU 預載資料集直切
 # =========================================================
 def _iter_batches(loader, device: str, batch_size: int):
     """
@@ -340,3 +340,33 @@ def get_trainer(cfg):
         return train_one_fold
     else:
         raise ValueError(f"[trainer_factory] Unknown task type: {task}")
+
+
+# =========================================================
+# 溫度校準（Temperature Scaling
+# =========================================================
+import torch.nn.functional as F
+def fit_temperature_ce(logits, y_true, max_iter=50):
+    """
+    1. 說明:
+        溫度校準（Temperature Scaling, CE 版）。尋找標量溫度 T，使
+        CE( logits / T, y_true ) 最小化。通常用於多分類 softmax 機率的後校準。
+    2. inputs:
+        - logits (Tensor): shape=[N,C] 的未經 softmax 之輸出分數（可為任意 dtype/裝置）。
+        - y_true (Tensor): shape=[N] 的整數標籤。
+        - max_iter (int): LBFGS 的最大迭代次數（預設 50）。
+    3. return:
+        - T (Tensor): 單一標量張量（與 logits 同裝置），可用於 `(logits / T)` 進行校準。
+    """
+    T = torch.nn.Parameter(torch.ones(1, device=logits.device, dtype=torch.float32))
+    opt = torch.optim.LBFGS([T], lr=0.1, max_iter=max_iter)
+    y_true = y_true.to(logits.device).long()
+
+    def closure():
+        opt.zero_grad()
+        loss = F.cross_entropy((logits.float()) / T.clamp_min(1e-4), y_true, reduction="mean")
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return T.detach()

@@ -395,9 +395,6 @@ if __name__ == "__main__":
     main()
 
 """
-用法：
 python feature_selection/statistics/rank_biserial/run_rank_biserial.py --side short --debug
 
-# 如 precomputed 的時間其實是台北本地時間，請在 YAML 設定：
-# index.tz_precomputed: "Asia/Taipei"
 """

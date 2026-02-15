@@ -15,6 +15,7 @@ from train.data.dataloaders.base import (
     load_precomputed_features,
     reindex_to_full_grid,
     apply_scaling,
+    flatten_micro_features,
 )
 from train.data.labeling import create_label
 from train.data.dataset.time_dataset import SeqDataset
@@ -35,13 +36,47 @@ def make_time_loaders_for_fold(
     task_type = cfg["task"]["type"]
     ref_index = pd.DatetimeIndex(df.index)
 
+    def _to_utc(ts_like):
+        ts = pd.Timestamp(ts_like)
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
+    cv_start = _to_utc(cfg["cv"]["start_date"])
+    cv_end_cfg = _to_utc(cfg["cv"]["end_date"])
+    post_cfg = ((cfg.get("post_infer", {}) or {}).get("tbm_concat", {}) or {})
+    post_end = post_cfg.get("date_end")
+    ts_end_limit = _to_utc(post_end) if post_end else cv_end_cfg
+
     # 1) 取得特徵與標籤來源
     feat_df = load_precomputed_features(path=cfg["data"]["path"], drop_ohlcv=False).astype(np.float32)
 
     micro_cfg = (cfg.get("data", {}) or {}).get("micro", {})
+    micro_df = None
     if micro_cfg.get("enabled") and micro_cfg.get("path"):
         micro_df = load_precomputed_features(path=micro_cfg["path"]).astype(np.float32)
-        feat_df = feat_df.join(micro_df, how="left")
+
+    # 日期裁剪：cv.start_date ~ min(cv/post_infer end)
+    ts_end_candidates = [ts_end_limit, pd.DatetimeIndex(feat_df.index).max()]
+    if micro_df is not None and len(micro_df.index):
+        ts_end_candidates.append(pd.DatetimeIndex(micro_df.index).max())
+    ts_end = min(ts_end_candidates)
+
+    feat_df = feat_df.loc[feat_df.index <= ts_end]
+    if feat_df.isna().any().any():
+        raise ValueError("[time_loader] 15m features contain NaN/Inf; please sanitize upstream.")
+
+    if micro_df is not None:
+        window_len = int(micro_cfg.get("window_len", 15))
+        feat_df = flatten_micro_features(
+            feat_df=feat_df,
+            micro_df=micro_df,
+            cv_start=cv_start,
+            ts_end=ts_end,
+            window_len=window_len,
+        )
+
+    feat_df = feat_df.loc[(feat_df.index >= cv_start) & (feat_df.index <= ts_end)]
 
     freq = (cfg.get("data", {}) or {}).get("freq")
     if freq and not feat_df.empty:
@@ -68,9 +103,7 @@ def make_time_loaders_for_fold(
         raise ValueError("[time_loader] 產生標籤後仍含 NaN，請調整標籤設定或資料。")
 
     # 5) CV 範圍 + 與 fold 對齊（沿用你現有邏輯）
-    cv_start = pd.Timestamp(cfg["cv"]["start_date"]).tz_localize("UTC")
-    cv_end   = (pd.Timestamp(cfg["cv"]["end_date"]).tz_localize("UTC") + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1))
-    mask = (feat_df.index >= cv_start) & (feat_df.index <= cv_end)
+    mask = (feat_df.index >= cv_start) & (feat_df.index <= ts_end)
     feat_df = feat_df.loc[mask]; y_series = y_series.loc[mask]
 
     work = pd.concat([feat_df, y_series], axis=1)

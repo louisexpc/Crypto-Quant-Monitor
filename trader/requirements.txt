@@ -1,0 +1,14 @@
+ccxt
+pandas
+PyYAML
+numpy
+pandas_ta
+vectorbt
+tsfeatures
+dotenv
+websockets 
+aioredis 
+asyncio 
+python-binance==1.0.30
+torch
+TA-Lib

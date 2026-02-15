@@ -31,11 +31,11 @@ from train.training.trainers.utils import (
     infer_class_prior,
     _iter_batches,
     find_best_threshold_by_fbeta,
+    fit_temperature_ce
     )
 
 from train.training.metrics.metrics_cls import compute_cls_metrics
 from train.training.losses.cls import build_classification_loss
-from train.training.hooks import CollapseGuard, fit_temperature_ce
 from train.models.xgb_model import XGBClassifierModel
 from train.training.trainers.xgb import _train_one_fold_xgb
 
@@ -125,52 +125,10 @@ def train_one_fold(
     else:
         class_prior = None
 
-    # ---- CollapseGuard 設定（只在二分類時啟用）----
-    guard_cfg = cfg.get("guard", cfg.get("collapse_guard", {})) or {}
-    guard_enabled = bool(guard_cfg.get("enabled", True)) and (num_class == 2)
-    guard = None
-    if guard_enabled:
-        # PPR 門檻建議與實際決策門檻一致；若使用固定門檻可讀取 train.threshold
-        thr_mode = str(cfg["train"].get("threshold_mode", "auto_auc")).lower()
-        if thr_mode == "fixed" and (cfg["train"].get("threshold") is not None):
-            pos_thr = float(cfg["train"]["threshold"])
-        else:
-            pos_thr = float(guard_cfg.get("pos_threshold", 0.5))
-
-        # 可選回滾：在觸發時載回當前最佳權重
-        best_state_holder = {"state": None}
-        def _on_trigger(ctx: Dict):
-            if bool(guard_cfg.get("restore_on_trigger", True)) and best_state_holder["state"] is not None:
-                try:
-                    ctx["model"].load_state_dict(best_state_holder["state"])
-                    print("[CollapseGuard] restored best weights.")
-                except Exception as e:
-                    print(f"[CollapseGuard] restore error: {e}")
-
-        guard = CollapseGuard(
-            pos_threshold=pos_thr,
-            ppr_warn_band=tuple(guard_cfg.get("ppr_warn_band", (0.05, 0.60))),
-            warn_patience=int(guard_cfg.get("warn_patience", 50)),
-            ppr_extreme_band=tuple(guard_cfg.get("ppr_extreme_band", (0.02, 0.98))),
-            extreme_patience=int(guard_cfg.get("extreme_patience", 100)),
-            cp_boost_factor=float(guard_cfg.get("cp_boost_factor", 1.25)),
-            lr_decay=float(guard_cfg.get("lr_decay", 0.5)),
-            max_conf_penalty=float(guard_cfg.get("max_conf_penalty", 0.20)),
-            min_lr=float(guard_cfg.get("min_lr", 1e-6)),
-            on_trigger=_on_trigger,
-            smoothing=float(guard_cfg.get("smoothing", 0.95)),
-            warmup_steps=int(guard_cfg.get("warmup_steps", steps_per_epoch * 2)),
-            entropy_hi=float(guard_cfg.get("entropy_hi", 0.60)),
-            cooldown_steps=int(guard_cfg.get("cooldown_steps", max(steps_per_epoch, 200))),
-            verbose=bool(guard_cfg.get("verbose", False))
-            )
-    else:
-        best_state_holder = {"state": None}
 
     # ---- Early-stop 狀態 ----
     best_epoch = 0
     best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    best_state_holder["state"] = best_state  # 讓 CollapseGuard 能回滾
     wait = 0
     prefix = f"[fold {fold_id}] " if fold_id is not None else ""
     history = []
@@ -193,7 +151,6 @@ def train_one_fold(
         model.train()
         train_loss_sum, train_n = 0.0, 0
         tr_preds, tr_tgts = [], []
-        last_guard_info = None
 
         for Xb, yb in _iter_batches(train_loader, device, int(cfg["train"]["batch_size"])):
             Xb = Xb.to(device, non_blocking=True)
@@ -230,15 +187,6 @@ def train_one_fold(
             scaler.step(optimizer)
             scheduler.step()
             scaler.update()
-
-            # CollapseGuard 監控與自救（訓練後、作用於後續 step）
-            if guard is not None:
-                info = guard.on_batch_end(logits.detach(), loss_fn, optimizer, model=model)
-                last_guard_info = info
-                if info["warn"]:
-                    print(f"[WARN step={info['step']}] PPR_ema={info['ppr_ema']:.3f} Entropy_ema={info['entropy_ema']:.3f}")
-                if info["triggered"]:
-                    print(f"[TRIGGER] λ_cp→{getattr(loss_fn,'conf_penalty',0.0):.4f}; LR decayed.")
 
             # 累計 loss 與收集訓練預測（for train 指標）
             bs = Xb.size(0)
@@ -303,8 +251,6 @@ def train_one_fold(
             curr_val_thresh = None
 
         m_va = compute_cls_metrics(y_va, yhat_va)
-        if guard is not None and curr_val_thresh is not None:
-            guard.set_pos_threshold(float(curr_val_thresh))
 
         # ---- Early Stopping ----
         improved = (avg_va_loss < (best_cls_val_loss - 1e-6)) if not primary_is_f05 else \
@@ -319,7 +265,6 @@ def train_one_fold(
             best_cls_val_loss = avg_va_loss
             best_epoch = epoch
             best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            best_state_holder["state"] = best_state  # 讓 CollapseGuard 能回滾最新最佳
             best_T = T_epoch.detach().clone()
             wait = 0
         else:
@@ -328,8 +273,6 @@ def train_one_fold(
                 print(f"{prefix}Early stop at epoch {epoch} | best_epoch={best_epoch} | val_f1={best_val_f1:.4f} | val_f05={best_val_f_05:.4f}")
                 break
 
-        # ---- CollapseGuard epoch 摘要 ----
-        guard_epoch_info = guard.on_epoch_end() if guard is not None else {}
         # ---- 記錄歷史 ----
         history.append({
             "epoch": epoch,
@@ -341,13 +284,6 @@ def train_one_fold(
             "train_macro_recall":    m_tr.get("macro_recall", np.nan),
             "val_macro_recall":      m_va.get("macro_recall", np.nan),
             "val_f_05_macro":        m_va.get("f_05_macro", np.nan),
-            # CollapseGuard logs
-            "guard_ppr_ema": guard_epoch_info.get("ppr_ema", np.nan),
-            "guard_entropy_ema": guard_epoch_info.get("entropy_ema", np.nan),
-            "guard_warn_streak": guard_epoch_info.get("warn_streak", np.nan),
-            "guard_extreme_streak": guard_epoch_info.get("extreme_streak", np.nan),
-            "guard_last_ppr": last_guard_info.get("ppr", np.nan) if last_guard_info else np.nan,
-            "guard_last_entropy": last_guard_info.get("entropy", np.nan) if last_guard_info else np.nan,
         })
         print(f"{prefix}[Epoch {epoch:03d}] tr_loss={avg_tr_loss:.4f} | val_loss={avg_va_loss:.4f} | "
               f"val_acc={m_va.get('acc',np.nan):.3f} | val_f1={m_va.get('macro_f1',np.nan):.3f} | "

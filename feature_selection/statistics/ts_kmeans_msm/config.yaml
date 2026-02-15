@@ -1,11 +1,11 @@
 # === Input ===
 input:
-  csv_path: "feature_selection/results/hierarchical_corr/hcorr_pearson_avg_k60/hcorr_pearson_avg_k60_selected_feat.csv"
+  csv_path: "feature_selection/results/rank_biserial/long_108_v2/rank_biserial_120_feat.csv"
   index_col: "datetime"      # 可為 "timestamp" 或 None（若整檔全是數值欄）
   start: 2023-01-03          # 例如 "2023-01-01T00:00:00Z"
   end: 2025-04-30            # 例如 "2024-01-01T00:00:00Z"
   drop_na: false             # 是否丟掉含 NaN 的列
-  downsample_every: 96       # 沿時間軸降採樣間隔（>1 可降低序列長度）
+  downsample_every: 4       # 沿時間軸降採樣間隔（>1 可降低序列長度）
   max_time_steps: null        # 最多保留的時間步數（從尾端取），避免 MSM 記憶體爆掉；可改大或設 null
   exclude_cols:              # 不參與分群的欄（時間戳、標籤等）
     - datetime
@@ -18,7 +18,7 @@ input:
 
 # === Clustering ===
 cluster:
-  n_clusters: 10
+  n_clusters: 60
   msm_cost: 0.1
   max_iter: 50
   n_init: 3
@@ -35,6 +35,6 @@ report:
   silhouette_limit_per_cluster: 8  # 依群數動態放寬上限，例如 k=15 則上限 max(60, 8*15=120)
 output:
   dir: "feature_selection/results/ts_kmeans_msm"
-  prefix: "msm_kmeans_btcusdt_15m_k10"
+  prefix: "rb120_kmeans60"
 
 # bash feature_selection/statistics/ts_kmeans_msm/run.sh

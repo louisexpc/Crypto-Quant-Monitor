@@ -99,7 +99,7 @@ def _load_fng_15m(fng_csv: str) -> pd.DataFrame:
     df = df.rename(columns=rename_map)
 
     # 只保留需要欄位，缺者補 NaN
-    need = ["fng", "fng_diff1", "fng_z7d"]
+    need = ["fng"]
     for n in need:
         if n not in df.columns:
             df[n] = np.nan
@@ -109,11 +109,7 @@ def _load_fng_15m(fng_csv: str) -> pd.DataFrame:
     df = df.resample("15min").ffill()
 
     # dtype 壓成 float32；加前綴 sent_
-    df = df.astype(np.float32).rename(columns={
-        "fng": "sent_fng",
-        "fng_diff1": "sent_fng_diff1",
-        "fng_z7d": "sent_fng_z7d",
-    })
+    df = df.astype(np.float32)
 
     # 去重 & 排序
     df = df[~df.index.duplicated(keep="first")].sort_index()
@@ -155,10 +151,6 @@ def merge_and_save(base_csv: str, fng_csv: str, out_csv: str, trim_to_intersecti
     cols.remove("timestamp")
     out = out[["datetime", "timestamp"] + cols]
 
-    # 確保新欄位保持 float32（reset_index 可能改成 float64）
-    for c in ("sent_fng", "sent_fng_diff1", "sent_fng_z7d"):
-        if c in out.columns:
-            out[c] = out[c].astype("float32")
 
     out_path = Path(out_csv)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,18 +158,17 @@ def merge_and_save(base_csv: str, fng_csv: str, out_csv: str, trim_to_intersecti
 
     print(f"[OK] merged saved → {out_path.resolve()}")
     print(f"rows={len(out):,}, cols={len(out.columns):,}")
-    print("new columns:", [c for c in out.columns if c.startswith("sent_")])
 
 # --------------------------
 # CLI
 # --------------------------
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Merge 15m FNG into 15m master indicators (no shift here).")
-    ap.add_argument("--base_csv", default="data/derived/btcusdt_15m_with_flat_1m.csv",
+    ap.add_argument("--base_csv", default="data/ohlcv_2023/binanceusdm_swap_BTC-USDT-USDT_15m.csv",
                     help="你的 15m 主表 CSV（含 datetime 欄，UTC）")
     ap.add_argument("--fng_csv",  default="data/FNG/fng_15m_utc.csv",
                     help="FNG 15m CSV（含 fng/fng_diff1/fng_z7d 與 datetime 或 timestamp）")
-    ap.add_argument("--out_csv",  default="data/FNG/btcusdt_15m_with_fng_with_flat_1m.csv",
+    ap.add_argument("--out_csv",  default="data/derived/ohlcv_fng_15m.csv",
                     help="輸出路徑")
     ap.add_argument("--trim_to_intersection", action="store_true",
                     help="僅保留與 FNG 有交集的時間段")
@@ -194,3 +185,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

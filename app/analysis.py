@@ -206,6 +206,19 @@ class StrategyAnalyzer:
     def analyze(self) -> List[Dict[str, Any]]:
         """
         執行完整的分析流程：先模擬市場，再對最後一根 K 線做判斷。
+        Returns:
+           - List of detected signals (if any).
+           containing following keys:
+                - "symbol": self.symbol, str
+                - "timeframe": self.timeframe, pd.Timestamp
+                - "signal_type": signal_type, str
+                - "signal_candle_time": level.created_at, pd.Timestamp
+                - "test_trigger_time": self.last_candle.name, pd.Timestamp
+                - "level_price": level.price, float
+                - "level_current_type": level.type, str
+                - "level_snr_type": level.snr_type, str
+                - "level_flipped_at": level.flipped_at, pd.Timestamp
+
         """
         log.info(f"Starting analysis for {self.symbol} on {self.timeframe}...")
         

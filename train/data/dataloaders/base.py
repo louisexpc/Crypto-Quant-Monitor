@@ -67,31 +67,6 @@ def load_precomputed_features(
                 df = df.drop(columns=[col])
     return df
 
-
-def clip_df_by_start_date(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
-    """
-    若 cfg.cv.start_date 有設，僅保留該日期（含）之後的列，避免 rolling 前置 NaN 影響。
-    """
-    cv_cfg = (cfg.get("cv", {}) or {})
-    start_date = cv_cfg.get("start_date")
-    if not start_date:
-        return df
-    try:
-        start_ts = pd.Timestamp(start_date)
-    except Exception:
-        return df
-    idx_tz = getattr(df.index, "tz", None)
-    if idx_tz is not None:
-        if start_ts.tzinfo is None:
-            start_ts = start_ts.tz_localize(idx_tz)
-        else:
-            start_ts = start_ts.tz_convert(idx_tz)
-    else:
-        if start_ts.tzinfo is not None:
-            start_ts = start_ts.tz_convert(None)
-    return df.loc[df.index >= start_ts]
-
-
 # ---------- Align & Fit-index ----------
 def align_times(t0_index: pd.DatetimeIndex, idx_all: pd.DatetimeIndex, method: str) -> pd.DatetimeIndex:
     """
@@ -140,6 +115,59 @@ def ensure_utc_index(idx_like) -> pd.DatetimeIndex:
     else:
         idx = idx.tz_convert("UTC")
     return idx
+
+
+def flatten_micro_features(
+    feat_df: pd.DataFrame,
+    micro_df: Optional[pd.DataFrame],
+    cv_start: pd.Timestamp,
+    ts_end: pd.Timestamp,
+    window_len: int = 15,
+) -> pd.DataFrame:
+    """
+    將 1m micro 特徵展平成 m0~m(window_len-1) 並與 15m 特徵 join（m0 最舊、m(window_len-1) 最新）。
+    - micro_df=None 或空表時直接回傳 feat_df
+    - micro_df 會先裁剪到 [cv_start - window_len, ts_end]，再按 target_idx(<=ts_end) 做 reindex 展平
+    - 不處理 NaN，呼叫端自行檢查
+    """
+    if micro_df is None or len(micro_df.index) == 0:
+        return feat_df
+
+    def _to_utc(ts_like):
+        ts_obj = pd.Timestamp(ts_like)
+        if ts_obj.tzinfo is None:
+            return ts_obj.tz_localize("UTC")
+        return ts_obj.tz_convert("UTC")
+
+    cv_start = _to_utc(cv_start)
+    ts_end = _to_utc(ts_end)
+
+    micro_df = micro_df.sort_index()
+    micro_df = micro_df.loc[(micro_df.index >= cv_start - pd.Timedelta(minutes=window_len)) & (micro_df.index <= ts_end)]
+    if len(micro_df.index) == 0:
+        return feat_df
+
+    micro_cols = list(micro_df.columns)
+    col_names: List[str] = []
+    for i in range(window_len):
+        for c in micro_cols:
+            col_names.append(f"m{i}_{c}")
+
+    target_idx = feat_df.index[feat_df.index <= ts_end]
+    flat_rows = []
+    for t in target_idx:
+        t_utc = _to_utc(t)
+        win_idx = pd.date_range(
+            end=t_utc - pd.Timedelta(minutes=1),
+            periods=window_len,
+            freq="1min",
+            tz="UTC",
+        )
+        sub = micro_df.reindex(win_idx)
+        flat_rows.append(sub.to_numpy().reshape(-1))
+
+    flat_df = pd.DataFrame(flat_rows, index=target_idx, columns=col_names, dtype=np.float32)
+    return feat_df.join(flat_df, how="left")
 
 
 # ---------- Scaling ----------
