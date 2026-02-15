@@ -28,3 +28,4 @@ train/research_problem.MD
 .python-version
 
 trader/trader/
+trader/trader/*
