@@ -1,4 +1,4 @@
-# types.py
+# shared_types.py
 """
 全資料集型定義與工具函式。
 """
