@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+"""Orderbook 品質旗標（quality flags）計算。"""
+
 from orderbook_snapshot.domain_types import SnapshotRecord
 
 
 class QualityFlagsCalculator:
+    """檢查 crossed book、排序與數量品質。"""
+
     name = "quality_flags"
     version = "1.0.0"
 
     def compute(self, snap: SnapshotRecord) -> dict[str, float | int | bool]:
+        """計算 snapshot 的品質旗標。
+
+        Args:
+            snap: 單筆 snapshot。
+
+        Returns:
+            品質旗標字典。
+        """
         best_bid_p, _ = snap.bids[0]
         best_ask_p, _ = snap.asks[0]
 

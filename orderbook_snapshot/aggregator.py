@@ -13,17 +13,40 @@ from orderbook_snapshot.domain_types import (
 
 
 class MinuteAggregator:
+    """將 snapshot features 對齊到 bar 並產生單列 row。
+
+    目前預設為 1m bar，時間對齊使用 Asia/Taipei。實際的覆蓋策略由 store
+    端使用同 key 去重達成（last-write-wins）。
+    """
+
     def __init__(
         self,
         bar_interval: BarInterval = "1m",
         source: str = "binance_futures",
         feature_schema_version: str = "ob_snapshot_features.v1",
     ) -> None:
+        """初始化 bar 聚合器。
+
+        Args:
+            bar_interval: 目標 bar 週期（常見為 `1m`）。
+            source: 資料來源名稱，會寫入 row 的 `source` 欄位。
+            feature_schema_version: 特徵 schema 版本。
+        """
         self.bar_interval = bar_interval
         self.source = source
         self.feature_schema_version = feature_schema_version
 
     def _resolve_bucket_ts_ms(self, snap: SnapshotRecord) -> int:
+        """依規範挑選時間分桶基準 timestamp。
+
+        優先順序：`event_ts_ms -> tx_ts_ms -> recv_ts_ms`。
+
+        Args:
+            snap: 單筆 snapshot。
+
+        Returns:
+            用於 floor 到 bar open 的 timestamp（毫秒）。
+        """
         header = snap.header
         if header.event_ts_ms is not None:
             return header.event_ts_ms
@@ -32,6 +55,18 @@ class MinuteAggregator:
         return header.recv_ts_ms
 
     def ingest(self, snap: SnapshotRecord, features: dict[str, float | int | bool]) -> dict[str, Any]:
+        """把 snapshot + features 組裝為單一 bar row。
+
+        Args:
+            snap: 單筆 snapshot。
+            features: 由 engine 計算出的 flattened features。
+
+        Returns:
+            可直接送入 store 的 row dict，包含 header/meta/features。
+
+        Raises:
+            ValueError: 當缺少必備 TOB 欄位，或 `bar_open_datetime_tpe` 非 tz-aware。
+        """
         bar_open_ts_ms = floor_to_bar_open_in_tz(
             self._resolve_bucket_ts_ms(snap),
             interval=self.bar_interval,

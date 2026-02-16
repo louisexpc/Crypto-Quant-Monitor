@@ -1,13 +1,25 @@
 from __future__ import annotations
 
+"""Top-of-Book 與 micro-structure 基礎特徵。"""
+
 from orderbook_snapshot.domain_types import SnapshotRecord
 
 
 class TopOfBookCalculator:
+    """計算 TOB 與一階市場微觀狀態特徵。"""
+
     name = "tob"
     version = "1.0.0"
 
     def compute(self, snap: SnapshotRecord) -> dict[str, float | int | bool]:
+        """從最佳買一/賣一產生 TOB 特徵。
+
+        Args:
+            snap: 單筆 snapshot。
+
+        Returns:
+            包含 best bid/ask、spread、mid、imbalance、microprice 的特徵字典。
+        """
         best_bid_p, best_bid_q = snap.bids[0]
         best_ask_p, best_ask_q = snap.asks[0]
 

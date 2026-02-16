@@ -1,16 +1,33 @@
 from __future__ import annotations
 
+"""Depth-within-bps 特徵計算。"""
+
 from orderbook_snapshot.domain_types import SnapshotRecord
 
 
 class DepthWithinBpsCalculator:
+    """計算不同 bps 範圍內的 bid/ask 累積量。"""
+
     name = "depth_within_bps"
     version = "1.0.0"
 
     def __init__(self, bps_levels: tuple[int, ...] = (5, 10, 25, 50)) -> None:
+        """初始化 depth-within-bps 計算器。
+
+        Args:
+            bps_levels: 要計算的 bps 清單，例如 `(5, 10, 25, 50)`。
+        """
         self.bps_levels = bps_levels
 
     def compute(self, snap: SnapshotRecord) -> dict[str, float | int | bool]:
+        """計算各 bps 範圍內的深度累積量。
+
+        Args:
+            snap: 單筆 snapshot。
+
+        Returns:
+            `depth_bid_*bps` 與 `depth_ask_*bps` 欄位字典。
+        """
         best_bid_p, _ = snap.bids[0]
         best_ask_p, _ = snap.asks[0]
         mid = (best_bid_p + best_ask_p) / 2.0
