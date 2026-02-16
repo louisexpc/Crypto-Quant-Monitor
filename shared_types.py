@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, ClassVar, Literal, Sequence, Tuple
+from typing import Literal, Sequence, Tuple
 
 from zoneinfo import ZoneInfo
 
