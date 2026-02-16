@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional, List, Literal
 
 import dotenv
+from pydantic import BaseModel
 import yaml
 import argparse
 import pandas as pd
@@ -18,11 +19,15 @@ from utils.state_manager import BotStateStore
 from indicators.feature_computer import FeatureComputer
 from predictor.predictor import Predictor
 from strategy.strategy import SNRLiveStrategy, SNRCfg, Candle
-
+from utils.discord_bot import DiscordNotifier
 dotenv.load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-
+class APIKeyConfig(BaseModel):
+    api_key: str
+    api_secret: str
+    discord_bot_token: str
+    discord_channel_id: int
 
 class ProcessGuard:
     """A minimal single-instance guard using a pidfile.
@@ -179,10 +184,12 @@ class TradingBot:
     the call signature.
     """
 
-    def __init__(self, api_key: str, api_secret: str, config: dict):
+    def __init__(self, api_key_config: APIKeyConfig, config: dict):
         self.config = config
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_key = api_key_config.api_key
+        self.api_secret = api_key_config.api_secret
+        self.discord_bot_token = api_key_config.discord_bot_token
+        self.discord_channel_id = api_key_config.discord_channel_id
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -219,6 +226,7 @@ class TradingBot:
         self.long_predictor, self.short_predictor = self._init_long_short_predictor()
         self.strategy_manager = self._init_strategy_manager()
         self.trader = self._init_trader()
+        self._init_discord_notifier()
 
         # Strategy Manager Bootstrap
         self.lookback_bars = (
@@ -280,6 +288,9 @@ class TradingBot:
             apiKey=self.api_key,
             apiSecret=self.api_secret,
         )
+    def _init_discord_notifier(self):
+        self.discord_notifier = DiscordNotifier(self.discord_bot_token, self.discord_channel_id, self.logger)
+        self.logger.info("Discord Notifier initialized (pending async connect).")
 
     # -----------------------------
     # User-owned Trading Logic
@@ -419,6 +430,13 @@ class TradingBot:
 
     async def run_forever(self):
         self.logger.info("Starting TradingBot daemon...")
+        if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
+            try:
+                await self.discord_notifier.connect()
+                self.logger.info("Discord Notifier connected.")
+                await self.discord_notifier.send_info("TradingBot initialized and connected to Discord channel.")
+            except Exception:
+                self.logger.exception("Discord Notifier connect failed; continue without Discord notifications.")
         listener = BinanceFuturesKlineListener(
             symbol=self.symbol,
             interval=self.trigger_interval,
@@ -483,6 +501,12 @@ class TradingBot:
                 pass
 
             await listener.stop()
+            if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
+                try:
+                    await self.discord_notifier.close()
+                    self.logger.info("Discord Notifier closed.")
+                except Exception:
+                    self.logger.exception("Failed to close Discord Notifier.")
             self.logger.info("TradingBot daemon stopped.")
 
 
@@ -672,10 +696,12 @@ def setup_logging(log_dir: Path):
 
 
 def main():
-    api_key = os.getenv("API_KEY")
-    api_secret = os.getenv("API_SECRET")
-    if not api_key or not api_secret:
-        raise ValueError("API_KEY and API_SECRET must be set in environment variables")
+    api_key_config = APIKeyConfig(
+        api_key=os.getenv("TRADER_API_KEY"),
+        api_secret=os.getenv("TRADER_API_SECRET"),
+        discord_bot_token=os.getenv("DISCORD_BOT_TOKEN"),
+        discord_channel_id=int(os.getenv("DISCORD_CHANNEL_ID")),
+    )   
 
     parser = argparse.ArgumentParser(description="Trader Application")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to the configuration YAML file")
@@ -695,7 +721,7 @@ def main():
     config_path = args.config
     config = load_config(config_path)
 
-    bot = TradingBot(api_key, api_secret, config)
+    bot = TradingBot(api_key_config, config)
 
     if args.mode == "init":
         bot.logger.info("Init mode: modules initialized; exiting.")
