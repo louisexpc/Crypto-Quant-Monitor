@@ -7,6 +7,14 @@ from typing import Dict, Any, Optional, List
 
 class DiscordNotifier:
     def __init__(self,token:str, channel_id: int, logger: logging.Logger | None = None):
+        """
+        Discord notifier client for sending messages and embeds to a specific channel.
+        Security note:
+            The ``token`` argument is a Discord bot token and must be treated as a sensitive
+            credential. It should be provided from secure sources such as environment
+            variables or a secrets manager, and must not be hard-coded in source control
+            or logged/printed in plaintext.
+        """
         self.token = token
         self.channel_id = channel_id
         if not self.token or not self.channel_id:
@@ -35,7 +43,11 @@ class DiscordNotifier:
         color = discord.Color.green() if signal_type == 'Long' else discord.Color.red()
         
         raw_symbol = signal_data['symbol']
-        display_symbol = f"{raw_symbol.split(':')[0]} (Perpetual)"
+        if ':' in raw_symbol:
+            base_symbol = raw_symbol.split(':', 1)[0]
+            display_symbol = f"{base_symbol} (Perpetual)"
+        else:
+            display_symbol = raw_symbol
         
         python_datetime = signal_data['test_trigger_time'].to_pydatetime()
 
@@ -77,6 +89,7 @@ class DiscordNotifier:
             await self.channel.send(embeds=embeds_to_send)
             self.logger.info(f"Successfully sent a batch of {len(embeds_to_send)} signals to Discord.")
 
+
     async def send_error(self, message: str):
         """發送錯誤/嚴重日誌"""
         if not self.channel:
@@ -90,6 +103,8 @@ class DiscordNotifier:
             color=discord.Color.dark_red()
         )
         await self.channel.send(embed=embed)
+
+
     async def send_info(self, message: str):
         """發送一般資訊日誌"""
         if not self.channel:
@@ -102,6 +117,8 @@ class DiscordNotifier:
             color=discord.Color.blue()
         )
         await self.channel.send(embed=embed)
+
+
     async def close(self):
         """關閉 Discord 客戶端連接"""
         await self.client.close()

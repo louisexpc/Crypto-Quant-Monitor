@@ -737,12 +737,44 @@ def setup_logging(log_dir: Path):
 
 
 def main():
+    """
+    API Key Management
+    - API_KEY/API_SECRET : for general use except testnet trading (e.g., backtesting, data collection)
+    - TRADER_API_SECRET/TRADER_API_SECRET : for testnet trading (read from environment variables for security)
+    - DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID : for Discord notifications (also from environment variables)
+    """
+    # Load and validate required environment variables for API keys
+    api_key = os.getenv("TRADER_API_KEY")
+    api_secret = os.getenv("TRADER_API_SECRET")
+    discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
+    discord_channel_id_str = os.getenv("DISCORD_CHANNEL_ID")
+    missing_env_vars = [
+        name
+        for name, value in [
+            ("TRADER_API_KEY", api_key),
+            ("TRADER_API_SECRET", api_secret),
+            ("DISCORD_BOT_TOKEN", discord_bot_token),
+            ("DISCORD_CHANNEL_ID", discord_channel_id_str),
+        ]
+        if value is None
+    ]
+    if missing_env_vars:
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing_env_vars)}"
+        )
+    try:
+        discord_channel_id = int(discord_channel_id_str)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Environment variable DISCORD_CHANNEL_ID must be a valid integer"
+        ) from exc
+    
     api_key_config = APIKeyConfig(
-        api_key=os.getenv("TRADER_API_KEY"),
-        api_secret=os.getenv("TRADER_API_SECRET"),
-        discord_bot_token=os.getenv("DISCORD_BOT_TOKEN"),
-        discord_channel_id=int(os.getenv("DISCORD_CHANNEL_ID")),
-    )   
+        api_key=api_key,
+        api_secret=api_secret,
+        discord_bot_token=discord_bot_token,
+        discord_channel_id=discord_channel_id,
+    )
 
     parser = argparse.ArgumentParser(description="Trader Application")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to the configuration YAML file")
