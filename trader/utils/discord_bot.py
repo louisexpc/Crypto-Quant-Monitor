@@ -29,7 +29,7 @@ class DiscordNotifier:
         if not self.channel:
             raise ConnectionError(f"Could not find Discord channel with ID {self.channel_id}")
         
-    def _create_signal_embed(self, signal_data: Dict[str, Any], exchange_id: str, ai_prediction: Optional[Dict] = None) -> discord.Embed:
+    def _create_signal_embed(self, signal_data: Dict[str, Any], exchange_id: str) -> discord.Embed:
         """根據單一訊號數據，創建並返回一個 Embed 物件。"""
         signal_type = signal_data['signal_type']
         color = discord.Color.green() if signal_type == 'Long' else discord.Color.red()
@@ -53,14 +53,9 @@ class DiscordNotifier:
         embed.add_field(name="Flip Candle (Level Flipped)", value=f"`{signal_data['level_flipped_at']}`", inline=False)
         embed.add_field(name="Test Trigger (Latest Candle)", value=f"`{signal_data['test_trigger_time']}`", inline=False)
 
-        if ai_prediction:
-            pred_dir = ai_prediction['direction_pred']
-            pred_mag = ai_prediction['magnitude_pred']
-            ai_verdict = "✅ Confirmed" if (signal_type == 'Long' and pred_dir == 'Up') or \
-                                          (signal_type == 'Short' and pred_dir == 'Down') else "⚠️ Contradicted"
-            embed.add_field(name="🤖 AI Prediction", value=f"**Verdict:** {ai_verdict}\n**Predicted Direction:** {pred_dir}\n**Predicted Magnitude:** {pred_mag:.4f}%", inline=False)
-        
-        embed.set_footer(text="Crypto Quant Monitor")
+        embed.add_field(name="Model Prediction Result", value=f"Prediction: {'✅ Confirmed' if signal_data.get('prediction') else '⚠️ Not Confirmed'}", inline=False)
+
+        embed.set_footer(text="Crypto Trading Bot")
         return embed
 
     async def send_signals_in_batch(self, signals_list: List[Dict[str, Any]], exchange_id: str):

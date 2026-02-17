@@ -356,6 +356,7 @@ class TradingBot:
         if self.run_mode == "STATE_ONLY":
             self.strategy_manager.on_candle_close(latest_candle)
             self.logger.info(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
+            self.discord_notifier.send_info(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
             return
         elif self.run_mode == "LIVE_TRADE":
             signals = self.strategy_manager.on_candle_close(latest_candle)
@@ -391,11 +392,13 @@ class TradingBot:
                         consume_time , can_short_entry = self.short_predictor.predict(short_feature.iloc[-self.predictor_bars:])
                         prediction_success = True
                     except Exception as e:
-                        self.logger.exception(f"[LIVE_TRADE] Short prediction failed for candle close_time={latest_candle.close_time}: {e}")
-                        
+                        self.logger.exception(f"[LIVE_TRADE] Short prediction failed for candle close_time={latest_candle.close_time}: {e}")   
                 else:
                     self.logger.warning(f"[LIVE_TRADE] Unknown signal type: {signal_type}")
                     continue
+
+                # update signal with prediction results for logging/notification
+                signal['prediction'] = can_long_entry if signal_type == "Long" else can_short_entry
 
                 # 下單邏輯，如果 predict 出錯， fallback 回基礎信號，先以 log 處理
                 if (signal_type == "Long"):
@@ -412,7 +415,12 @@ class TradingBot:
                         self.logger.info(f"[LIVE_TRADE] Short prediction did not allow entry for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
                     else:
                         self.logger.warning(f"[LIVE_TRADE] Short signal generated but prediction failed for candle close_time={latest_candle.close_time}; no entry executed.")
-
+            # Send signals to Discord in batch
+            if self.discord_notifier and signals:
+                try:
+                    self.discord_notifier.send_signals_in_batch(signals, self.exchange_cfg.id)
+                except Exception as e:
+                    self.logger.exception(f"Failed to send signals batch to Discord: {e}")
         return
 
 
@@ -503,6 +511,7 @@ class TradingBot:
             await listener.stop()
             if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
                 try:
+                    self.discord_notifier.send_info("TradingBot is shutting down. Goodbye!")
                     await self.discord_notifier.close()
                     self.logger.info("Discord Notifier closed.")
                 except Exception:
