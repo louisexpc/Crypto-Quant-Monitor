@@ -4,7 +4,7 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Callable, Awaitable
 
 import dotenv
 from pydantic import BaseModel
@@ -215,6 +215,7 @@ class TradingBot:
         self._last_processed_ms: Optional[int] = self.state_store.load_last_processed()
         self._run_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # -----------------------------
     # Initialization Methods
@@ -293,6 +294,39 @@ class TradingBot:
         self.logger.info("Discord Notifier initialized (pending async connect).")
 
     # -----------------------------
+    # Async Discord Notification Helpers
+    # -----------------------------
+    def _submit_discord_task(self, coro_factory: Callable[[], Awaitable[None]], action: str) -> None:
+        if not hasattr(self, "discord_notifier") or self.discord_notifier is None:
+            return
+        if self._event_loop is None or self._event_loop.is_closed():
+            self.logger.debug("Skip discord action=%s because event loop is unavailable.", action)
+            return
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro_factory(), self._event_loop)
+
+            def _done_callback(done_fut):
+                try:
+                    done_fut.result()
+                except Exception:
+                    self.logger.exception("Discord action failed: %s", action)
+
+            fut.add_done_callback(_done_callback)
+        except Exception:
+            self.logger.exception("Failed to submit discord action: %s", action)
+
+    def _notify_info_sync(self, message: str) -> None:
+        self._submit_discord_task(lambda: self.discord_notifier.send_info(message), "send_info")
+
+    def _notify_signals_sync(self, signals: list[dict]) -> None:
+        exchange_id = getattr(self.exchange_cfg, "id", "default")
+        self._submit_discord_task(
+            lambda: self.discord_notifier.send_signals_in_batch(signals, exchange_id),
+            "send_signals_in_batch",
+        )
+
+    # -----------------------------
     # User-owned Trading Logic
     # -----------------------------
     def run(self):
@@ -356,7 +390,7 @@ class TradingBot:
         if self.run_mode == "STATE_ONLY":
             self.strategy_manager.on_candle_close(latest_candle)
             self.logger.info(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
-            self.discord_notifier.send_info(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
+            self._notify_info_sync(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
             return
         elif self.run_mode == "LIVE_TRADE":
             signals = self.strategy_manager.on_candle_close(latest_candle)
@@ -417,15 +451,11 @@ class TradingBot:
                         self.logger.warning(f"[LIVE_TRADE] Short signal generated but prediction failed for candle close_time={latest_candle.close_time}; no entry executed.")
             # Send signals to Discord in batch
             if self.discord_notifier and signals:
-                try:
-                    self.discord_notifier.send_signals_in_batch(signals, self.exchange_cfg.id)
-                except Exception as e:
-                    self.logger.exception(f"Failed to send signals batch to Discord: {e}")
+                self._notify_signals_sync(signals)
         return
 
 
         raise NotImplementedError("Implement TradingBot.run() using self.history_df and self.current_trigger_close_ts_ms")
-
     # -----------------------------
     # Daemon Mode (WS-triggered)
     # -----------------------------
@@ -438,6 +468,7 @@ class TradingBot:
 
     async def run_forever(self):
         self.logger.info("Starting TradingBot daemon...")
+        self._event_loop = asyncio.get_running_loop()
         if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
             try:
                 await self.discord_notifier.connect()
@@ -453,7 +484,7 @@ class TradingBot:
         )
         listener.start()
 
-        loop = asyncio.get_running_loop()
+        loop = self._event_loop
         self._install_signal_handlers(loop)
 
         agen = listener.closed_kline_events()
@@ -511,11 +542,12 @@ class TradingBot:
             await listener.stop()
             if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
                 try:
-                    self.discord_notifier.send_info("TradingBot is shutting down. Goodbye!")
+                    await self.discord_notifier.send_info("TradingBot is shutting down. Goodbye!")
                     await self.discord_notifier.close()
                     self.logger.info("Discord Notifier closed.")
                 except Exception:
                     self.logger.exception("Failed to close Discord Notifier.")
+            self._event_loop = None
             self.logger.info("TradingBot daemon stopped.")
 
 
