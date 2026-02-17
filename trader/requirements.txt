@@ -12,3 +12,4 @@ asyncio
 python-binance==1.0.30
 torch
 TA-Lib
+discord==2.3.2

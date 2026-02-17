@@ -4,9 +4,10 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Callable, Awaitable
 
 import dotenv
+from pydantic import BaseModel
 import yaml
 import argparse
 import pandas as pd
@@ -18,11 +19,15 @@ from utils.state_manager import BotStateStore
 from indicators.feature_computer import FeatureComputer
 from predictor.predictor import Predictor
 from strategy.strategy import SNRLiveStrategy, SNRCfg, Candle
-
+from utils.discord_bot import DiscordNotifier
 dotenv.load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent
 
-
+class APIKeyConfig(BaseModel):
+    api_key: str
+    api_secret: str
+    discord_bot_token: str
+    discord_channel_id: int
 
 class ProcessGuard:
     """A minimal single-instance guard using a pidfile.
@@ -179,10 +184,12 @@ class TradingBot:
     the call signature.
     """
 
-    def __init__(self, api_key: str, api_secret: str, config: dict):
+    def __init__(self, api_key_config: APIKeyConfig, config: dict):
         self.config = config
-        self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_key = api_key_config.api_key
+        self.api_secret = api_key_config.api_secret
+        self.discord_bot_token = api_key_config.discord_bot_token
+        self.discord_channel_id = api_key_config.discord_channel_id
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -208,6 +215,7 @@ class TradingBot:
         self._last_processed_ms: Optional[int] = self.state_store.load_last_processed()
         self._run_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # -----------------------------
     # Initialization Methods
@@ -219,6 +227,7 @@ class TradingBot:
         self.long_predictor, self.short_predictor = self._init_long_short_predictor()
         self.strategy_manager = self._init_strategy_manager()
         self.trader = self._init_trader()
+        self._init_discord_notifier()
 
         # Strategy Manager Bootstrap
         self.lookback_bars = (
@@ -279,6 +288,42 @@ class TradingBot:
             exchangeConfig=self.exchange_cfg,
             apiKey=self.api_key,
             apiSecret=self.api_secret,
+        )
+    def _init_discord_notifier(self):
+        self.discord_notifier = DiscordNotifier(self.discord_bot_token, self.discord_channel_id, self.logger)
+        self.logger.info("Discord Notifier initialized (pending async connect).")
+
+    # -----------------------------
+    # Async Discord Notification Helpers
+    # -----------------------------
+    def _submit_discord_task(self, coro_factory: Callable[[], Awaitable[None]], action: str) -> None:
+        if not hasattr(self, "discord_notifier") or self.discord_notifier is None:
+            return
+        if self._event_loop is None or self._event_loop.is_closed():
+            self.logger.debug("Skip discord action=%s because event loop is unavailable.", action)
+            return
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro_factory(), self._event_loop)
+
+            def _done_callback(done_fut):
+                try:
+                    done_fut.result()
+                except Exception:
+                    self.logger.exception("Discord action failed: %s", action)
+
+            fut.add_done_callback(_done_callback)
+        except Exception:
+            self.logger.exception("Failed to submit discord action: %s", action)
+
+    def _notify_info_sync(self, message: str) -> None:
+        self._submit_discord_task(lambda: self.discord_notifier.send_info(message), "send_info")
+
+    def _notify_signals_sync(self, signals: list[dict]) -> None:
+        exchange_id = getattr(self.exchange_cfg, "id", "default")
+        self._submit_discord_task(
+            lambda: self.discord_notifier.send_signals_in_batch(signals, exchange_id),
+            "send_signals_in_batch",
         )
 
     # -----------------------------
@@ -345,6 +390,7 @@ class TradingBot:
         if self.run_mode == "STATE_ONLY":
             self.strategy_manager.on_candle_close(latest_candle)
             self.logger.info(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
+            self._notify_info_sync(f"[STATE_ONLY] Strategy state updated for candle close_time={latest_candle.close_time}")
             return
         elif self.run_mode == "LIVE_TRADE":
             signals = self.strategy_manager.on_candle_close(latest_candle)
@@ -380,11 +426,13 @@ class TradingBot:
                         consume_time , can_short_entry = self.short_predictor.predict(short_feature.iloc[-self.predictor_bars:])
                         prediction_success = True
                     except Exception as e:
-                        self.logger.exception(f"[LIVE_TRADE] Short prediction failed for candle close_time={latest_candle.close_time}: {e}")
-                        
+                        self.logger.exception(f"[LIVE_TRADE] Short prediction failed for candle close_time={latest_candle.close_time}: {e}")   
                 else:
                     self.logger.warning(f"[LIVE_TRADE] Unknown signal type: {signal_type}")
                     continue
+
+                # update signal with prediction results for logging/notification
+                signal['prediction'] = can_long_entry if signal_type == "Long" else can_short_entry
 
                 # 下單邏輯，如果 predict 出錯， fallback 回基礎信號，先以 log 處理
                 if (signal_type == "Long"):
@@ -401,12 +449,13 @@ class TradingBot:
                         self.logger.info(f"[LIVE_TRADE] Short prediction did not allow entry for candle close_time={latest_candle.close_time} (prediction time: {consume_time:.2f}s)")
                     else:
                         self.logger.warning(f"[LIVE_TRADE] Short signal generated but prediction failed for candle close_time={latest_candle.close_time}; no entry executed.")
-
+            # Send signals to Discord in batch
+            if self.discord_notifier and signals:
+                self._notify_signals_sync(signals)
         return
 
 
         raise NotImplementedError("Implement TradingBot.run() using self.history_df and self.current_trigger_close_ts_ms")
-
     # -----------------------------
     # Daemon Mode (WS-triggered)
     # -----------------------------
@@ -419,6 +468,14 @@ class TradingBot:
 
     async def run_forever(self):
         self.logger.info("Starting TradingBot daemon...")
+        self._event_loop = asyncio.get_running_loop()
+        if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
+            try:
+                await self.discord_notifier.connect()
+                self.logger.info("Discord Notifier connected.")
+                await self.discord_notifier.send_info("TradingBot initialized and connected to Discord channel.")
+            except Exception:
+                self.logger.exception("Discord Notifier connect failed; continue without Discord notifications.")
         listener = BinanceFuturesKlineListener(
             symbol=self.symbol,
             interval=self.trigger_interval,
@@ -427,7 +484,7 @@ class TradingBot:
         )
         listener.start()
 
-        loop = asyncio.get_running_loop()
+        loop = self._event_loop
         self._install_signal_handlers(loop)
 
         agen = listener.closed_kline_events()
@@ -483,6 +540,14 @@ class TradingBot:
                 pass
 
             await listener.stop()
+            if hasattr(self, "discord_notifier") and self.discord_notifier is not None:
+                try:
+                    await self.discord_notifier.send_info("TradingBot is shutting down. Goodbye!")
+                    await self.discord_notifier.close()
+                    self.logger.info("Discord Notifier closed.")
+                except Exception:
+                    self.logger.exception("Failed to close Discord Notifier.")
+            self._event_loop = None
             self.logger.info("TradingBot daemon stopped.")
 
 
@@ -672,10 +737,44 @@ def setup_logging(log_dir: Path):
 
 
 def main():
-    api_key = os.getenv("API_KEY")
-    api_secret = os.getenv("API_SECRET")
-    if not api_key or not api_secret:
-        raise ValueError("API_KEY and API_SECRET must be set in environment variables")
+    """
+    API Key Management
+    - API_KEY/API_SECRET : for general use except testnet trading (e.g., backtesting, data collection)
+    - TRADER_API_SECRET/TRADER_API_SECRET : for testnet trading (read from environment variables for security)
+    - DISCORD_BOT_TOKEN/DISCORD_CHANNEL_ID : for Discord notifications (also from environment variables)
+    """
+    # Load and validate required environment variables for API keys
+    api_key = os.getenv("TRADER_API_KEY")
+    api_secret = os.getenv("TRADER_API_SECRET")
+    discord_bot_token = os.getenv("DISCORD_BOT_TOKEN")
+    discord_channel_id_str = os.getenv("DISCORD_CHANNEL_ID")
+    missing_env_vars = [
+        name
+        for name, value in [
+            ("TRADER_API_KEY", api_key),
+            ("TRADER_API_SECRET", api_secret),
+            ("DISCORD_BOT_TOKEN", discord_bot_token),
+            ("DISCORD_CHANNEL_ID", discord_channel_id_str),
+        ]
+        if value is None
+    ]
+    if missing_env_vars:
+        raise RuntimeError(
+            f"Missing required environment variables: {', '.join(missing_env_vars)}"
+        )
+    try:
+        discord_channel_id = int(discord_channel_id_str)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Environment variable DISCORD_CHANNEL_ID must be a valid integer"
+        ) from exc
+    
+    api_key_config = APIKeyConfig(
+        api_key=api_key,
+        api_secret=api_secret,
+        discord_bot_token=discord_bot_token,
+        discord_channel_id=discord_channel_id,
+    )
 
     parser = argparse.ArgumentParser(description="Trader Application")
     parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to the configuration YAML file")
@@ -695,7 +794,7 @@ def main():
     config_path = args.config
     config = load_config(config_path)
 
-    bot = TradingBot(api_key, api_secret, config)
+    bot = TradingBot(api_key_config, config)
 
     if args.mode == "init":
         bot.logger.info("Init mode: modules initialized; exiting.")
