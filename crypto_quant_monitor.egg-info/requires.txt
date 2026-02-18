@@ -15,3 +15,4 @@ python-binance==1.0.30
 torch==2.9.1
 TA-Lib==0.6.8
 discord==2.3.2
+pydantic>=2.12.5
