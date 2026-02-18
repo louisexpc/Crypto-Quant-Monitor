@@ -3,13 +3,12 @@
 ## 概要
 - 輕量推論模組，支援多 checkpoint 載入，專注單窗推論（序列長度由 config 提供）。
 - 不依賴 `train/`，僅保留 TwoStreamHybrid 模型的 inference 版本。
-- 若多個 checkpoint 的 AMP 設定不同，會沿用第一個並給警告。
 
 ## 主要介面
 - `Predictor(cfg: dict, side)`  
   - `cfg` 需包含：`model_path_list`（list[str|Path]）、`seq_len`（int）、`device`（預設 "cuda:0"）。
   - 其中`model_path_list`底下需要分別設定 `long/short` 的 `model list`，並由 `side` 決定用於建立 `Predictor` 的 `model`。
-  - 會一次載入所有 checkpoints，驗證 feature_columns/amp/threshold/temperature 一致。
+  - 會一次載入所有 checkpoints，驗證 feature_columns/threshold/temperature 一致。
 - `predict(feat_df, model_idx=0) -> (inference_time_sec, pred_bool)`  
   - 使用指定模型推論單一時間窗，返回耗時（秒）與布林預測。
 - `predict_vote(feat_df) -> (inference_time_sec, pred_bool)`  
@@ -25,7 +24,7 @@
 
 
 ## Checkpoint 需求
-- 應包含：`state_dict`、`feature_columns`、`model_cfg`、`best_val_thresh`、`temperature`、`amp`、`amp_dtype`。
+- 應包含：`state_dict`、`feature_columns`、`model_cfg`、`best_val_thresh`、`temperature`。
 - 僅支援 TwoStreamHybrid。
 
 ## 常見用法

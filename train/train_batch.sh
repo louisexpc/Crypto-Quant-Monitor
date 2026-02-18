@@ -34,9 +34,8 @@ for side in "${SIDES[@]}"; do
     python -m train.main_train \
       --config "${CONFIG_PATH}" \
       --project-name "${project_name}" \
-      --data-path "${data_path}" \
+      --feat-path "${data_path}" \
       --tbm-csv-path "${tbm_csv}" \
-      --tbm-lookback "${lookback}" \
       --tbm-keep-sides "${side}"
   done
 done

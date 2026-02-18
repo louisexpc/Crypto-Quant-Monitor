@@ -5,11 +5,30 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import pandas as pd
+import yaml
 
-from train.core.config_loader import load_cfg
-from train.data.dataloaders.base import flatten_micro_features, load_precomputed_features
+from train.data.dataloaders.base import (
+    flatten_micro_features,
+    load_precomputed_features,
+    load_tbm_events,
+    resolve_timezone_name,
+)
 from train.evaluation.exporters.tbm_exporter import TBMExporter
 from train.inference.predictor import Predictor
+
+
+def load_cfg(path: str | Path) -> Dict[str, Any]:
+    """Load YAML configuration file.
+
+    Args:
+        path: Configuration file path.
+
+    Returns:
+        Parsed configuration dictionary.
+    """
+    cfg_path = Path(path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -50,19 +69,20 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _to_utc(ts_like: Any) -> pd.Timestamp:
+def _to_target_tz(ts_like: Any, tz_name: str) -> pd.Timestamp:
     """
     1. 說明:
-        將任意時間格式轉為 UTC 時區的 Timestamp（tz-aware）。
+        將任意時間格式轉為指定時區的 Timestamp（tz-aware）。
     2. inputs:
         - ts_like: 可轉為 pandas Timestamp 的物件。
+        - tz_name: 目標時區名稱。
     3. return:
-        - pd.Timestamp: UTC 時區的時間戳。
+        - pd.Timestamp: 目標時區的時間戳。
     """
     ts = pd.Timestamp(ts_like)
     if ts.tzinfo is None:
-        return ts.tz_localize("UTC")
-    return ts.tz_convert("UTC")
+        return ts.tz_localize(tz_name)
+    return ts.tz_convert(tz_name)
 
 
 class EventInferenceRunner:
@@ -91,6 +111,10 @@ class EventInferenceRunner:
         self.cfg = cfg
         self.model_paths = [Path(p) for p in model_paths]
         self.output_path = Path(output_path)
+        self.data_tz = resolve_timezone_name(
+            ((cfg.get("data", {}) or {}).get("time_zone")),
+            default="Asia/Taipei",
+        )
         self._validate_model_paths()
 
     def _validate_model_paths(self) -> None:
@@ -116,20 +140,24 @@ class EventInferenceRunner:
             - feat_df: 15m 預算特徵 DataFrame。
             - micro_df: 1m micro 特徵 DataFrame 或 None。
         3. return:
-            - (cv_start, ts_end): UTC Timestamp 範圍。
+            - (cv_start, ts_end): 指定時區 Timestamp 範圍。
         """
-        cv_start = _to_utc(self.cfg["cv"]["start_date"])
+        cv_start = _to_target_tz(self.cfg["cv"]["start_date"], self.data_tz)
 
         post_root = (self.cfg.get("post_infer", {}) or {})
         post_cfg = post_root if isinstance(post_root, dict) else {}
         ts_end_param = post_cfg.get("date_end") or (self.cfg.get("cv", {}) or {}).get("end_date")
-        ts_end_param = _to_utc(ts_end_param) if ts_end_param else _to_utc(pd.DatetimeIndex(feat_df.index).max())
+        ts_end_param = (
+            _to_target_tz(ts_end_param, self.data_tz)
+            if ts_end_param
+            else _to_target_tz(pd.DatetimeIndex(feat_df.index).max(), self.data_tz)
+        )
 
-        feat_end = _to_utc(pd.DatetimeIndex(feat_df.index).max())
+        feat_end = _to_target_tz(pd.DatetimeIndex(feat_df.index).max(), self.data_tz)
         candidates: List[pd.Timestamp] = [feat_end, ts_end_param]
 
         if micro_df is not None and len(micro_df.index):
-            micro_end = _to_utc(pd.DatetimeIndex(micro_df.index).max())
+            micro_end = _to_target_tz(pd.DatetimeIndex(micro_df.index).max(), self.data_tz)
             candidates.append(micro_end)
 
         ts_end = min(candidates)
@@ -144,12 +172,17 @@ class EventInferenceRunner:
         3. return:
             - pd.DataFrame: 已排序且展平的特徵表。
         """
-        feat_df = load_precomputed_features(path=self.cfg["data"]["path"])
+        data_cfg = (self.cfg.get("data", {}) or {})
+        feat_path = data_cfg.get("feat_path")
+        if not feat_path:
+            raise KeyError("cfg.data.feat_path is required.")
 
-        micro_cfg = (self.cfg.get("data", {}) or {}).get("micro", {}) or {}
+        feat_df = load_precomputed_features(path=feat_path, target_tz=self.data_tz)
+
+        micro_cfg = data_cfg.get("micro", {}) or {}
         micro_df = None
         if micro_cfg.get("enabled") and micro_cfg.get("path"):
-            micro_df = load_precomputed_features(path=micro_cfg["path"])
+            micro_df = load_precomputed_features(path=micro_cfg["path"], target_tz=self.data_tz)
 
         cv_start, ts_end = self._resolve_time_bounds(feat_df, micro_df)
 
@@ -179,8 +212,8 @@ class EventInferenceRunner:
         """
         tbm_path = (self.cfg.get("label", {}) or {}).get("tbm_csv_path")
         if not tbm_path:
-            raise ValueError("label.tbm_csv_path is required to load TBM CSV.")
-        return pd.read_csv(tbm_path, parse_dates=["t0"])
+            raise ValueError("label.tbm_csv_path is required to load TBM events.")
+        return load_tbm_events(path=str(tbm_path), parse_t1=False)
 
     def run(self) -> str:
         """

@@ -1,6 +1,7 @@
 # train/models/two_stream_model.py
 from __future__ import annotations
 from typing import Sequence, Optional, Tuple, List
+import re
 import torch
 import torch.nn as nn
 
@@ -29,8 +30,12 @@ def build_feature_indices_by_prefix(
         return [], []
     if isinstance(minute_prefixes, str):
         minute_prefixes = (minute_prefixes,)
-    minute_idx = [i for i, c in enumerate(columns) if c.startswith(minute_prefixes)]
-    base_idx   = [i for i, c in enumerate(columns) if not c.startswith(minute_prefixes)]
+    minute_idx = [
+        i for i, c in enumerate(columns)
+        if str(c).startswith(minute_prefixes) or re.match(r"^m\d+_", str(c))
+    ]
+    minute_idx_set = set(minute_idx)
+    base_idx = [i for i, _ in enumerate(columns) if i not in minute_idx_set]
     return minute_idx, base_idx
 
 
@@ -166,6 +171,7 @@ class TwoStreamHybrid(nn.Module):
             pooling      = pooling,
             use_causal   = use_causal,
         )
+        self._shape_debug_printed = False
 
     @property
     def has_minute(self) -> bool:
@@ -200,6 +206,13 @@ class TwoStreamHybrid(nn.Module):
         if not self.has_minute or x_min_flat is None:
             if x_base is None:
                 raise RuntimeError("無 minute 且 base_idx 為空；輸入全被吃掉了。請檢查切分。")
+            if not self._shape_debug_printed:
+                print(
+                    f"[TwoStreamHybrid] x_base={tuple(x_base.shape)} | "
+                    "x_min=None | "
+                    f"fused={tuple(x_base.shape)}"
+                )
+                self._shape_debug_printed = True
             return self.backbone(x_base, key_padding_mask=key_padding_mask)
 
         # 還原 minute → [B*T, S, Fm]
@@ -213,6 +226,13 @@ class TwoStreamHybrid(nn.Module):
 
         # 與 base 拼接
         fused = micro_emb if x_base is None else torch.cat([x_base, micro_emb], dim=-1)  # [B,T, base_dim+H]
+        if not self._shape_debug_printed:
+            print(
+                f"[TwoStreamHybrid] x_base={None if x_base is None else tuple(x_base.shape)} | "
+                f"x_min={tuple(x_min.shape)} | "
+                f"fused={tuple(fused.shape)}"
+            )
+            self._shape_debug_printed = True
         return self.backbone(fused, key_padding_mask=key_padding_mask)
 
 

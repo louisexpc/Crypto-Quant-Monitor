@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
-from torch import amp, nn
+from torch import nn
 
-from predictor.model import build_model
+try:
+    from trader.predictor.model import build_model
+except ModuleNotFoundError:
+    from predictor.model import build_model
 import re
 
 from typing import Literal
-import logging
 # ------------------------------------------------------------
 # Predictor (inference-only)
 # ------------------------------------------------------------
@@ -46,11 +48,15 @@ class Predictor:
 
         self.device = device_cfg if torch.cuda.is_available() and str(device_cfg).startswith("cuda") else "cpu"
         self.seq_len = int(seq_len_cfg)
+        vote_mode_cfg = str(cfg.get("vote_mode", "hard")).strip().lower()
+        if vote_mode_cfg not in {"hard", "soft"}:
+            raise ValueError("cfg.vote_mode must be 'hard' or 'soft'.")
+        self.vote_mode = vote_mode_cfg
 
         self.models: List[nn.Module] = []
         self.model_meta: List[Dict[str, Any]] = []
         self.feature_columns: List[str] = []
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.num_classes: int | None = None
         for i, mp in enumerate(model_path_list):
             ckpt_path = Path(mp)
             if not ckpt_path.is_file():
@@ -63,61 +69,58 @@ class Predictor:
             temperature = ckpt.get("temperature", None)
             if temperature is None:
                 raise ValueError(f"[ckpt {ckpt_path}] missing temperature; refusing to use default.")
-            thr = ckpt.get("best_val_thresh", None)
-            if thr is None:
-                raise ValueError(f"[ckpt {ckpt_path}] missing best_val_thresh; refusing to use default.")
-
-            amp_cfg = ckpt.get("amp", None)
-            amp_dtype_cfg = ckpt.get("amp_dtype", None)
-            if amp_cfg is None or amp_dtype_cfg is None:
-                raise ValueError(f"[ckpt {ckpt_path}] missing amp/amp_dtype; refusing to use default.")
-            amp_dtype_cfg = str(amp_dtype_cfg).lower()
 
             if i == 0:
                 self.feature_columns = list(feature_columns)
-                self.amp_enabled = bool(amp_cfg)
-                if amp_dtype_cfg in {"bf16", "bfloat16"}:
-                    self.amp_dtype = torch.bfloat16
-                elif amp_dtype_cfg in {"fp16", "float16"}:
-                    self.amp_dtype = torch.float16
-                else:
-                    raise ValueError(f"[ckpt {ckpt_path}] unsupported amp_dtype: {amp_dtype_cfg}")
             else:
                 if list(feature_columns) != self.feature_columns:
                     raise ValueError(f"[ckpt {ckpt_path}] feature_columns mismatch across checkpoints.")
-                # 若 amp 設定不同，沿用第一個 ckpt 的設定並提醒
-                if bool(amp_cfg) != self.amp_enabled or str(amp_dtype_cfg) != str(self.amp_dtype).lower():
-                    self.logger.warning(f"amp config mismatch in {ckpt_path}; using first ckpt's amp settings.")
 
             state_dict = ckpt.get("state_dict", ckpt)
             model_cfg = ckpt.get("model_cfg", ckpt.get("model", {})) or {}
             model_cfg = self._maybe_infer_layers_from_state_dict(model_cfg, state_dict)
+            num_classes = self._infer_num_classes(model_cfg, state_dict)
+            thr = ckpt.get("best_val_thresh", None)
+            if num_classes <= 2 and thr is None:
+                raise ValueError(
+                    f"[ckpt {ckpt_path}] binary checkpoint requires best_val_thresh; got None."
+                )
 
             n_features = len(self.feature_columns)
             model = build_model(model_cfg, n_features, self.feature_columns)
             model.load_state_dict(state_dict)
             model = model.to(self.device)
             model.eval()
+            if self.num_classes is None:
+                self.num_classes = int(num_classes)
+            elif int(num_classes) != int(self.num_classes):
+                raise ValueError(
+                    f"[ckpt {ckpt_path}] num_classes mismatch across checkpoints: "
+                    f"{num_classes} != {self.num_classes}"
+                )
             self.models.append(model)
             self.model_meta.append(
                 {
                     "temperature": float(temperature),
-                    "threshold": float(thr),
+                    "threshold": None if thr is None else float(thr),
+                    "num_classes": int(num_classes),
                 }
             )
 
-    def predict(self, feat_df: pd.DataFrame, model_idx: int = 0) -> Tuple[float, bool]:
+    def predict(self, feat_df: pd.DataFrame, model_idx: int = 0) -> Tuple[float, Union[bool, int]]:
         """
         1. 說明:
-            針對單一時間窗特徵做推論，回傳 (推論耗時秒, 預測標籤bool)。
+            針對單一時間窗特徵做推論。
+            - 二分類：回傳 bool（使用 best_val_thresh）
+            - 多分類：回傳 int 類別索引（argmax）
         2. inputs:
             - feat_df: 單窗特徵 DataFrame，index 可有任意時間，需含所有 feature_columns，行數=seq_len
             - model_idx: 使用哪個 checkpoint（預設第0個）
         3. return:
-            - (elapsed_sec, pred_bool)
+            - (elapsed_sec, pred)
         """
         self._validate_features(feat_df)
-        x = feat_df[self.feature_columns].to_numpy(dtype=np.float32, copy=False)
+        x = feat_df[self.feature_columns].to_numpy(dtype=np.float32, copy=True)
         self._validate_length_and_time(feat_df)
         if not np.isfinite(x).all():
             raise ValueError("feat_df contains NaN/Inf; please sanitize input.")
@@ -129,62 +132,109 @@ class Predictor:
         model = self.models[model_idx]
         meta = self.model_meta[model_idx]
 
-        device_type = "cuda" if self.device.startswith("cuda") else "cpu"
-        dtype = self.amp_dtype if self.amp_enabled else None
-
         start = time.perf_counter()
-        probs: List[float] = []
-        with torch.no_grad(), amp.autocast(device_type=device_type, dtype=dtype, enabled=self.amp_enabled):
+        pred: Union[bool, int]
+        with torch.no_grad():
             logits = model(xb) / meta["temperature"]
-            if logits.ndim == 1 or logits.shape[-1] == 1:
+            if int(meta["num_classes"]) <= 2:
+                thr = meta["threshold"]
+                if thr is None:
+                    raise ValueError("binary inference requires threshold, but got None.")
                 p1 = torch.sigmoid(logits.float().squeeze(-1))
+                prob = float(p1.item())
+                pred = bool(prob >= float(thr))
+            elif logits.ndim == 1:
+                pred = int(torch.argmax(logits).item())
             else:
-                p1 = torch.softmax(logits.float(), dim=1)[:, 1]
-            probs.append(float(p1.item()))
+                pred = int(torch.argmax(logits.float(), dim=1).item())
         inference_time = time.perf_counter() - start
 
-        prob = float(np.mean(probs))
-        pred_bool = bool(prob >= meta["threshold"])
-        return (inference_time, pred_bool)
+        return (inference_time, pred)
 
-    def predict_vote(self, feat_df: pd.DataFrame) -> Tuple[float, bool]:
+    def predict_vote(
+        self,
+        feat_df: pd.DataFrame,
+        vote_mode: Literal["hard", "soft"] | None = None,
+    ) -> Tuple[float, Union[bool, int]]:
         """
         1. 說明:
-            多 checkpoint 投票：逐一模型推論，平均耗時，並依個別門檻計算票數。
+            多 checkpoint 投票：
+            - hard:
+                - 二分類：各模型各自 threshold 判斷後做多數決
+                - 多分類：各模型 argmax 後做多數決
+            - soft:
+                - 二分類：先平均各模型 p1，再用 threshold（平均 fold threshold）判斷
+                - 多分類：先平均各模型 class probabilities，再 argmax
         2. inputs:
             - feat_df: 單窗特徵 DataFrame，需符合長度/欄位/時間檢查
+            - vote_mode: 'hard' 或 'soft'；None 時使用 cfg.vote_mode
         3. return:
-            - (elapsed_sec, pred_bool)
+            - (elapsed_sec, pred)
         """
         if not self.models:
             raise ValueError("No models loaded for predict_vote.")
+        mode = str(vote_mode or self.vote_mode).strip().lower()
+        if mode not in {"hard", "soft"}:
+            raise ValueError("vote_mode must be 'hard' or 'soft'.")
         self._validate_features(feat_df)
         self._validate_length_and_time(feat_df)
-        x = feat_df[self.feature_columns].to_numpy(dtype=np.float32, copy=False)
+        x = feat_df[self.feature_columns].to_numpy(dtype=np.float32, copy=True)
         if not np.isfinite(x).all():
             raise ValueError("feat_df contains NaN/Inf; please sanitize input.")
 
         xb = torch.from_numpy(x).unsqueeze(0).to(self.device)
-        device_type = "cuda" if self.device.startswith("cuda") else "cpu"
-        dtype = self.amp_dtype if self.amp_enabled else None
 
-        preds: List[bool] = []
+        is_binary = all(int(meta["num_classes"]) <= 2 for meta in self.model_meta)
+        preds_bin: List[bool] = []
+        probs_bin: List[float] = []
+        preds_cls: List[int] = []
+        probs_cls: List[np.ndarray] = []
         start = time.perf_counter()
-        with torch.no_grad(), amp.autocast(device_type=device_type, dtype=dtype, enabled=self.amp_enabled):
+        with torch.no_grad():
             for model, meta in zip(self.models, self.model_meta):
                 logits = model(xb) / meta["temperature"]
-                if logits.ndim == 1 or logits.shape[-1] == 1:
+                if int(meta["num_classes"]) <= 2:
+                    thr = meta["threshold"]
+                    if thr is None:
+                        raise ValueError("binary ensemble inference requires threshold, but got None.")
                     p1 = torch.sigmoid(logits.float().squeeze(-1))
+                    prob = float(p1.item())
+                    probs_bin.append(prob)
+                    preds_bin.append(bool(prob >= float(thr)))
                 else:
-                    p1 = torch.softmax(logits.float(), dim=1)[:, 1]
-                prob = float(p1.item())
-                preds.append(bool(prob >= meta["threshold"]))
+                    if logits.ndim == 1:
+                        logits2 = logits.float().unsqueeze(0)
+                    else:
+                        logits2 = logits.float()
+                    p = torch.softmax(logits2, dim=1).squeeze(0).detach().cpu().numpy()
+                    probs_cls.append(p.astype(np.float64, copy=False))
+                    preds_cls.append(int(np.argmax(p)))
         inference_time = time.perf_counter() - start
 
-        votes_true = sum(1 for p in preds if p)
-        votes_false = len(preds) - votes_true
-        pred_bool = votes_true > votes_false
-        return (inference_time, pred_bool)
+        if is_binary:
+            if mode == "soft":
+                mean_prob = float(np.mean(np.asarray(probs_bin, dtype=np.float64)))
+                thr_arr = np.asarray([float(meta["threshold"]) for meta in self.model_meta], dtype=np.float64)
+                mean_thr = float(np.mean(thr_arr))
+                pred: Union[bool, int] = bool(mean_prob >= mean_thr)
+                return (inference_time, pred)
+
+            votes_true = sum(1 for p in preds_bin if p)
+            votes_false = len(preds_bin) - votes_true
+            pred = votes_true > votes_false
+            return (inference_time, pred)
+
+        if mode == "soft":
+            prob_mat = np.asarray(probs_cls, dtype=np.float64)
+            mean_probs = prob_mat.mean(axis=0)
+            pred = int(np.argmax(mean_probs))
+            return (inference_time, pred)
+
+        # hard 多分類：同票時採「最小 class id」作 deterministic tie-break。
+        cls_values, counts = np.unique(np.asarray(preds_cls, dtype=np.int64), return_counts=True)
+        winner_idx = int(np.argmax(counts))
+        pred = int(cls_values[winner_idx])
+        return (inference_time, pred)
 
     def _validate_features(self, df: pd.DataFrame) -> None:
         """
@@ -249,3 +299,32 @@ class Predictor:
             model_cfg["n_layers"] = n_layers
             model_cfg["num_layers"] = n_layers
         return model_cfg
+
+    @staticmethod
+    def _infer_num_classes(model_cfg: Dict[str, Any], state_dict: Dict[str, Any]) -> int:
+        """
+        Infer number of classes from model config/state dict.
+
+        Args:
+            model_cfg: Model config loaded from checkpoint.
+            state_dict: Model state dict loaded from checkpoint.
+        Returns:
+            Number of classes. Falls back to 1 when unavailable.
+        """
+        cfg_n = model_cfg.get("num_classes", None)
+        if cfg_n is not None:
+            try:
+                n = int(cfg_n)
+                if n >= 1:
+                    return n
+            except Exception:
+                pass
+        for k, v in state_dict.items():
+            if str(k).endswith("head.weight") and hasattr(v, "shape") and len(v.shape) >= 1:
+                try:
+                    n = int(v.shape[0])
+                    if n >= 1:
+                        return n
+                except Exception:
+                    continue
+        return 1

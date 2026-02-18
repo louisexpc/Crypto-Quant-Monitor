@@ -3,7 +3,7 @@
 Time-driven DataLoader builder.
 
 把時間驅動 (time-driven) 的 bar 級資料，對齊到離線預算好的特徵格點，依折疊切成
-train/val/test，套用時間安全或 sklearn 縮放器，最後回傳三個 DataLoader 與 info。
+train/val/test，最後回傳三個 DataLoader 與 info。
 """
 from __future__ import annotations
 from typing import Optional, List, Dict
@@ -13,9 +13,10 @@ from torch.utils.data import DataLoader
 
 from train.data.dataloaders.base import (
     load_precomputed_features,
+    load_ohlcv_for_label,
     reindex_to_full_grid,
-    apply_scaling,
     flatten_micro_features,
+    resolve_timezone_name,
 )
 from train.data.labeling import create_label
 from train.data.dataset.time_dataset import SeqDataset
@@ -30,34 +31,66 @@ def make_time_loaders_for_fold(
     also_XGB: bool = False,
 ):
     """
-    時間驅動 DataLoader：僅用預算特徵、依 plan 篩欄、算 OHLCV label、縮放、切 TR/VA/TE。
+    時間驅動 DataLoader：僅用預算特徵、依 plan 篩欄、算 OHLCV label、切 TR/VA/TE。
     """
     assert cfg is not None and fold is not None, "cfg 與 fold 皆不可為 None"
     task_type = cfg["task"]["type"]
     ref_index = pd.DatetimeIndex(df.index)
+    data_cfg = (cfg.get("data", {}) or {})
 
-    def _to_utc(ts_like):
+    feat_path = data_cfg.get("feat_path")
+    if not feat_path:
+        raise KeyError("cfg.data.feat_path is required.")
+    ohlcv_path = data_cfg.get("ohlcv_fng_path")
+    if not ohlcv_path:
+        raise KeyError("cfg.data.ohlcv_fng_path is required.")
+
+    data_tz = resolve_timezone_name(data_cfg.get("time_zone"), default="Asia/Taipei")
+
+    def _to_tz(ts_like):
+        """Convert timestamp-like object to configured data timezone.
+
+        Args:
+            ts_like: Input timestamp-like value.
+        Returns:
+            Timezone-aware pandas Timestamp in data_tz.
+        """
         ts = pd.Timestamp(ts_like)
         if ts.tzinfo is None:
-            return ts.tz_localize("UTC")
-        return ts.tz_convert("UTC")
+            return ts.tz_localize(data_tz)
+        return ts.tz_convert(data_tz)
 
-    cv_start = _to_utc(cfg["cv"]["start_date"])
-    cv_end_cfg = _to_utc(cfg["cv"]["end_date"])
-    post_cfg = ((cfg.get("post_infer", {}) or {}).get("tbm_concat", {}) or {})
+    cv_start = _to_tz(cfg["cv"]["start_date"])
+    cv_end_cfg = _to_tz(cfg["cv"]["end_date"])
+    post_cfg = (cfg.get("post_infer", {}) or {})
     post_end = post_cfg.get("date_end")
-    ts_end_limit = _to_utc(post_end) if post_end else cv_end_cfg
+    ts_end_limit = _to_tz(post_end) if post_end else cv_end_cfg
 
     # 1) 取得特徵與標籤來源
-    feat_df = load_precomputed_features(path=cfg["data"]["path"], drop_ohlcv=False).astype(np.float32)
+    feat_df = load_precomputed_features(
+        path=feat_path,
+        drop_ohlcv=False,
+        target_tz=data_tz,
+    ).astype(np.float32)
+    ohlcv_df = load_ohlcv_for_label(
+        path=ohlcv_path,
+        target_tz=data_tz,
+    ).astype(np.float32)
 
-    micro_cfg = (cfg.get("data", {}) or {}).get("micro", {})
+    micro_cfg = data_cfg.get("micro", {}) or {}
     micro_df = None
     if micro_cfg.get("enabled") and micro_cfg.get("path"):
-        micro_df = load_precomputed_features(path=micro_cfg["path"]).astype(np.float32)
+        micro_df = load_precomputed_features(
+            path=micro_cfg["path"],
+            target_tz=data_tz,
+        ).astype(np.float32)
 
     # 日期裁剪：cv.start_date ~ min(cv/post_infer end)
-    ts_end_candidates = [ts_end_limit, pd.DatetimeIndex(feat_df.index).max()]
+    ts_end_candidates = [
+        ts_end_limit,
+        pd.DatetimeIndex(feat_df.index).max(),
+        pd.DatetimeIndex(ohlcv_df.index).max(),
+    ]
     if micro_df is not None and len(micro_df.index):
         ts_end_candidates.append(pd.DatetimeIndex(micro_df.index).max())
     ts_end = min(ts_end_candidates)
@@ -83,12 +116,11 @@ def make_time_loaders_for_fold(
         feat_df = reindex_to_full_grid(feat_df, str(freq))
 
     # 2) 先抓 OHLCV 做 label（若快取沒有時間標籤，現場計算）
-    need = ["open","high","low","close","volume"]
-    miss = [c for c in need if c not in feat_df.columns]
-    if miss:
-        raise KeyError(f"預算特徵檔缺少 OHLCV 欄位: {miss}")
-    dfb = feat_df.loc[:, need].copy()
-
+    dfb = ohlcv_df.reindex(feat_df.index)
+    missing_mask = dfb.isna().any(axis=1)
+    if missing_mask.any():
+        miss_idx = dfb.index[missing_mask][:5].tolist()
+        raise ValueError(f"[time_loader] ohlcv_fng_path 無法完整對齊特徵索引，缺值樣本例：{miss_idx}")
 
     # 檢查 NaN
     nan_rows = feat_df.isna().any(axis=1)
@@ -107,8 +139,6 @@ def make_time_loaders_for_fold(
     feat_df = feat_df.loc[mask]; y_series = y_series.loc[mask]
 
     work = pd.concat([feat_df, y_series], axis=1)
-    # 移除 OHLCV 後續僅保留特徵欄
-    feat_df = feat_df.drop(columns=[c for c in need if c in feat_df.columns])
     feat_cols = [c for c in feat_df.columns if np.issubdtype(feat_df[c].dtype, np.number)]
     target_col = target_col or ("y_reg" if is_reg else "y_cls")
 
@@ -123,13 +153,9 @@ def make_time_loaders_for_fold(
     split_pos = int(len(df_tv_index) * cfg["cv"]["train_val_split"])
     tr_idx, va_idx, te_idx = df_tv_index[:split_pos], df_tv_index[split_pos:], df_te_index
 
-    # 7) 縮放（time-safe 直接全段；sklearn 用 train bar 作 fit_index）
+    # 7) 特徵已在上游處理，這裡不再做任何縮放
     L = int(cfg["sequence"]["seq_len"])
-    min_frac = float(cfg["sequence"].get("min_frac", 0.2))
-    scaled, sk_scaler, cols_to_scale = apply_scaling(
-        df=work, feat_cols=feat_cols, scaler_kind=cfg["sequence"]["scaler"],
-        L=L, min_frac=min_frac, fit_index=tr_idx
-    )
+    scaled = work
 
     # 8) split → Dataset / Loader（保持你原本的設定）
     def _clean(X_df, y_s):
@@ -141,17 +167,27 @@ def make_time_loaders_for_fold(
     X_va, y_va = _clean(scaled.loc[va_idx, feat_cols], scaled.loc[va_idx, target_col])
     X_te, y_te = _clean(scaled.loc[te_idx, feat_cols], scaled.loc[te_idx, target_col])
 
-    runtime_device = cfg["device"]; bs = int(cfg["train"]["batch_size"])
-    preload = bool(cfg.get("sequence", {}).get("preload_to_gpu", False))
-    ds_device = runtime_device if (preload and runtime_device == "cuda") else "cpu"
-    stride = cfg["sequence"]["stride"]; anchor = int(cfg["sequence"]["stride_anchor"]) % stride
+    runtime_device = str(cfg["device"]); bs = int(cfg["train"]["batch_size"])
+    runtime_is_cuda = runtime_device.startswith("cuda")
+    preload_to_gpu = bool(data_cfg.get("preload_to_gpu", True))
+    ds_device = runtime_device if (runtime_is_cuda and preload_to_gpu) else "cpu"
+    stride_cfg = cfg["sequence"].get("stride", 1)
+    if isinstance(stride_cfg, list):
+        if len(stride_cfg) != 1:
+            raise ValueError("[time_loader] sequence.stride list 僅允許單一值。")
+        stride = int(stride_cfg[0])
+    else:
+        stride = int(stride_cfg)
+    if stride <= 0:
+        raise ValueError("[time_loader] sequence.stride 必須 > 0。")
+    anchor = 0
     label_dtype = "float" if is_reg else "long"
 
-    ds_tr = SeqDataset(X_tr, y_tr, L, scaler=sk_scaler, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
-    ds_va = SeqDataset(X_va, y_va, L, scaler=sk_scaler, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
-    ds_te = SeqDataset(X_te, y_te, L, scaler=sk_scaler, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
+    ds_tr = SeqDataset(X_tr, y_tr, L, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
+    ds_va = SeqDataset(X_va, y_va, L, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
+    ds_te = SeqDataset(X_te, y_te, L, device=ds_device, label_dtype=label_dtype, stride=stride, anchor=anchor)
 
-    pin = (ds_device == "cpu" and runtime_device == "cuda"); nw = 10 if pin else 0
+    pin = (ds_device == "cpu" and runtime_is_cuda); nw = 10 if pin else 0
     train_loader = DataLoader(ds_tr, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=pin)
     val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=pin)
     test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False, drop_last=False, num_workers=nw, pin_memory=pin)
@@ -161,12 +197,9 @@ def make_time_loaders_for_fold(
         Xtr = X_tr.values.astype(np.float32, copy=False)
         Xva = X_va.values.astype(np.float32, copy=False)
         Xte = X_te.values.astype(np.float32, copy=False)
-        if sk_scaler is not None:
-            Xtr = sk_scaler.transform(Xtr); Xva = sk_scaler.transform(Xva); Xte = sk_scaler.transform(Xte)
         y_dtype = np.float32 if is_reg else np.int64
         info["XGB"] = {"X_tr": Xtr, "y_tr": y_tr.values.astype(y_dtype, copy=False),
                        "X_va": Xva, "y_va": y_va.values.astype(y_dtype, copy=False),
-                       "X_te": Xte, "y_te": y_te.values.astype(y_dtype, copy=False),
-                       "scaler": sk_scaler, "cols_to_scale": cols_to_scale}
+                       "X_te": Xte, "y_te": y_te.values.astype(y_dtype, copy=False)}
 
     return train_loader, val_loader, test_loader, info

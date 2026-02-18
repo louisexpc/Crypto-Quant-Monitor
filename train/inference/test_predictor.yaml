@@ -1,7 +1,9 @@
 device: "cuda:0"
 
 data:
-  path: data/precomputed/btcusdt_15m_features/btcusdt_15m_features.csv
+  ohlcv_fng_path: data/derived/ohlcv_fng_15m.csv
+  feat_path: data/derived/ohlcv_fng_15m_feat.csv
+  time_zone: "UTC+08:00 (Asia/Taipei)"
   micro:
     enabled: true
     path: data/precomputed/btcusdt_15m_features/btcusdt_1m_trades.csv
@@ -23,12 +25,9 @@ post_infer:
   enabled: true
   date_start: "2025-05-01"
   date_end: "2025-10-20"
-  collapse_mask_enable: true
 
 train:
   batch_size: 256
-  amp: true
-  amp_dtype: "bf16"
 
 model:
   name: "TwoStreamHybrid"

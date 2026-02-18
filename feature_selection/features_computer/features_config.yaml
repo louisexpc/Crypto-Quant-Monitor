@@ -17,7 +17,7 @@ data:
     time: ["datetime", "timestamp"]
     ohlcv: ["open", "high", "low", "close", "volume"]
 
-  selected_feat_path: feature_selection/results/rank_biserial/long_108_v2/rank_biserial_120_feat_cols.txt
+  selected_feat_path: ""
 
   # Trades feat
   trades:                           # 1 分鐘訊號（15m bar 聚合）    

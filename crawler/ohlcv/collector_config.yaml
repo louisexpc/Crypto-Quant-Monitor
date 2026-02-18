@@ -4,10 +4,10 @@ exchange:
 
 range:
   start: "2023-01-01"
-  end: "2026-2-14"
+  end: "2025-12-31"
 
 io:
-  outdir: "data/"
+  outdir: "data/ohlcv_2023"
   fmt: "csv"
   append: true
 
@@ -19,4 +19,4 @@ fetch:
 
 monitoring:
   - symbol: "BTC/USDT:USDT"
-    timeframes: ["15m", "5m" ]
+    timeframes: ["5m" ]

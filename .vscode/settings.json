@@ -1,0 +1,153 @@
+{
+  "git.autofetch": true,
+  "explorer.confirmDelete": false,
+  "terminal.integrated.sendKeybindingsToShell": true,
+  "debug.onTaskErrors": "debugAnyway",
+  "git.confirmSync": false,
+  "git.enableSmartCommit": true,
+  "diffEditor.ignoreTrimWhitespace": false,
+  "terminal.integrated.enableMultiLinePasteWarning": false,
+  "explorer.confirmDragAndDrop": false,
+  "workbench.editor.empty.hint": "hidden",
+  "python.createEnvironment.trigger": "off",
+  "editor.largeFileOptimizations": false,
+  "files.autoSave": "afterDelay",
+  "files.autoSaveDelay": 200,
+  "files.autoSaveWhenNoErrors": false,
+  "github.copilot.enable": {
+    "*": false,
+    "plaintext": false,
+    "markdown": false,
+    "scminput": false,
+    "python": false
+  },
+  "remote.autoForwardPortsSource": "hybrid",
+  "security.allowedUNCHosts": [
+    "wsl.localhost"
+  ],
+  "remote.SSH.configFile": "D:\\ssh_cfg\\hosts",
+  "remote.SSH.path": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+  "remote.SSH.remotePlatform": {
+    "ntulab": "linux",
+    "yoyo-pve": "linux",
+    "NTU": "linux",
+    "YOYO-VM": "linux",
+    "ntu": "linux"
+  },
+  "remote.WSL.defaultDistro": "Ubuntu-D",
+  "terminal.integrated.defaultProfile.windows": "Ubuntu-D (WSL)",
+  "terminal.integrated.profiles.windows": {
+    "Ubuntu-D (WSL)": {
+      "source": "wsl",
+      "args": [
+        "-d",
+        "Ubuntu-D"
+      ]
+    }
+  },
+  "editor.unicodeHighlight.nonBasicASCII": false,
+  "editor.unicodeHighlight.ambiguousCharacters": false,
+  "python.analysis.typeCheckingMode": "off",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "none",
+    "reportMissingModuleSource": "none",
+    "reportUnusedImport": "none"
+  },
+  "[python]": {
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "always",
+      "source.organizeImports.ruff": "always"
+    }
+  },
+  "ruff.rules": {
+    "I001": "ignore"
+  },
+  // ===== LaTeX Workshop: XeLaTeX recipe + viewer + autobuild =====
+  "latex-workshop.latex.tools": [
+    {
+      "name": "latexmk-xelatex",
+      "command": "latexmk",
+      "args": [
+        "-xelatex",
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "-pdf",
+        "%DOC%"
+      ]
+    }
+  ],
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "latexmk (xelatex)",
+      "tools": [
+        "latexmk-xelatex"
+      ]
+    }
+  ],
+  "latex-workshop.latex.autoBuild.run": "onSave",
+  "latex-workshop.view.pdf.viewer": "tab",
+  "latex-workshop.latex.outDir": "%DIR%/out",
+  "latex-workshop.synctex.afterBuild.enabled": true,
+  // ===== Lint / dictionary (optional) =====
+  "latex-workshop.linting.chktex.enabled": true,
+  "latex-workshop.linting.chktex.args.active": [
+    "-wall",
+    "-n8",
+    "-n24"
+  ],
+  // 建議統一 UTF-8
+  "files.encoding": "utf8",
+  "files.eol": "\n",
+  "cSpell.words": [
+    "documentclass",
+    "twocolumn",
+    "letterpaper",
+    "cvpr",
+    "latexmk",
+    "xelatex",
+    "bibtex",
+    "ieee",
+    "cleveref"
+  ],
+  "markdown-preview-enhanced.previewTheme": "atom-dark.css",
+  // ===== Markdown Preview Enhanced (Puppeteer 匯出) =====
+  // ► 若走「Windows 的 Chrome」（你目前最穩）
+  "markdown-preview-enhanced.chromePath": "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe",
+  "markdown-preview-enhanced.puppeteerArgs": [
+    "--no-sandbox",
+    "--disable-dev-shm-usage"
+  ],
+  "markdown-preview-enhanced.exportPDFPageFormat": "A4",
+  "markdown-preview-enhanced.usePandocParser": false,
+  "markdown-preview-enhanced.mathRenderingOption": "KaTeX",
+  "markdown-preview-enhanced.frontMatterRenderingOption": "none", // 以防模板注入第二個引擎
+  "markdown-preview-enhanced.embedLocalImages": true,
+  "terminal.integrated.stickyScroll.enabled": false,
+  "files.associations": {
+    "*.py": "python"
+  },
+  "git.openRepositoryInParentFolders": "never",
+  "remote.SSH.enableDynamicForwarding": false, // 讓資源內嵌，避免 CSS 路徑失效
+  "remote.SSH.useLocalServer": true, // 用本機小代理更穩
+  "remote.SSH.permitPtyAllocation": true, // 讓連線拿到 PTY
+  "remote.SSH.showLoginTerminal": true, // 看到登入過程/錯誤
+  "remote.SSH.sshPath": "C:\\Windows\\System32\\OpenSSH\\ssh.exe",
+  "remote.SSH.preferredLocalPortRange": "50000-55000",
+  "github.copilot.nextEditSuggestions.enabled": true,
+  "explorer.confirmPasteNative": false,
+  "chatgpt.runCodexInWindowsSubsystemForLinux": true,
+  "chatgpt.openOnStartup": true,
+  "chatgpt.cliExecutable": "",
+  "markdown-preview-enhanced.enablePreviewZenMode": true,
+  "workbench.editorAssociations": {
+    "*.copilotmd": "vscode.markdown.preview.editor",
+    "*.csv": "default"
+  },
+  "geminicodeassist.project": "sunny-abode-ksf6z",
+  "security.workspace.trust.untrustedFiles": "open"
+  // ► 如果你確定已啟用 systemd + snap 並安裝了 chromium，
+  // 把上面 chromePath 換成下面這條，並改回簡單參數：
+  // "markdown-preview-enhanced.chromePath": "/snap/bin/chromium",
+  // "markdown-preview-enhanced.puppeteerArgs": ["--no-sandbox"]
+}

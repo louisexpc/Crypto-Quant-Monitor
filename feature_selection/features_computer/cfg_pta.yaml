@@ -1,0 +1,21 @@
+data:
+  ohlcv_fng_path: data/derived/ohlcv_fng_15m.csv
+
+# all | path/to/feat.txt
+feat_plan: feature_selection/results/rank_biserial/3candle/rank_biserial_40_short_feat_cols.txt
+
+# train 建議 true；runtime 可 false（未知欄位跳過）
+strict_txt: true
+
+# pipeline 順序: shift -> fill_nan -> normalization
+shift_bars: 1
+fill_nan: linear_interp # last | zero | linear_interp
+
+normalization:
+  mode: z_rolling # none | z_rolling
+  rolling_window: 144
+  min_periods: 1
+  std_floor: 1.0e-8
+
+output:
+  feat_path: data/derived/ohlcv_fng_15m_feat_rb40_short.csv

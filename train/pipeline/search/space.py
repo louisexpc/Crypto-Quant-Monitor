@@ -134,6 +134,8 @@ def make_folds(df, cfg):
 # ======================================================================
 def suggest_model_hparams(trial: optuna.Trial, cfg: dict) -> dict:
     model_name = str(cfg["model"].get("name", "")).lower()
+    if "num_layers" not in cfg["model"] and "n_layers" in cfg["model"]:
+        cfg["model"]["num_layers"] = cfg["model"]["n_layers"]
 
     if model_name in ["lstm_se"]:
         for key in ["hidden_size", "n_layers"]:
@@ -148,7 +150,7 @@ def suggest_model_hparams(trial: optuna.Trial, cfg: dict) -> dict:
         if cfg["model"]["d_model"] % cfg["model"]["n_heads"] != 0:
             raise optuna.TrialPruned()
 
-        cfg["model"]["n_layers"] = suggest_int(trial, "n_layers", cfg["model"]["n_layers"])
+        cfg["model"]["num_layers"] = suggest_int(trial, "num_layers", cfg["model"]["num_layers"])
         cfg["model"]["mlp_ratio"] = suggest_float(trial, "mlp_ratio", cfg["model"]["mlp_ratio"])
         cfg["model"]["dropout"] = suggest_float(trial, "dropout", cfg["model"]["dropout"])
         cfg["model"]["attn_dropout"] = suggest_float(trial, "attn_dropout", cfg["model"]["attn_dropout"])
@@ -163,18 +165,19 @@ def suggest_model_hparams(trial: optuna.Trial, cfg: dict) -> dict:
         if cfg["model"]["d_model"] % cfg["model"]["n_heads"] != 0:
             raise optuna.TrialPruned()
 
-        cfg["model"]["n_layers"]     = suggest_int(trial, "model.n_layers",     cfg["model"]["n_layers"])
+        cfg["model"]["num_layers"]   = suggest_int(trial, "model.num_layers",   cfg["model"]["num_layers"])
         cfg["model"]["mlp_ratio"]    = suggest_float(trial, "model.mlp_ratio",  cfg["model"]["mlp_ratio"])
         cfg["model"]["dropout"]      = suggest_float(trial, "model.dropout",    cfg["model"]["dropout"])
         cfg["model"]["attn_dropout"] = suggest_float(trial, "model.attn_dropout", cfg["model"]["attn_dropout"])
         cfg["model"]["pooling"]      = suggest_cat(trial, "model.pooling",      cfg["model"]["pooling"])
-        # minute-LSTM 分支
+        # minute-LSTM 分支（僅在 micro.enabled=true 時才需要）
+        micro_enabled = bool(((cfg.get("data", {}) or {}).get("micro", {}) or {}).get("enabled", False))
         # minute_steps 通常是資料規格（例如 15），除非你真的要搜，否則視為單值
-        if "minute_hidden" in cfg["model"]:
+        if micro_enabled and "minute_hidden" in cfg["model"]:
             cfg["model"]["minute_hidden"]  = suggest_int(trial, "model.minute_hidden",  cfg["model"]["minute_hidden"])
-        if "minute_layers" in cfg["model"]:
+        if micro_enabled and "minute_layers" in cfg["model"]:
             cfg["model"]["minute_layers"]  = suggest_int(trial, "model.minute_layers",  cfg["model"]["minute_layers"])
-        if "minute_dropout" in cfg["model"]:
+        if micro_enabled and "minute_dropout" in cfg["model"]:
             cfg["model"]["minute_dropout"] = suggest_float(trial, "model.minute_dropout", cfg["model"]["minute_dropout"])
 
 
