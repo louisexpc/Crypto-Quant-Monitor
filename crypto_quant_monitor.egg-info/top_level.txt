@@ -1,3 +1,7 @@
+aggTrade
+backtest
+crawler
 feature_selection
+orderbook_snapshot
 trader
 train

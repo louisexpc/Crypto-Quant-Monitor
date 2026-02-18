@@ -28,3 +28,14 @@ dependencies = [
   "TA-Lib==0.6.8",
   "discord==2.3.2"
 ]
+
+[tool.setuptools.packages.find]
+include = [
+  "aggTrade*",
+  "backtest*",
+  "crawler*",
+  "trader*",
+  "feature_selection*",
+  "orderbook_snapshot*",
+  "train*"
+]

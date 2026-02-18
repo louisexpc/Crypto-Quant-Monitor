@@ -2,8 +2,25 @@ Metadata-Version: 2.4
 Name: crypto-quant-monitor
 Version: 0.0.1
 Summary: Quant training pipeline with ADML CV and TBM event labeling
-Requires-Python: >=3.10
+Requires-Python: ==3.12.3
 Description-Content-Type: text/markdown
+Requires-Dist: matplotlib
+Requires-Dist: pymongo[srv]
+Requires-Dist: apscheduler
+Requires-Dist: ccxt==4.5.33
+Requires-Dist: pandas==3.0.0
+Requires-Dist: pandas-ta==0.4.71b0
+Requires-Dist: PyYAML==6.0.3
+Requires-Dist: numpy==2.2.6
+Requires-Dist: vectorbt==0.28.2
+Requires-Dist: tsfeatures==0.4.5
+Requires-Dist: dotenv==0.9.9
+Requires-Dist: websockets==16.0
+Requires-Dist: aioredis==2.0.1
+Requires-Dist: python-binance==1.0.30
+Requires-Dist: torch==2.9.1
+Requires-Dist: TA-Lib==0.6.8
+Requires-Dist: discord==2.3.2
 
 # Project Structure
 ```
