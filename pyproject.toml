@@ -1,15 +1,30 @@
-[project]
-name = "crypto-quant-monitor"        # 套件名稱（隨你，但別跟 PyPI 熱門包撞名）
-version = "0.0.1"
-description = "Quant training pipeline with ADML CV and TBM event labeling"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []                    # 如需自動安裝依賴可填，但你已有 train_requirements.txt
-
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["train*", "feature_selection*", "trader*"]                 # 只封裝 train/ 這棵樹（你也可擴到其它子包）
+[project]
+name = "crypto-quant-monitor"
+version = "0.0.1"
+description = "Quant training pipeline with ADML CV and TBM event labeling"
+requires-python = "==3.12.3"
+readme = "README.md"
+
+dependencies = [
+  "matplotlib",
+  "pymongo[srv]",
+  "apscheduler",
+  "ccxt==4.5.33",
+  "pandas==3.0.0",
+  "pandas-ta==0.4.71b0",
+  "PyYAML==6.0.3",
+  "numpy==2.2.6",
+  "vectorbt==0.28.2",
+  "tsfeatures==0.4.5",
+  "dotenv==0.9.9",
+  "websockets==16.0",
+  "aioredis==2.0.1",
+  "python-binance==1.0.30",
+  "torch==2.9.1",
+  "TA-Lib==0.6.8",
+  "discord==2.3.2"
+]
