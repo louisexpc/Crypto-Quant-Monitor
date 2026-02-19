@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from typing import Any, Dict, Sequence
 
-from feature_selection.features_computer.feat_lib_pta import FeatureLibPTA
+from trader.indicators.feature_lib import FeatureLibPTA
 
 
 class FeatureComputer:

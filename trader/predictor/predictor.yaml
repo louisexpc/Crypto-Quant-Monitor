@@ -1,6 +1,6 @@
 device: cuda:0
 # ensemble vote: hard | soft
-vote_mode: soft
+vote_mode: hard
 model_path_list:
   long: # runs/BTC_3candles_long_rb40/trial_001_mcc=+0.097
     - trader/predictor/model_path/long/model_state_0.pt

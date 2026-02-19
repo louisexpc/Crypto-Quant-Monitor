@@ -1,55 +1,95 @@
-# Trader Indicators
+# Trader Indicators (新版)
 
-## 概要
-- 純特徵計算器：吃原始 OHLCV(+FNG/Trades) DataFrame，依配置計算技術指標、shift(1)、可選 rolling z-score。
-- 不做檔案 I/O；呼叫端自行讀寫 CSV/Parquet。
-- 不依賴 `train/`，指標由本地 `indicators_lib` 提供。
-- 支援白名單：先用白名單過濾 builder，避免計算不需要的特徵；計算後再保留白名單欄位。
+## 1) 目的
+- 這層是 **runtime 特徵計算器**，給交易端吃。
+- 核心是 `FeatureComputer` + `FeatureLibPTA`：
+  - `FeatureComputer`：時間/欄位清理、`shift(1)`、NaN 策略、可選 rolling z-score。
+  - `FeatureLibPTA`：所有指標用 `pandas_ta` 計算，支援用 `feat txt` 指定要算哪些欄位。
 
-## 配置
-- `config/compute_config.yaml`：
-  - `time.columns`：時間欄候選（例：["datetime", "timestamp"]）
-  - `time.freq`：預期頻率（預設 15min，僅檢查不補齊）
-  - `ohlcv_required`：必備欄位（含 fng）
-  - `trades.enabled/window_len`：若計畫包含 1m 聚合特徵則開啟
-  - `feat_plan.long_feat_path` / `short_feat_path`：多/空特徵計畫路徑
-  - `selected_feat_path.long/short`：白名單 txt；留空則計算所有 enabled 特徵
-  - `feat_normalization.enabled/rolling_window/skip_cols`：rolling z-score 設定
-  - `feat_normalization.std_floor`：滾動標準差的下限（預設 1e-8，避免常數序列除以 0）
-  - `manifest_path`：若啟用 `export.manifest_enabled`（預設 False），可指定 manifest 儲存路徑
-  - `nan_policy`：raise | drop | linear_interp
-- `feat_cfg/long_feat.yaml` / `short_feat.yaml`：特徵清單，格式 `{name, enabled, kwargs}`。
+## 2) 目前目錄
+- `trader/indicators/feature_computer.py`
+- `trader/indicators/feature_lib.py`
+- `trader/indicators/feature.yaml`
+- `trader/indicators/feat_cols/rank_biserial_40_long_feat_cols.txt`
+- `trader/indicators/feat_cols/rank_biserial_40_short_feat_cols.txt`
 
-## 主要介面
-- `FeatureComputer(cfg: dict)`  
-  - cfg 需對應上方 compute_config 的鍵。
-- `compute(df_raw: pd.DataFrame, side="long") -> pd.DataFrame`  
-  - 輸入需含時間欄或 DatetimeIndex；輸出僅含計算後特徵（時間索引保留，未附原 OHLCV）。
+## 3) Config（`feature.yaml`）
+實際有用到的 key：
 
-## 流程概述
-1. 時間正規化：UTC、排序、去重，檢查 freq 是否等距。
-2. 檢查必備欄位並轉 float32（含 fng）；依 `nan_policy` 處理缺值。
-3. 讀取白名單（若有），先過濾掉不會產生目標欄位的 builder，逐項計算並 shift(1)。
-4. 合併特徵、檢查重複，若有白名單僅保留白名單欄位。
-5. 可選 rolling z-score（skip cols 依設定，std_floor 避免除以 0）。
-6. 若 `export.manifest_enabled=True`，輸出 manifest.json（欄名→family/kwargs/來源 spec）。
+- `time.columns`
+  - 候選時間欄位，依序找（預設 `["datetime", "timestamp"]`）。
+- `ohlcv_required`
+  - 必備欄位（通常 `open/high/low/close/volume/fng`）。
+- `selected_feat_path.long / selected_feat_path.short`
+  - long/short 對應的 `feat txt`。
+- `nan_policy`
+  - `raise | drop | linear_interp`。
+- `feat_normalization.enabled`
+  - 是否開 rolling z-score。
+- `feat_normalization.rolling_window`
+  - rolling window。
+- `feat_normalization.skip_cols`
+  - z-score 跳過欄位（可空）。
+- `feat_normalization.std_floor`
+  - 標準差下限，避免除以 0（預設 `1e-8`）。
 
-## 簡易用法
+目前保留但未用在 `FeatureComputer.compute()` 的 key：
+- `time.freq`
+- `trades.*`
+
+## 4) FeatureComputer 流程
+`FeatureComputer.compute(df_raw, side)`：
+
+1. 標準化欄名（全轉小寫）。
+2. 建 UTC `DatetimeIndex`（優先 `time.columns`，否則用原 index）。
+3. 驗證 `ohlcv_required` 並轉 numeric。
+4. 先對 raw 套 `nan_policy`。
+5. 依 `side` 讀 `selected_feat_path.{side}`，呼叫 `FeatureLibPTA.compute_from_txt(...)`。
+6. 對特徵統一 `shift(1)`（防洩漏）。
+7. 特徵再做 inf/NaN 清理 + `nan_policy` + `float32`。
+8. 若開啟，套 rolling z-score。
+
+輸出：
+- 只回傳特徵欄位（`pd.DataFrame`，UTC DatetimeIndex，`float32`）。
+- 不含原始 OHLCV/time columns。
+
+## 5) FeatureLibPTA（命名規則）
+`feature_lib.py` 用 canonical 名稱解析，例如：
+
+- raw：`open/high/low/close/volume/fng`
+- single：`rsi_16`, `mom_4`, `entropy_96`, `atr_14`, `atrp_14`, `hl_range_32`, `kdj_9_3_3`
+- multi family：
+  - `macd_12_26_9`, `macds_12_26_9`, `macdh_12_26_9`
+  - `adx_48`, `dmp_48`, `dmn_48`
+  - `pvo_12_26_9`, `pvos_12_26_9`, `pvoh_12_26_9`
+  - `kvo_34_55_13`, `kvos_34_55_13`, `kvoh_34_55_13`
+  - `ewm_m_12`, `ewm_s_12`
+- 其他：`dir_strength`, `pxv_lr_vchg`, `dirxvol`, `tod_sin`, `tod_cos`, `dow_sin`, `dow_cos`
+
+三種入口：
+- `compute_from_txt(txt_path, strict=...)`
+- `compute_from_list(feature_names, strict=...)`
+- `compute_all(...)`
+
+## 6) 使用範例
 ```python
-from trader.indicators.feature_computer import FeatureComputer
-import yaml, pandas as pd
+from pathlib import Path
+import yaml
+import pandas as pd
 
-cfg = yaml.safe_load(open("trader/indicators/config/compute_config.yaml"))
+from trader.indicators.feature_computer import FeatureComputer
+
+cfg = yaml.safe_load(Path("trader/indicators/feature.yaml").read_text())
 fc = FeatureComputer(cfg)
-df_feat = fc.compute(df_raw, side="long")
+
+# df_raw 需有 datetime/timestamp + ohlcv + fng
+df_raw = pd.read_csv("data/derived/ohlcv_fng_15m.csv")
+
+feat_long = fc.compute(df_raw, side="long")
+feat_short = fc.compute(df_raw, side="short")
 ```
 
-## 輸入範例（15m OHLCV+FNG）
-
-| datetime                  | timestamp   |   open |    high |     low |   close |   volume |   fng |
-|:--------------------------|:------------|-------:|--------:|--------:|--------:|---------:|------:|
-| 2022-12-31T16:00:00+00:00 | 1672502400  | 16586.1| 16591.7 | 16586.0 | 16588.4 |   873.158|  25.0 |
-| 2022-12-31T16:15:00+00:00 | 1672503300  | 16588.4| 16599.3 | 16577.3 | 16599.1 |  1409.596|  25.0 |
-| 2022-12-31T16:30:00+00:00 | 1672504200  | 16599.1| 16599.3 | 16590.7 | 16593.6 |   675.457|  25.0 |
-| 2022-12-31T16:45:00+00:00 | 1672505100  | 16593.7| 16609.3 | 16592.3 | 16596.0 |   993.925|  25.0 |
-| 2022-12-31T17:00:00+00:00 | 1672506000  | 16596.1| 16600.1 | 16576.2 | 16578.6 |  1496.217|  25.0 |
+## 7) 行為重點
+- `compute_from_txt(..., strict=False)`：未知欄位會 skip，並印 warning，不會中斷。
+- runtime 預設會插值/補值（依 `nan_policy`）；如果你要嚴格 fail，設 `nan_policy: raise`。
+- long/short 用不同 feat list；請確保和 checkpoint 的 `feature_columns` 對齊。
