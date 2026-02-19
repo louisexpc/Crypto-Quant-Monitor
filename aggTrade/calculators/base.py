@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 """Trade feature calculator 協議。"""
+from __future__ import annotations
 
 from typing import Protocol
 

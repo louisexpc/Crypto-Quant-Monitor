@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 """Trade 1m 聚合時的 state 容器。"""
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 

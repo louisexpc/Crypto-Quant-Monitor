@@ -36,7 +36,10 @@ class JsonlTradeAdapter:
         data = msg.get("data", {})
 
         symbol = str(data.get("s") or payload.get("symbol"))
-        recv_ts_ms = self._to_ms(payload.get("recv_ts")) or 0
+        recv_ts_raw = payload.get("recv_ts")
+        if recv_ts_raw is None:
+            raise ValueError("Missing required field 'recv_ts' in trade payload")
+        recv_ts_ms = self._to_ms(recv_ts_raw)
         event_ts_ms = self._to_ms(data.get("E"))
         tx_ts_ms = self._to_ms(data.get("T"))
 

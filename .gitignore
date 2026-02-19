@@ -16,7 +16,6 @@ runs
 DAML
 Report
 feature_selections
-./crypto_quant_monitor.egg-info
 
 /utils
 # *.json

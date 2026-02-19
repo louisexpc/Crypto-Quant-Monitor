@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 """Trade 事件驅動分鐘聚合器。"""
+from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
@@ -86,6 +85,12 @@ class TradeMinuteAggregator:
         """輸入單筆 trade，必要時 finalize 前一分鐘並回傳 row。"""
         symbol = trade.header.symbol
         trade_ts_ms, flag_missing_trade_ts = self._resolve_trade_ts_ms(trade)
+        if trade_ts_ms <= 0:
+            # 無法解析有效時間戳的 trade：不分桶，不更新引擎，僅標記現有狀態。
+            state = self._states.get(symbol)
+            if state is not None and flag_missing_trade_ts:
+                state.flag_missing_trade_ts = True
+            return []
         bar_open_ts_ms = floor_to_bar_open_in_tz(trade_ts_ms, interval=self.bar_interval, tz=TZ_TPE)
 
         state = self._states.get(symbol)
