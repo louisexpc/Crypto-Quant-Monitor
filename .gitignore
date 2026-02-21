@@ -2,6 +2,7 @@
 __pycache__
 .env
 .venv
+.vscode
 /data
 .csv
 recycle_bin
@@ -16,7 +17,9 @@ runs
 DAML
 Report
 feature_selections
-
+.pytest_cache
+.gitmodules
+ 
 /utils
 # *.json
 feature_select/results
@@ -25,6 +28,7 @@ train/results/*
 *.pth
 train/research_problem.MD
 
+CryptoStrategy
 trader/trader/
 trader/trader/*
 data/
