@@ -1,12 +1,12 @@
 # feature_select/config.yaml
 paths:
-  tbm_labels: "data/TBM_label/win_rate/BTC-USDT_1h_ewma_up8_dn8_lookback108_label.csv"
-  precomputed: "data/precomputed/btcusdt_15m_features/btcusdt_15m_features.csv"
+  tbm_labels: "data/TBM_label/3candle/3candle_label_15min.csv"
+  precomputed: "data/derived/ohlcv_fng_15m_feat.csv"
 
-  output_folder: "feature_selection/results/rank_biserial/short_108_v2"  
-  out_csv: "rank_biserial_120.csv"
-  selected_feat_csv: "rank_biserial_120_feat.csv"
-  selected_feat_cols: "rank_biserial_120_feat_cols.txt"
+  output_folder: "feature_selection/results/rank_biserial/3candle/"  
+  out_csv: "rank_biserial_40_short.csv"
+  selected_feat_csv: "rank_biserial_40_short_feat.csv"
+  selected_feat_cols: "rank_biserial_40_short_feat_cols.txt"
 
 index:
   dt_col_precomputed: "datetime"   # precomputed 的時間欄
@@ -38,7 +38,7 @@ scoring:
   do_spearman: false   # 先關閉；需要簽名報酬時再開
   fdr_q: 0.10
   min_non_nan: 20     # 特徵有效樣本下限
-  top_k: 120           # 額外輸出前 K 名（依 rrb_mean 排序）
+  top_k: 40           # 額外輸出前 K 名（依 rrb_mean 排序）
 
 columns:
   # 明確排除不該參與的欄位（label/價量/時間/重複 open,high...）
@@ -46,8 +46,3 @@ columns:
   exclude_exact:
     - datetime
     - timestamp
-    # - open
-    # - high
-    # - low
-    # - close
-    # - volume

@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from torch import amp
 
 from train.data.dataset.event_dataset import EventDataset
 from train.data.dataloaders.base import align_times, ensure_utc_index
@@ -49,7 +48,7 @@ class Predictor:
         - predict(): 單一模型預測
         - predict_vote(): 多模型（多 fold checkpoint）投票
     2. inputs:
-        - cfg: 全域設定 dict（device/seq_len/keep_sides/tbm_csv_path/date window/amp 等）
+        - cfg: 全域設定 dict（device/seq_len/keep_sides/tbm_csv_path/date window 等）
     3. return:
         - Predictor instance
     """
@@ -57,7 +56,7 @@ class Predictor:
     def __init__(self, cfg: Dict[str, Any]):
         """
         1. 說明:
-            初始化 Predictor（只保存 cfg 與裝置/AMP 設定）。
+            初始化 Predictor（只保存 cfg 與裝置設定）。
         2. inputs:
             - cfg: 設定 dict（建議與 train 同一份）
         3. return:
@@ -125,38 +124,73 @@ class Predictor:
 
         out_df = pack.tbm_out.copy()
         per_model_cols: List[str] = []
+        prob_cols_by_class: Dict[int, List[str]] = defaultdict(list)
 
         for i, mp in enumerate(model_paths):
             col_i = f"{prefix}_{i}"
             df_i = self._predict_on_pack(pack, mp, suffix=str(i))
-            # 只 merge 這次模型的欄位，避免覆蓋其他模型結果
-            cols_to_keep = [c for c in ["__rid", col_i, f"{col_i}_p1"] if c in df_i.columns]
+            prob_cols_i = [c for c in df_i.columns if c.startswith(f"{col_i}_p")]
+            cols_to_keep = [c for c in ["__rid", col_i, *prob_cols_i] if c in df_i.columns]
             out_df = out_df.merge(df_i[cols_to_keep], on="__rid", how="left", validate="one_to_one", suffixes=("", "_dup"))
-            # 清掉 merge 產生的重複欄
             dup_cols = [c for c in out_df.columns if c.endswith("_dup")]
             if dup_cols:
                 out_df = out_df.drop(columns=dup_cols)
             if col_i in out_df.columns:
                 per_model_cols.append(col_i)
+            for prob_col in prob_cols_i:
+                suffix_k = prob_col.rsplit("_p", 1)[-1]
+                if suffix_k.isdigit():
+                    prob_cols_by_class[int(suffix_k)].append(prob_col)
 
-        # vote 聚合（沿用你原本 exporter 的欄位命名）
         col_vote_total = f"{prefix}_vote_votes_total"
-        col_vote_margin = f"{prefix}_vote_margin"
         col_vote_pred = f"{prefix}_vote"
+        col_vote_margin = f"{prefix}_vote_margin"
+
+        if not per_model_cols:
+            out_df[col_vote_total] = pd.Series(pd.NA, index=out_df.index, dtype="Int64")
+            out_df[col_vote_pred] = pd.Series(pd.NA, index=out_df.index, dtype="Int64")
+            return out_df
 
         pred_mat = out_df[per_model_cols]
         votes_total = pred_mat.notna().sum(axis=1).astype("Int64")
-        votes_one = pred_mat.fillna(0).astype(float).sum(axis=1)
-        votes_zero = votes_total.astype(float) - votes_one
-        margin = votes_one - votes_zero
-
         out_df[col_vote_total] = votes_total
-        out_df[col_vote_margin] = margin
-        out_df[col_vote_pred] = (votes_one > votes_zero).astype("Int64")
+
+        if prob_cols_by_class:
+            class_ids = sorted(prob_cols_by_class.keys())
+            vote_prob_cols: List[str] = []
+            for cls_idx in class_ids:
+                vote_prob_col = f"{prefix}_vote_p{cls_idx}"
+                out_df[vote_prob_col] = out_df[prob_cols_by_class[cls_idx]].astype(float).mean(axis=1, skipna=True)
+                vote_prob_cols.append(vote_prob_col)
+
+            prob_mat = out_df[vote_prob_cols].to_numpy(dtype=float)
+            prob_safe = np.where(np.isfinite(prob_mat), prob_mat, -np.inf)
+            valid_mask = np.isfinite(prob_mat).any(axis=1)
+            vote_pred = np.full(len(out_df), np.nan, dtype=np.float64)
+            if valid_mask.any():
+                vote_idx = np.argmax(prob_safe[valid_mask], axis=1)
+                vote_pred[valid_mask] = np.asarray(class_ids, dtype=np.int64)[vote_idx]
+            out_df[col_vote_pred] = pd.Series(vote_pred, index=out_df.index, dtype="Float64").astype("Int64")
+
+            if class_ids == [0, 1]:
+                out_df[col_vote_margin] = out_df[f"{prefix}_vote_p1"] - out_df[f"{prefix}_vote_p0"]
+        else:
+            pred_np = pred_mat.to_numpy(dtype=float)
+            vote_pred = np.full(len(out_df), np.nan, dtype=np.float64)
+            for row_idx, row in enumerate(pred_np):
+                valid = row[np.isfinite(row)]
+                if valid.size == 0:
+                    continue
+                values, counts = np.unique(valid.astype(np.int64), return_counts=True)
+                vote_pred[row_idx] = values[np.argmax(counts)]
+            out_df[col_vote_pred] = pd.Series(vote_pred, index=out_df.index, dtype="Float64").astype("Int64")
 
         # 沒有任何模型投票的 row（例如非 keep_sides）保持 NA
         no_vote_mask = votes_total.isna() | (votes_total == 0)
-        out_df.loc[no_vote_mask, [col_vote_margin, col_vote_pred]] = pd.NA
+        if col_vote_margin in out_df.columns:
+            out_df.loc[no_vote_mask, [col_vote_margin, col_vote_pred]] = pd.NA
+        else:
+            out_df.loc[no_vote_mask, [col_vote_pred]] = pd.NA
 
         return out_df
 
@@ -238,8 +272,8 @@ class Predictor:
 
         # 建 dataset / loader
         L = int(self.cfg.get("sequence", {}).get("seq_len", 144))
-        bs = int(((self.cfg.get("post_infer", {}) or {}).get("tbm_concat", {}) or {}).get("batch_size",
-                 (self.cfg.get("train", {}) or {}).get("batch_size", 256)))
+        post_cfg = (self.cfg.get("post_infer", {}) or {})
+        bs = int(post_cfg.get("batch_size", (self.cfg.get("train", {}) or {}).get("batch_size", 256)))
 
         ds = EventDataset(
             feat_view,
@@ -294,16 +328,15 @@ class Predictor:
         )
 
     def _predict_on_pack(self, pack: _InferPack, model_path: Path, suffix: Optional[str] = None) -> pd.DataFrame:
-        """
-        1. 說明:
-            對同一份 pack（dataset/dataloader）跑單一 checkpoint，並把結果 merge 回 tbm_out。
-        2. inputs:
-            - pack: _InferPack（共用資料）
-            - model_path: checkpoint path
-            - out_col: 基底欄位名（例如 "pred"）
-            - suffix: 若不為 None，寫入欄位為 f"{out_col}_{suffix}"；否則寫入 f"{out_col}_0" 不做
-        3. return:
-            - out_df: pack.tbm_out + 預測欄位
+        """Run one checkpoint on a prepared inference pack.
+
+        Args:
+            pack: Prepared dataloader and output frame.
+            model_path: Checkpoint path.
+            suffix: Optional output suffix for per-model columns.
+
+        Returns:
+            DataFrame with prediction/probability columns merged back to TBM rows.
         """
         prefix = "pred"
         ckpt = torch.load(model_path, map_location="cpu")
@@ -321,6 +354,8 @@ class Predictor:
             feat_cols = [c for c in ckpt_cols if c in feat_cols]
             if len(feat_cols) == 0:
                 raise ValueError(f"[Predictor] checkpoint feature_columns not found in feat_df: {model_path}")
+        feat_pos = [pack.feature_cols.index(c) for c in feat_cols]
+        use_feature_slice = (len(feat_pos) != len(pack.feature_cols)) or any(i != j for j, i in enumerate(feat_pos))
 
         cfg_local = dict(self.cfg)
         if ckpt_model_cfg is not None:
@@ -332,32 +367,48 @@ class Predictor:
         model = model.to(self.device)
         model.eval()
 
-        dtype, autocast_enabled = self._resolve_amp()
-        device_type = self.device_type
-
         # forward
-        pred_records: List[Tuple[int, float, int]] = []
+        pred_records: List[Dict[str, Any]] = []
         ptr = 0
-        with torch.no_grad(), amp.autocast(device_type=device_type, dtype=dtype, enabled=autocast_enabled):
+        num_classes: Optional[int] = None
+        with torch.no_grad():
             for Xb, _ in pack.dl:
                 Xb = Xb.to(self.device, non_blocking=False)
+                if use_feature_slice:
+                    Xb = Xb[..., feat_pos]
                 logits = model(Xb) / temperature
 
-                if logits.ndim == 1 or logits.shape[-1] == 1:
+                if logits.ndim == 1:
+                    p1 = torch.sigmoid(logits.float())
+                    probs = torch.stack([1.0 - p1, p1], dim=1)
+                elif logits.ndim == 2 and logits.shape[-1] == 1:
                     p1 = torch.sigmoid(logits.float().squeeze(-1))
+                    probs = torch.stack([1.0 - p1, p1], dim=1)
                 else:
-                    p1 = torch.softmax(logits.float(), dim=1)[:, 1]
+                    probs = torch.softmax(logits.float(), dim=1)
 
-                p1_np = p1.detach().to("cpu").numpy().astype(np.float32)
-                rids = pack.rid_by_sample[ptr: ptr + len(p1_np)]
+                probs_np = probs.detach().to("cpu").numpy().astype(np.float32)
+                n_cls = int(probs_np.shape[1])
+                if num_classes is None:
+                    num_classes = n_cls
 
-                for rid, prob in zip(rids, p1_np):
+                if n_cls == 2:
+                    yhat_np = (probs_np[:, 1] >= thr_used).astype(np.int64)
+                else:
+                    yhat_np = probs_np.argmax(axis=1).astype(np.int64)
+
+                rids = pack.rid_by_sample[ptr: ptr + len(probs_np)]
+
+                for rid, prob_vec, yhat in zip(rids, probs_np, yhat_np):
                     if rid < 0:
                         continue
-                    yhat = int(float(prob) >= thr_used)
-                    pred_records.append((rid, float(prob), yhat))
+                    row: Dict[str, Any] = {"__rid": int(rid), f"{prefix}_{suffix}" if suffix is not None else prefix: int(yhat)}
+                    for cls_idx, prob in enumerate(prob_vec.tolist()):
+                        col_prob = f"{prefix}_{suffix}_p{cls_idx}" if suffix is not None else f"{prefix}_p{cls_idx}"
+                        row[col_prob] = float(prob)
+                    pred_records.append(row)
 
-                ptr += len(p1_np)
+                ptr += len(probs_np)
 
         model = model.to("cpu")
         if self.device_type == "cuda":
@@ -366,20 +417,20 @@ class Predictor:
         # merge 回輸出底稿
         out_df = pack.tbm_out.copy()
         col_name = f"{prefix}_{suffix}" if suffix is not None else prefix
-        proba_col = f"{col_name}_p1"
-
+        n_cls_final = int(num_classes or 2)
         out_df[col_name] = pd.NA
-        out_df[proba_col] = pd.NA
+        for cls_idx in range(n_cls_final):
+            out_df[f"{col_name}_p{cls_idx}"] = pd.NA
 
-        if len(pred_records) > 0:
-            tmp = pd.DataFrame(pred_records, columns=["__rid", proba_col, col_name])
+        if pred_records:
+            tmp = pd.DataFrame(pred_records)
             out_df = out_df.merge(tmp, on="__rid", how="left", validate="one_to_one", suffixes=("", "_new"))
-            if f"{col_name}_new" in out_df.columns:
-                out_df[col_name] = out_df[f"{col_name}_new"]
-                out_df = out_df.drop(columns=[f"{col_name}_new"])
-            if f"{proba_col}_new" in out_df.columns:
-                out_df[proba_col] = out_df[f"{proba_col}_new"]
-                out_df = out_df.drop(columns=[f"{proba_col}_new"])
+            new_cols = [c for c in out_df.columns if c.endswith("_new")]
+            for c_new in new_cols:
+                c_old = c_new[:-4]
+                out_df[c_old] = out_df[c_new]
+            if new_cols:
+                out_df = out_df.drop(columns=new_cols)
 
         return out_df
     # ----------------------------
@@ -430,31 +481,6 @@ class Predictor:
         if ts_obj.tzinfo is None:
             return ts_obj.tz_localize("UTC")
         return ts_obj.tz_convert("UTC")
-
-    def _resolve_amp(self) -> Tuple[Optional[torch.dtype], bool]:
-        """
-        1. 說明:
-            根據 cfg.train.amp / cfg.train.amp_dtype 決定 autocast dtype。
-        2. inputs:
-            - None
-        3. return:
-            - (dtype, enabled)
-        """
-        train = self.cfg.get("train", {}) or {}
-        enabled = bool(train.get("amp", True))
-        if not enabled:
-            return None, False
-
-        kind = str(train.get("amp_dtype", "auto")).lower()
-        if kind in {"bf16", "bfloat16"}:
-            return torch.bfloat16, True
-        if kind in {"fp16", "float16"}:
-            return torch.float16, True
-
-        # auto
-        if self.device_type == "cuda":
-            return (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16), True
-        return torch.bfloat16, True
 
     def _normalize_model_paths(self, x: Union[PathLike, Sequence[PathLike]]) -> List[Path]:
         """

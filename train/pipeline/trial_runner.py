@@ -27,7 +27,12 @@ from train.evaluation.reporters.regression_reporter import RegressionReporter
 # -- 3) Loader：優先新 -> 退回舊 --
 from train.data.dataloaders.time_loader import make_time_loaders_for_fold  # type: ignore
 from train.data.dataloaders.event_loader import make_event_loaders_for_fold  # type: ignore
-from train.data.dataloaders.base import load_precomputed_features, flatten_micro_features
+from train.data.dataloaders.base import (
+    load_precomputed_features,
+    load_tbm_events,
+    flatten_micro_features,
+    resolve_timezone_name,
+)
 from train.models.model_factory import build_model
 
 
@@ -157,8 +162,6 @@ class TrialRunner:
                         "model_cfg": cfg.get("model"),
                         "temperature": float(temperature) if temperature is not None else None,
                         "best_val_thresh": float(best_thr) if best_thr is not None else None,
-                        "amp": (cfg.get("train", {}) or {}).get("amp"),
-                        "amp_dtype": (cfg.get("train", {}) or {}).get("amp_dtype"),
                     }
                     torch.save(meta, checkpoint_path)
                     model_ref = checkpoint_path
@@ -530,35 +533,48 @@ class TrialRunner:
                     return
                 ds = str(post_infer["date_start"])
                 de = str(post_infer["date_end"])
-                out_csv = str(post_infer.get("csv_path_override") or cfg.get("label", {}).get("tbm_csv_path"))
+                out_csv = str(cfg.get("label", {}).get("tbm_csv_path"))
+                if not out_csv:
+                    raise KeyError("cfg.label.tbm_csv_path is required for post_infer.")
                 trial_name = trial_dir.name
                 match = re.match(r"^(trial_\d+)", trial_name)
                 trial_token = match.group(1) if match else trial_name
                 keep_sides = str(cfg["label"]["keep_sides"]).lower()
-                lookback = cfg["label"]["lookback"]
-                lookback_token = f"{int(lookback)}"
-                save_csv = trial_dir / f"{trial_token}_{keep_sides}_{lookback_token}.csv"
+                save_csv = trial_dir / f"{trial_token}_{keep_sides}.csv"
                 debug_lines += [f"date_range=[{ds},{de}]", f"tbm_src={out_csv}", f"save_to={save_csv}"]
 
                 # 準備特徵（與 loader/tbm_exporter 同步展平邏輯）
-                tbm_df = pd.read_csv(out_csv, parse_dates=["t0"])
-                feat_df = load_precomputed_features(path=cfg["data"]["path"])
-                micro_cfg = (cfg.get("data", {}) or {}).get("micro", {}) or {}
+                tbm_df = load_tbm_events(path=out_csv, parse_t1=False)
+                data_cfg = (cfg.get("data", {}) or {})
+                feat_path = data_cfg.get("feat_path")
+                if not feat_path:
+                    raise KeyError("cfg.data.feat_path is required.")
+                data_tz = resolve_timezone_name(data_cfg.get("time_zone"), default="Asia/Taipei")
+
+                feat_df = load_precomputed_features(path=feat_path, target_tz=data_tz)
+                micro_cfg = data_cfg.get("micro", {}) or {}
                 micro_df = None
                 micro_end = None
                 if micro_cfg.get("enabled") and micro_cfg.get("path"):
-                    micro_df = load_precomputed_features(path=micro_cfg["path"])
+                    micro_df = load_precomputed_features(path=micro_cfg["path"], target_tz=data_tz)
                     if len(micro_df.index):
                         micro_end = pd.DatetimeIndex(micro_df.index).max()
 
-                def _to_utc(ts_like):
+                def _to_tz(ts_like):
+                    """Convert timestamp-like object to configured data timezone.
+
+                    Args:
+                        ts_like: Input timestamp-like value.
+                    Returns:
+                        Timezone-aware pandas Timestamp in data_tz.
+                    """
                     ts = pd.Timestamp(ts_like)
                     if ts.tzinfo is None:
-                        return ts.tz_localize("UTC")
-                    return ts.tz_convert("UTC")
+                        return ts.tz_localize(data_tz)
+                    return ts.tz_convert(data_tz)
 
-                cv_start = _to_utc(cfg["cv"]["start_date"])
-                ts_end_param = _to_utc(de)
+                cv_start = _to_tz(cfg["cv"]["start_date"])
+                ts_end_param = _to_tz(de)
                 ts_end_candidates = [ts_end_param, pd.DatetimeIndex(feat_df.index).max()]
                 if micro_end is not None:
                     ts_end_candidates.append(micro_end)

@@ -5,7 +5,7 @@
 
 - `predict(df, tbm_df, model_path, date_start=None, date_end=None)`: 單一 checkpoint，輸出欄位 `pred`、`pred_p1`。
 - `predict_vote(df, tbm_df, model_paths_or_dir, date_start=None, date_end=None)`: 多 checkpoint 投票，輸出 `pred_i`（各 fold）、`pred_vote_votes_total`、`pred_vote_margin`、`pred_vote`。
-- 不做 scaler/標準化，假設特徵已在 precompute 階段完成。
+- 不做額外特徵轉換，假設特徵已在 precompute 階段完成。
 
 TrialRunner 的 post-infer（若 `post_infer.enabled=True`）會自動調用這支 Predictor。
 
@@ -18,7 +18,7 @@ TrialRunner 的 post-infer（若 `post_infer.enabled=True`）會自動調用這�
 ```yaml
 device: str
 data:
-  path: str
+  feat_path: str
   micro: # (optional)
     enabled: bool # (optional)
     path: str # (optional)
@@ -36,14 +36,11 @@ post_infer:
   enabled: bool
   date_start: str
   date_end: str
-  collapse_mask_enable: bool # (optional)
 model:
   name: str
   num_classes: int
-train: # (optional) 使用與 train 相同的 dtype/bs
+train: # (optional)
   batch_size: int # (optional)
-  amp: bool # (optional)
-  amp_dtype: str # (optional)
 
 ```
 
@@ -52,14 +49,15 @@ train: # (optional) 使用與 train 相同的 dtype/bs
 ```python
 from pathlib import Path
 import pandas as pd
+import yaml
 
-from train.core.config_loader import load_cfg
 from train.data.dataloaders.base import flatten_micro_features, load_precomputed_features
 from train.inference.predictor import Predictor
 
-cfg = load_cfg("train/inference/test_predictor.yaml")
+with open("train/inference/test_predictor.yaml", "r", encoding="utf-8") as f:
+    cfg = yaml.safe_load(f)
 
-feat_df = load_precomputed_features(path=cfg["data"]["path"])
+feat_df = load_precomputed_features(path=cfg["data"]["feat_path"])
 micro_cfg = cfg["data"].get("micro", {})
 if micro_cfg.get("enabled"):
     micro_df = load_precomputed_features(path=micro_cfg["path"])

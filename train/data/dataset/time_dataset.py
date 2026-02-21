@@ -1,9 +1,8 @@
 # time_dataset.py
-import pandas as pd
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
-from typing import Literal, Optional, List, Dict
+from torch.utils.data import Dataset
+from typing import Literal
 
 class SeqDataset(Dataset):
     def __init__(
@@ -11,22 +10,13 @@ class SeqDataset(Dataset):
         X_df,
         y_s,
         seq_len: int,
-        scaler=None,
         device: str = "cuda",
         label_dtype: Literal["auto", "float", "long"] = "auto",
         stride: int = 1,                 # ★ 新增
         anchor: int = 0,                 # ★ 新增：0..stride-1，控制起始對齊
     ):
         X_df = X_df.astype(np.float32, copy=False)
-
-        if scaler is None:
-            X = X_df.values
-        elif hasattr(scaler, "transform"):
-            X = scaler.transform(X_df.values).astype(np.float32, copy=False)
-        elif hasattr(scaler, "transform_df"):
-            X = scaler.transform_df(X_df).values.astype(np.float32, copy=False)
-        else:
-            raise TypeError("Unsupported scaler: expected .transform(...) or .transform_df(...)")
+        X = X_df.values
 
         # ---- y ----
         if label_dtype == "auto":
@@ -66,4 +56,3 @@ class SeqDataset(Dataset):
 
     def __getitem__(self, i):
         return self.X[i], self.y[i]
-

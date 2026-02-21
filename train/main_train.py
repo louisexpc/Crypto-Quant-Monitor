@@ -13,21 +13,70 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Any, Dict
+import random
+import warnings
 import optuna
 import pandas as pd
-import os
+import numpy as np
+import torch
+import yaml
 from train.pipeline.search.objective import objective
-from train.core.context import set_seed
-from train.core.config_loader import load_cfg
-from train.data.dataloaders.base import load_precomputed_features, reindex_to_full_grid
+from train.data.dataloaders.base import (
+    load_precomputed_features,
+    reindex_to_full_grid,
+    resolve_timezone_name,
+)
 
 
 __all__ = [
     "load_cfg",
     "prepare_dataframe",
     "build_study",
-    "run_single",
+    "run",
 ]
+
+
+def load_cfg(path: str | Path) -> Dict[str, Any]:
+    """Load YAML configuration file.
+
+    Args:
+        path: Configuration file path.
+
+    Returns:
+        Parsed configuration dictionary.
+    """
+    cfg_path = Path(path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def set_seed(seed: int = 42, deterministic: bool = True) -> None:
+    """Set random seeds for reproducible training.
+
+    Args:
+        seed: Random seed value.
+        deterministic: Whether to enable deterministic CUDA behavior.
+
+    Returns:
+        None.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+    except Exception:
+        pass
+    warnings.filterwarnings(
+        "ignore",
+        message="pkg_resources is deprecated.*",
+        category=UserWarning,
+        module="pandas_ta",
+    )
 
 
 # ======================================================================
@@ -37,8 +86,14 @@ def prepare_dataframe(cfg: dict) -> pd.DataFrame:
     """
     預先讀取離線特徵檔，只取時間索引用於後續折疊生成。
     """
-    feat_df = load_precomputed_features(path=cfg["data"]["path"])
-    freq = (cfg.get("data", {}) or {}).get("freq")
+    data_cfg = (cfg.get("data", {}) or {})
+    feat_path = data_cfg.get("feat_path")
+    if not feat_path:
+        raise KeyError("cfg.data.feat_path is required.")
+    data_tz = resolve_timezone_name(data_cfg.get("time_zone"), default="Asia/Taipei")
+
+    feat_df = load_precomputed_features(path=feat_path, target_tz=data_tz)
+    freq = data_cfg.get("freq")
     if freq and not feat_df.empty:
         feat_df = reindex_to_full_grid(feat_df, str(freq))
     df = pd.DataFrame(index=feat_df.index)
@@ -96,20 +151,21 @@ def _apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[
     if args.project_name:
         cfg["project_name"] = args.project_name
 
-    if args.data_path:
-        ensure_branch(cfg, "data")["path"] = args.data_path
+    if args.feat_path:
+        ensure_branch(cfg, "data")["feat_path"] = args.feat_path
+
+    if args.ohlcv_path:
+        ensure_branch(cfg, "data")["ohlcv_fng_path"] = args.ohlcv_path
 
     if args.micro_path:
         data_branch = ensure_branch(cfg, "data")
         micro_branch = ensure_branch(data_branch, "micro")
         micro_branch["path"] = args.micro_path
 
-    if args.tbm_csv_path or args.tbm_lookback is not None or args.tbm_keep_sides:
+    if args.tbm_csv_path or args.tbm_keep_sides:
         label_branch = ensure_branch(cfg, "label")
         if args.tbm_csv_path:
             label_branch["tbm_csv_path"] = args.tbm_csv_path
-        if args.tbm_lookback is not None:
-            label_branch["lookback"] = int(args.tbm_lookback)
         if args.tbm_keep_sides:
             label_branch["keep_sides"] = args.tbm_keep_sides
 
@@ -122,7 +178,7 @@ def _apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[
 def run(cfg_path: str, *, cfg: dict | None = None):
     # 1) 載入設定 / 設定隨機種子 / 啟動 CUDA 選項
     cfg = cfg or load_cfg(cfg_path)
-    set_seed(int(cfg.get("seed", 42)))
+    set_seed(int(cfg.get("seed", 42)), deterministic=bool(cfg.get("deterministic", True)))
 
     # 2) 建輸出資料夾
     run_dir = Path("runs") / cfg.get("project_name", "exp")
@@ -154,10 +210,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optuna TBM training entry")
     parser.add_argument("--config", default="train/config.yaml", help="Path to config YAML.")
     parser.add_argument("--project-name", help="Override cfg.project_name.")
-    parser.add_argument("--data-path", help="Override cfg.data.path.")
+    parser.add_argument("--feat-path", help="Override cfg.data.feat_path.")
+    parser.add_argument("--ohlcv-path", help="Override cfg.data.ohlcv_fng_path.")
     parser.add_argument("--micro-path", help="Override cfg.data.micro.path.")
     parser.add_argument("--tbm-csv-path", help="Override cfg.label.tbm_csv_path.")
-    parser.add_argument("--tbm-lookback", type=int, help="Override cfg.label.lookback.")
     parser.add_argument("--tbm-keep-sides", choices=["short", "long", "both"], help="Override cfg.label.keep_sides.")
     parser.add_argument("--n-trials", type=int, help="Override cfg.search.n_trials.")
     args = parser.parse_args()

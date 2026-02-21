@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import copy
 import os
+import random
+import warnings
 from pathlib import Path
 from typing import Any, Dict
 
 import optuna
+import numpy as np
+import torch
 
-from train.core.context import set_seed
 from train.pipeline.search.space import (
     get_task_type,
     suggest_sequence_and_cv,
@@ -20,6 +23,35 @@ from train.pipeline.search.space import (
 from train.pipeline.trial_runner import run_trial
 
 __all__ = ["objective"]
+
+
+def _set_seed(seed: int = 42, deterministic: bool = True) -> None:
+    """Set random seeds for one trial run.
+
+    Args:
+        seed: Random seed value.
+        deterministic: Whether to enable deterministic CUDA behavior.
+
+    Returns:
+        None.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+    try:
+        torch.backends.cuda.matmul.fp32_precision = "tf32"
+        torch.backends.cudnn.conv.fp32_precision = "tf32"
+    except Exception:
+        pass
+    warnings.filterwarnings(
+        "ignore",
+        message="pkg_resources is deprecated.*",
+        category=UserWarning,
+        module="pandas_ta",
+    )
 
 
 def _prepare_config(trial: optuna.Trial, base_cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,7 +128,7 @@ def objective(trial: optuna.Trial, base_cfg: Dict[str, Any], df, run_dir: Path) 
 
     base_seed = int(cfg.get("seed", 42))
     effective_seed = base_seed + trial.number
-    set_seed(effective_seed, deterministic=cfg.get("deterministic", True))
+    _set_seed(effective_seed, deterministic=bool(cfg.get("deterministic", True)))
 
     folds = make_folds(df, cfg)
 

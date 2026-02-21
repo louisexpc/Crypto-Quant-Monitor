@@ -13,7 +13,6 @@ train/
 │   ├── column_plan.py
 │   ├── folds.py
 │   ├── labeling.py
-│   ├── scalers.py
 │   ├── dataloaders/
 │   │   ├── base.py
 │   │   ├── event_loader.py
@@ -94,18 +93,10 @@ train/
 | `config.yaml`   | 所有超參數設定|
 | `readme.md`     | 本文件。|
 
-### 1. `core/`
-```
-├── core/
-│   ├── config_loader.py
-│   ├── context.py
-│   └── orchestrator.py
-```
+### 1. 入口與設定
 | 檔案 | 功能 |
 | ---- | ---- |
-| `config_loader.py` | `load_cfg(path)`：讀取 YAML 設定。|
-| `context.py` | `set_seed`、CUDA TF32 開關等執行環境設定。|
-| `orchestrator.py` | CLI 入口 (`python -m train.core.orchestrator`)；載入設定、設 seed、呼叫 `main_train`。|
+| `main_train.py` | CLI 與 pipeline 入口（內含 `load_cfg`、`set_seed`）。|
 
 
 ### 2. `data/`
@@ -114,7 +105,6 @@ train/
 │   ├── column_plan.py
 │   ├── folds.py
 │   ├── labeling.py
-│   ├── scalers.py
 │   ├── dataloaders/
 │   │   ├── base.py
 │   │   ├── event_loader.py
@@ -130,8 +120,7 @@ train/
 | ---- | ---- |
 | `folds.py` | `FoldGenerator` 實作 Rolling / Purged K-Fold CV|
 | `labeling.py` | 依照 ohlcv 以及 cls / reg 產生對應 label|
-| `scalers.py` | 對feat進行標準化|
-| `dataloaders/base.py` | `load_precomputed_features`、`apply_scaling`、`build_loaders`、`flatten_micro_features`（1m→m0~m(window_len-1) 展平）等共用函式。|
+| `dataloaders/base.py` | `load_precomputed_features`、`build_loaders`、`flatten_micro_features`（1m→m0~m(window_len-1) 展平）等共用函式。|
 | `dataloaders/time_loader.py` | 依時間序列建立 `SeqDataset` 與 DataLoader。|
 | `dataloaders/event_loader.py` | 事件驅動 (TBM) loader，輸出 `EventDataset`。|
 | `dataset.time_dataset.py` | `SeqDataset`：time-driven|
@@ -173,7 +162,7 @@ train/
 ```
 | 檔案 | 功能 |
 | ---- | ---- |
-| `trainers/utils.py` | `get_trainer` (對應 cls / reg)、optimizer / warmup / AMP helper。|
+| `trainers/utils.py` | `get_trainer` (對應 cls / reg)、optimizer / warmup helper。|
 | `trainers/classification.py` | 分類 fold 訓練流程，回傳指標與圖表所需 payload。|
 | `trainers/regression.py` | 回歸 fold 訓練流程，含混合指標與回歸→分類分析。|
 | `trainers/xgb.py` | XGBoost 折訓練與指標計算。|
@@ -233,7 +222,7 @@ train/
 | 檔案 | 功能 |
 | ---- | ---- |
 | `predictor_testing.py` | 最小化範例：載入 15m + 1m 預算特徵，呼叫 `Predictor.predict_vote`，並用 `TBMExporter` 輸出 CSV。|
-| `predictor.yaml` | 測試用設定（包含 `post_infer.tbm_concat.model_paths`），可直接指定 checkpoint 路徑與推論日期區間。|
+| `predictor.yaml` | 測試用設定（`post_infer.*`），可直接指定 checkpoint 路徑與推論日期區間。|
 
 
 ## 3. Pipeline 詳細流程
@@ -243,8 +232,8 @@ train/
    - TBM labels: 透過 `train/train_utils/analysis.py`、`train/train_utils/label.py` 或自訂腳本，將行情 / 交易資料轉為預算特徵表與標籤
 
 2. **設定載入與環境初始化**  
-   - `train/core/config_loader.load_cfg(path)` 讀取設定  
-   - `train/core/context.set_seed(seed, deterministic)` 設定 randomseed 及 CUDA 加速  
+   - `train/main_train.py` 內的 `load_cfg(path)` 讀取設定  
+   - `train/main_train.py` 與 `train/pipeline/search/objective.py` 內建 `set_seed` 設定 randomseed/CUDA  
    - `train/main_train.build_study(cfg, run_dir)` 透過 `optuna.create_study` 建立一次 study
 3. **資料索引檢查**  
    - `train/main_train.prepare_dataframe(cfg)` 讀取 `precomputed feat data`，使用 UTC 時區 idx 用於 `make_folds`。  
@@ -256,13 +245,13 @@ train/
    - `make_folds(df, cfg)` 使用 `train.data.folds.FoldGenerator` 建立 Rolling / Purged K-Fold。
 5. **TrialRunner 執行一次 Trial** (`TrialRunner.run`)  
     - 判斷任務 (`get_task_type`) 後，依 `label.mode` 呼叫 `make_time_loaders_for_fold` 或 `make_event_loaders_for_fold`：
-      - 時間驅動：自動取用特徵表所有數值欄位，必要時展平 1m micro（`flatten_micro_features` 產生 m0~m(window_len-1)），再經 `apply_scaling` → `SeqDataset` → DataLoader。  
+      - 時間驅動：自動取用特徵表所有數值欄位，必要時展平 1m micro（`flatten_micro_features` 產生 m0~m(window_len-1)），直接進 `SeqDataset` → DataLoader。  
       - 事件驅動：同樣先展平 1m micro，再以 `align_times` + `EventDataset` 建立批次資料。  
    - `train.models.model_factory.build_model(cfg, n_features, feat_cols)` 建立模型。  
    - `train.training.trainers.utils.get_trainer(cfg)` 取得對應 `train_one_fold` 實作。
 6. **單 fold 訓練與指標計算**  
    - `train/training/trainers/classification.train_one_fold` / `regression.train_one_fold`：
-     - 使用 `build_optimizer`、`build_warmup_scheduler`、`build_grad_scaler`。  
+     - 使用 `build_optimizer`、`build_warmup_scheduler`。  
      - 依需求呼叫 `CollapseGuard`、`infer_class_prior`、`find_best_threshold_by_fbeta`。  
      - 計算指標 (`metrics_cls.compute_cls_metrics`, `metrics_reg.compute_regression_metrics`) 並回傳 `history` 與 `eval_payload`。  
    - XGBoost 分支：`train/training/trainers/xgb._train_one_fold_xgb`。
@@ -272,7 +261,7 @@ train/
    - `_compute_cv_avgs` → `save_cv_summary`、`_tag_trial_dir`、`_dump_reproducible_cfg`。
 8. **搜尋結束後的匯出**  
    - `objective` 將 `TrialOutputs.mean_score` 傳給 Optuna
-   - 若 `post_infer.tbm_concat.enabled=True`，`TrialRunner._maybe_export_tbm` 會讀取 15m(+1m 展平) 特徵、用 `train/inference/predictor.py` 對當次 trial 的 checkpoints 做投票推論，再透過 `TBMExporter` 輸出 `tbm_with_pred_*.csv`。
+   - 若 `post_infer.enabled=True`，`TrialRunner._maybe_export_tbm` 會讀取 15m(+1m 展平) 特徵、用 `train/inference/predictor.py` 對當次 trial 的 checkpoints 做投票推論，再透過 `TBMExporter` 輸出 `tbm_with_pred_*.csv`。
 
 
 #### Pipeline structure
@@ -290,13 +279,14 @@ train/
    - indicators.py 自訂 feat 計算方式，產出對應之 precomputed data 
 
 2. **設定 `train/config.yaml`**：
-   - `data.path` 指向 `precomputed_data` ；`data.freq` 設定使用的時間尺度。
+   - `data.feat_path` 指向預先計算好的 feature 檔；`data.ohlcv_fng_path` 指向 label 所需的 OHLCV。
+   - `data.freq` 設定使用的時間尺度。
    - `cv`: 指定 Rolling / Purged K-Fold 
-   - `sequence`: 控制視窗長度、stride、scaler。
+   - `sequence`: 控制視窗長度、stride。
    - `model` / `train` / `objective` 設定模型超參、訓練輪次、Optuna 調參指標。
 
 3. **啟動訓練**：
-   - 執行 `python -m train.core.orchestrator train/config.yaml`
+   - 執行 `python -m train.main_train --config train/config.yaml`
 
 4. **輸出成果**：
    - 每個 trial 目錄包含 fold 指標 (`metrics_epoch.csv`)、圖表、該次的 `trial_config_*.yaml` 等。
@@ -305,11 +295,10 @@ train/
 ## 4. 自訂擴充指南
 ### 4.1 自訂 Dataset
 - 參考 `train/data/dataset/time_dataset.py:6` 與 `train/data/dataset/event_dataset.py:1` 的介面；自訂 Dataset 必須實作 `__len__`、`__getitem__`，並將輸入資料轉成 `[N, T, F]` 或 `[N, L, F]` 的 `torch.Tensor`，同時考量裝置搬移（現有實作會在 `__init__` 直接建立位於 `cfg['device']` 的張量）。
-- 建議在 `train/data/dataset/` 新增檔案並保持與現有類別相同的初始化參數（如 `seq_len`、`scaler`、`stride` 等），讓 dataloader 能以相同方式建立物件。
-- 若需要特殊縮放或特徵處理，可複用 `ColumnSubsetScaler`、`TimeSafeScaler` 與 `pick_cols_to_scale` 等工具（`train/data/dataloaders/base.py:134`）。
+- 建議在 `train/data/dataset/` 新增檔案並保持與現有類別相同的初始化參數（如 `seq_len`、`stride` 等），讓 dataloader 能以相同方式建立物件。
 
 ### 4.2 自訂 Dataloader
-- 新增檔案於 `train/data/dataloaders/`，並沿用 `load_precomputed_features`、`apply_scaling` 等共用函式（`train/data/dataloaders/base.py:12`）。
+- 新增檔案於 `train/data/dataloaders/`，並沿用 `load_precomputed_features` 等共用函式（`train/data/dataloaders/base.py:11`）。
 - Dataloader 函式需回傳 `(train_loader, val_loader, test_loader, info)`：
   - `train_loader`/`val_loader`/`test_loader` 為 `torch.utils.data.DataLoader` 物件。
   - `info` 至少包含 `feat_cols`、`target_col`，若支援 XGBoost，需提供 `info['XGB']` 結構與現有 loader 相同（`train/data/dataloaders/time_loader.py:118`）。

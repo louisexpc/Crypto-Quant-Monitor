@@ -5,6 +5,7 @@ from typing import Literal, Optional, Dict
 
 import numpy as np
 import pandas as pd
+from train.data.dataloaders.base import load_tbm_events
 
 
 __all__ = [
@@ -87,7 +88,7 @@ def assign_tbm_labels_to_df(
     將 TBM 事件檔（含 t0/t1/side/label）對齊到 15m bar 的索引，貼成二分類 y_cls。
     若 keep_sides='both' 且同一 t0 有多邊，會丟出錯誤（必須擇一邊）。
     """
-    tbm = pd.read_csv(tbm_csv_path, parse_dates=["t0", "t1"])
+    tbm = load_tbm_events(path=tbm_csv_path, parse_t1=True)
     req = {"t0", "t1", "label", "side", "entry_price"}
     missing = req - set(tbm.columns)
     if missing:

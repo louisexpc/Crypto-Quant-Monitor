@@ -18,7 +18,8 @@ BASE_URL = "https://data.binance.vision"
 PREFIX_TEMPLATE = r"data/futures/um/daily/trades/{symbol}"
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_OUTDIR = Path("data/binance_trades") / DEFAULT_SYMBOL
-DEFAULT_START = "2023-01-01"
+DEFAULT_START = "2025-11-05"
+DEFAULT_END = "2025-11-20"
 
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
@@ -149,7 +150,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--symbol", default=DEFAULT_SYMBOL)
     ap.add_argument("--outdir", default=str(DEFAULT_OUTDIR))
     ap.add_argument("--start", default=DEFAULT_START)
-    ap.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
+    ap.add_argument("--end", default=DEFAULT_END, help="End date YYYY-MM-DD (default: today)")
     ap.add_argument("--output_csv", default=None, help="Optional merged CSV path")
     ap.add_argument("--base_url", default=BASE_URL)
     ap.add_argument("--resume", dest="resume", action="store_true", default=True)

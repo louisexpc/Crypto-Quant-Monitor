@@ -38,8 +38,35 @@ def _drop_label_like_cols(df: pd.DataFrame) -> pd.DataFrame:
     bad = {"label", "target", "y", "y_cls", "y_reg"}
     cols = [c for c in df.columns if str(c).lower() not in bad]
     return df.loc[:, cols]
-import numpy as np
-import pandas as pd
+
+
+def _load_tbm_events(path: str, parse_t1: bool = True) -> pd.DataFrame:
+    """Load TBM events from csv/parquet.
+
+    Args:
+        path: TBM file path.
+        parse_t1: Whether to parse the ``t1`` column when it exists.
+
+    Returns:
+        Loaded TBM dataframe.
+    """
+    p = str(path)
+    if p.endswith(".csv"):
+        cols_head = pd.read_csv(p, nrows=0).columns
+        parse_cols = ["t0"]
+        if parse_t1 and "t1" in cols_head:
+            parse_cols.append("t1")
+        return pd.read_csv(p, parse_dates=parse_cols)
+
+    if p.endswith(".parquet"):
+        df = pd.read_parquet(p)
+        if "t0" in df.columns:
+            df["t0"] = pd.to_datetime(df["t0"], errors="coerce", utc=False)
+        if parse_t1 and "t1" in df.columns:
+            df["t1"] = pd.to_datetime(df["t1"], errors="coerce", utc=False)
+        return df
+
+    raise ValueError(f"Unsupported TBM file format: {path}. Only .csv/.parquet are supported.")
 
 @dataclass
 class EventRow:
@@ -122,10 +149,10 @@ class EventDataset(Dataset):
             if tbm_csv_path is None:
                 raise ValueError("EventDataset requires tbm_df or tbm_csv_path.")
             if not os.path.exists(tbm_csv_path):
-                raise FileNotFoundError(f"TBM label CSV not found: {tbm_csv_path}")
-            cols_head = pd.read_csv(tbm_csv_path, nrows=0).columns
-            parse_cols = ["t0"] + (["t1"] if "t1" in cols_head else [])
-            tbm = pd.read_csv(tbm_csv_path, parse_dates=parse_cols)
+                raise FileNotFoundError(f"TBM label file not found: {tbm_csv_path}")
+            tbm = _load_tbm_events(path=tbm_csv_path, parse_t1=True)
+            if "t1" not in tbm.columns:
+                tbm["t1"] = pd.NaT
         else:
             tbm = tbm_df.copy()
             if "t0" not in tbm.columns:
@@ -160,9 +187,17 @@ class EventDataset(Dataset):
         else:
             tbm["side"] = tbm["side"].astype("Int8")
 
-        # label 容錯轉型（允許字串/缺失）
+        # label 容錯轉型（允許字串/缺失），並轉為 CE 類別索引
         tbm["label"] = pd.to_numeric(tbm["label"], errors="coerce")
         tbm = tbm[tbm["label"].notna()].copy()
+        tbm["label_raw"] = tbm["label"].astype(int)
+        label_map = {-1: 0, 0: 1, 1: 2}  # 0=loss(sl), 1=draw, 2=win(tp)
+        tbm["label"] = tbm["label_raw"].map(label_map)
+        if tbm["label"].isna().any():
+            bad_labels = sorted(tbm.loc[tbm["label"].isna(), "label_raw"].unique().tolist())
+            raise ValueError(
+                f"Unsupported TBM labels: {bad_labels}. Expected labels are {sorted(label_map)}."
+            )
         tbm["label"] = tbm["label"].astype(int)
 
         # 方向過濾

@@ -5,13 +5,12 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
-from torch import amp
 from sklearn.metrics import fbeta_score
 from torch.optim.lr_scheduler import LambdaLR
 
 __all__ = [
     "get_task_type", "get_trainer",
-    "amp_dtype", "build_optimizer", "build_warmup_scheduler", "build_grad_scaler",
+    "build_optimizer", "build_warmup_scheduler",
     "infer_class_weights", "infer_class_prior",
     "find_best_threshold_by_fbeta",
     "_iter_batches",
@@ -73,7 +72,7 @@ def _iter_batches(loader, device: str, batch_size: int):
         yield xb, yb
 
 # -----------------------------
-# 任務/裝置/AMP dtype 公用
+# 任務型態公用
 # -----------------------------
 def get_task_type(cfg: dict) -> str:
     """
@@ -90,28 +89,6 @@ def get_task_type(cfg: dict) -> str:
         return str(cfg["target"]["type"]).lower()
     nc = int(cfg["model"].get("num_classes", 1))
     return "classification" if nc >= 2 else "regression"
-
-def amp_dtype(cfg: dict | None = None):
-    """
-    1. 說明:
-        根據裝置支援與設定，選擇 AMP 計算 dtype：bf16 > fp16；或關閉 AMP。
-    2. inputs:
-        - cfg (dict|None): 設定檔；可含 train.amp_dtype ∈ {'none','fp16','bf16','auto'}。
-    3. return:
-        - dtype (torch.dtype|None): torch.bfloat16 / torch.float16 / None。
-    """
-    choice = None
-    if cfg is not None and "train" in cfg and "amp_dtype" in cfg["train"]:
-        choice = str(cfg["train"]["amp_dtype"]).lower()
-    if choice == "none":
-        return None
-    if choice == "fp16":
-        return torch.float16
-    if choice == "bf16":
-        return torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
-    if torch.cuda.is_available():
-        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    return None
 
 # =========================================================
 # 類別先驗估計與動態 Threshold 搜尋
@@ -312,12 +289,6 @@ def find_best_threshold_by_fbeta(
 
     return float(best_thr), {"fbeta": float(best_val), "beta": float(beta), "task": task_used, "avg": average}
 
-
-# -----------------------------
-# AMP GradScaler（依 dtype）
-# -----------------------------
-def build_grad_scaler(dtype):
-    return amp.GradScaler(enabled=(dtype == torch.float16))
 
 # -----------------------------
 # Trainer factory

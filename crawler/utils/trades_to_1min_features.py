@@ -13,8 +13,8 @@ import pandas as pd
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_INPUT_DIR = f"data/binance_trades/{DEFAULT_SYMBOL}"
 DEFAULT_START = "2023-01-01"
-DEFAULT_END = "2025-11-05"
-DEFAULT_OUTPUT = "data/derived/btcusdt_trades_1min_features.csv"
+DEFAULT_END = "2025-12-31"
+DEFAULT_OUTPUT = "data/derived/btcusdt_trades_1min_features_230101-251231.csv"
 
 # 高階特徵參數
 VOL_SPIKE_WIN = 20          # volume_spike 參考的rolling視窗（分鐘）

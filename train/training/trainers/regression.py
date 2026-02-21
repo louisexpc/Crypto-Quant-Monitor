@@ -2,14 +2,11 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch import amp
 from sklearn.metrics import fbeta_score
 
 from train.training.trainers.utils import (
-    amp_dtype,
     build_optimizer,
     build_warmup_scheduler,
-    build_grad_scaler,
 )
 from train.training.trainers.xgb import _train_one_fold_xgb
 from train.training.losses.reg import build_regression_loss
@@ -31,7 +28,7 @@ def train_one_fold(
     """
     1. 說明:
         回歸任務的單一 fold 訓練/驗證/測試流程。
-        - 訓練：支援 AMP、warmup、梯度裁剪；損失可選 MSE/Huber 或 EMA-MSE+Pearson 混合。
+        - 訓練：支援 warmup、梯度裁剪；損失可選 MSE/Huber 或 EMA-MSE+Pearson 混合。
         - 驗證：計算 RMSE/MAE/MSE/Pearson/Spearman 與自訂 mixed objective（Optuna 可用）。
         - 早停：依 primary metric（mixed/pearson/spearman/val_loss）決定最佳權重。
         - 測試：載回最佳權重後輸出完整回歸指標與圖表。
@@ -75,8 +72,6 @@ def train_one_fold(
     optimizer = build_optimizer(model, cfg)
     steps_per_epoch = max(1, len(train_loader))
     scheduler = build_warmup_scheduler(optimizer, steps_per_epoch, cfg)
-    dtype = amp_dtype(cfg=cfg)
-    scaler = build_grad_scaler(dtype)
 
     # 回歸損失（由 cfg 決定：mse/huber 或 混合 α·EMA-MSE + β·(1-Pearson) 等）
     loss_fn = build_regression_loss(cfg)
@@ -112,17 +107,14 @@ def train_one_fold(
                 printed_shape = True
 
             optimizer.zero_grad(set_to_none=True)
-            with amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
-                pred = model(Xb).squeeze(-1)
-                loss = loss_fn(pred, yb)
+            pred = model(Xb).squeeze(-1)
+            loss = loss_fn(pred, yb)
 
-            scaler.scale(loss).backward()
+            loss.backward()
             if clip and clip > 0:
-                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), clip)
-            scaler.step(optimizer)
+            optimizer.step()
             scheduler.step()
-            scaler.update()
 
             bs = Xb.size(0)
             train_loss_sum += loss.item() * bs
@@ -142,7 +134,7 @@ def train_one_fold(
         val_tgts = []
         val_preds = []
 
-        with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
+        with torch.no_grad():
             for Xb, yb in val_loader:
                 Xb = Xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True).float()
@@ -234,7 +226,7 @@ def train_one_fold(
     te_tgts, te_preds = [], []
     test_loss_sum, test_n = 0.0, 0
 
-    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=True):
+    with torch.no_grad():
         for Xb, yb in test_loader:
             Xb = Xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True).float()

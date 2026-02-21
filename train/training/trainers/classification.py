@@ -2,13 +2,12 @@
 """
 --------------
 分類任務專用的訓練迴圈（single fold）。支援：
-1) CE / Focal-BCE 損失（含 class weight、label smoothing、Confidence Penalty）
-2) 類別分佈對齊（distribution alignment）
-3) 自動溫度校準（temperature scaling, CE 版）
-4) 二分類動態門檻（threshold）搜尋：AUC-Youden 或 F-beta
-5) 早停（可選用 val_loss 或 macro F0.5 作為主指標）
-6) 訓練/驗證/測試的完整指標與可視化匯出
-7) CollapseGuard：PPR/熵 監控與自救（λ_cp 調整、LR 衰減、可選回滾最佳權重）
+1) CrossEntropy 損失（可選 class weight）
+2) 自動溫度校準（temperature scaling, CE 版）
+3) 二分類動態門檻（threshold）搜尋：fixed 或 auto_fbeta
+4) 早停（可選用 val_loss 或 macro F0.5 作為主指標）
+5) 訓練/驗證/測試的完整指標與可視化匯出
+6) CollapseGuard：PPR/熵 監控與自救（λ_cp 調整、LR 衰減、可選回滾最佳權重）
 
 注意：
 - 檔案假設在 CUDA/GPU 環境下執行（會 assert）
@@ -18,17 +17,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch import amp
 from typing import Dict
 from collections import Counter
 from train.training.trainers.utils import (
-    amp_dtype,
     build_optimizer,
     build_warmup_scheduler,
-    build_grad_scaler,
     infer_class_weights,
-    infer_class_prior,
     _iter_batches,
     find_best_threshold_by_fbeta,
     fit_temperature_ce
@@ -55,7 +49,7 @@ def train_one_fold(
     """
     1. 說明:
         針對單一 fold 執行完整的訓練/驗證/測試流程。
-        - 訓練：支援 AMP、warmup、梯度裁剪、分佈對齊、Confidence Penalty。
+        - 訓練：支援 warmup、梯度裁剪。
         - 驗證：CE 指標、溫度校準、二分類門檻搜尋。
         - 早停：以主指標（val_loss 或 macro F0.5）決定最佳模型。
         - 測試：載回最佳權重與最佳溫度，輸出指標與圖表。
@@ -90,17 +84,15 @@ def train_one_fold(
     primary_metric = str(cfg.get("objective", {}).get("primary_metric", "val_loss")).lower()
     primary_is_f05 = primary_metric in ["macro_f05", "f_05_macro", "threshold_macro_f05"]
 
-    # ---- 準備優化器 / 語意精度 / AMP scaler / scheduler ----
+    # ---- 準備優化器 / scheduler ----
     model = model.to(device)
     optimizer = build_optimizer(model, cfg)
     steps_per_epoch = max(1, len(train_loader))
     scheduler = build_warmup_scheduler(optimizer, steps_per_epoch, cfg)
-    dtype = amp_dtype(cfg=cfg)                # 例如 torch.float16 或 bfloat16，或 None（停用 AMP）
-    scaler = build_grad_scaler(dtype)
 
     # ---- 檢查輸出維度並建立 loss ----
     model.eval()
-    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+    with torch.no_grad():
         xb0, _ = next(iter(train_loader))
         xb0 = xb0[:1].to(device, non_blocking=True)
         logits0 = model(xb0)
@@ -112,18 +104,6 @@ def train_one_fold(
     # class weights
     class_weights = infer_class_weights(train_loader, num_class, device)
     loss_fn = build_classification_loss(cfg, class_weights=class_weights)
-
-    # ---- 額外正則項（分佈對齊 / CE 的信心懲罰）----
-    dist_align_weight = float(cfg["train"].get("dist_align_weight", 0.0))
-    conf_penalty_w    = float(cfg["train"].get("confidence_penalty", 0.0))
-    prior_mode        = str(cfg["train"].get("dist_prior", "train")).lower()
-    if dist_align_weight > 0.0:
-        if prior_mode == "uniform":
-            class_prior = torch.full((num_class,), 1.0 / max(1, num_class), dtype=torch.float32, device=device)
-        else:
-            class_prior = infer_class_prior(train_loader, num_class, device)
-    else:
-        class_prior = None
 
 
     # ---- Early-stop 狀態 ----
@@ -161,32 +141,14 @@ def train_one_fold(
                 printed_shape = True
 
             optimizer.zero_grad(set_to_none=True)
-            with amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
-                logits = model(Xb)
-                loss = loss_fn(logits, yb)
+            logits = model(Xb)
+            loss = loss_fn(logits, yb)
 
-                # (1) 分佈對齊：KL( mean(p) || prior )  — 僅多類/二類 softmax 的情況
-                if dist_align_weight > 0.0 and class_prior is not None and logits.shape[-1] > 1:
-                    probs = torch.softmax(logits, dim=1).float()  # [B, C]
-                    p_mean = probs.mean(dim=0)                     # [C]
-                    kl = F.kl_div((p_mean + 1e-8).log(), class_prior, reduction="batchmean")
-                    loss = loss + dist_align_weight * kl
-
-                # (2) CE 路線的信心懲罰：期望的負熵（logits.shape[-1] > 1）
-                #    使用 BCEWithLogitsFocalLoss 時，CP 已內嵌於 loss；此處不重複。
-                if conf_penalty_w > 0.0 and logits.shape[-1] > 1:
-                    probs = torch.softmax(logits, dim=1).float()
-                    conf_loss = (probs * (probs + 1e-8).log()).sum(dim=1).mean()  # = -Entropy 的期望值
-                    loss = loss + conf_penalty_w * conf_loss
-
-            # 反傳 + AMP 梯度縮放
-            scaler.scale(loss).backward()
+            loss.backward()
             if clip and clip > 0:
-                scaler.unscale_(optimizer)
                 nn.utils.clip_grad_norm_(model.parameters(), clip)
-            scaler.step(optimizer)
+            optimizer.step()
             scheduler.step()
-            scaler.update()
 
             # 累計 loss 與收集訓練預測（for train 指標）
             bs = Xb.size(0)
@@ -208,7 +170,7 @@ def train_one_fold(
         val_tgts = []
         val_logits = []
 
-        with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+        with torch.no_grad():
             for Xb, yb in _iter_batches(val_loader, device, int(cfg["train"]["batch_size"])):
                 Xb = Xb.to(device, non_blocking=True)
                 yb = yb.to(device, non_blocking=True).long()
@@ -297,7 +259,7 @@ def train_one_fold(
     te_tgts, te_probs = [], []
     test_loss_sum, test_n = 0.0, 0
 
-    with torch.no_grad(), amp.autocast(device_type="cuda", dtype=dtype, enabled=(dtype is not None)):
+    with torch.no_grad():
         for Xb, yb in _iter_batches(test_loader, device, int(cfg["train"]["batch_size"])):
             Xb = Xb.to(device, non_blocking=True)
             yb = yb.to(device, non_blocking=True).long()
